@@ -43,17 +43,19 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.pub-cache
-          key: ${{ runner.os }}-pub-${{ hashFiles('pubspec.lock') }}
+          key: ${{ runner.os }}-pub-${{ hashFiles('taohuayuan/pubspec.lock') }}
           restore-keys: ${{ runner.os }}-pub-
 
       - name: Install Dependencies
+        working-directory: taohuayuan
         run: flutter pub get
 
       - name: Build arm64 Release APK
+        working-directory: taohuayuan
         run: flutter build apk --release --target-platform android-arm64
 
       - name: Rename APK
-        run: mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk taohuayuan-android-arm64-v2.9.0.apk
+        run: mv taohuayuan/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk taohuayuan-android-arm64-v2.9.0.apk
 
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1

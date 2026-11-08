@@ -40,16 +40,19 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.pub-cache
-          key: ${{ runner.os }}-pub-${{ hashFiles('pubspec.lock') }}
+          key: ${{ runner.os }}-pub-${{ hashFiles('taohuayuan/pubspec.lock') }}
           restore-keys: ${{ runner.os }}-pub-
 
       - name: Install Dependencies
+        working-directory: taohuayuan
         run: flutter pub get
 
       - name: Analyze
+        working-directory: taohuayuan
         run: flutter analyze
 
       - name: Test
+        working-directory: taohuayuan
         run: flutter test
 
   android-smoke:
@@ -77,10 +80,11 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.pub-cache
-          key: ${{ runner.os }}-pub-${{ hashFiles('pubspec.lock') }}
+          key: ${{ runner.os }}-pub-${{ hashFiles('taohuayuan/pubspec.lock') }}
           restore-keys: ${{ runner.os }}-pub-
 
       - name: Install Dependencies
+        working-directory: taohuayuan
         run: flutter pub get
 
       # KVM，没有它模拟器回退到软渲染会超时。
@@ -98,4 +102,4 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: flutter test integration_test/app_launch_test.dart
+          script: cd taohuayuan && flutter test integration_test/app_launch_test.dart
