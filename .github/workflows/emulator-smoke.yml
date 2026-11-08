@@ -82,6 +82,10 @@ jobs:
           arch: x86_64
           target: google_apis
           profile: pixel_7
+          # The debug APK is ~280 MB; the emulator's default userdata
+          # partition is too small for a streamed install of it (the
+          # previous run died with "Broken pipe" mid-install). Enlarge it.
+          emulator-options: -partition-size 4096
           script: |
             adb install -r build/app/outputs/flutter-apk/app-debug.apk
             adb logcat -c
