@@ -112,7 +112,7 @@ jobs:
       # jar, Outfit fonts, placeholder launcher icons, the CloudStream m2
       # repo, and the TorrServer Android AAR. See scripts/ci-android-setup.sh.
       - name: Set Up Go (for TorrServer AAR rebuild)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: 'stable'
       - name: Restore binary assets + rebuild native AARs

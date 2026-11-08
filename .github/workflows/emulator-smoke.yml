@@ -40,7 +40,7 @@ jobs:
           java-version: '25'
           cache: gradle
       - name: Set Up Go (for TorrServer AAR rebuild)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: 'stable'
       - name: Restore binary assets + rebuild native AARs
