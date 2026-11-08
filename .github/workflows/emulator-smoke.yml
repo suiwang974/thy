@@ -2,7 +2,7 @@ name: Emulator Smoke Test
 
 # Launch-crash test on a real Android emulator in GitHub Actions.
 # Builds a debug APK from the same text-only snapshot as release.yml, installs
-# it on an x86_64 emulator (API 36), launches MainActivity, and fails the job
+# it on an x86_64 emulator (API 34, like upstream's Smoke Test Android), launches MainActivity, and fails the job
 # if the app process is not alive a few seconds later. logcat + screenshot are
 # uploaded as artifacts either way, so a crash leaves a stack trace behind
 # instead of a guess.
@@ -75,10 +75,22 @@ jobs:
           rm -rf "$ANDROID_HOME"/system-images || true
           rm -rf /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
           df -h /
+      - name: Install emulator host libraries
+        run: |
+          # The emulator's qemu binary needs libpulse at load time; some
+          # ubuntu-latest runner images ship without it, and the launch
+          # then dies with "libpulse.so.0: cannot open shared object file"
+          # before the emulator even starts (run 42457226802).
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpulse0
+
       - name: Emulator launch test
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 36
+          # api-level 34, like upstream's own Smoke Test Android job
+          # (ci.yml) - the point is that the app launches, not the newest
+          # system image.
+          api-level: 34
           arch: x86_64
           target: google_apis
           profile: pixel_7

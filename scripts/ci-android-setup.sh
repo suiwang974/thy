@@ -2,10 +2,21 @@
 # scripts/ci-android-setup.sh
 #
 # Restores / rebuilds the binary assets that are gitignored upstream, so a
-# GitHub Actions Android build can run from the repo checkout:
-#   0. android-36 android.jar: patched in place with the two API-37 constants
-#      permission_handler_android 14.1.0 references (CINNAMON_BUN,
-#      ACCESS_LOCAL_NETWORK); compile-time only.
+# GitHub Actions Android build can run from the repo checkout.
+#
+# NOTE (2026-11-08, upstream alignment): this script used to carry two hacks
+# that are now REMOVED, because they only existed to work around a wrong
+# compileSdk we introduced in the fork (android-36.0):
+#   - patching the android-36 android.jar with the API-37 constants
+#     (CINNAMON_BUN, ACCESS_LOCAL_NETWORK) that permission_handler_android
+#     14.1.0 references;
+#   - rewriting the CloudStream library-android AAR's minCompileSdk 37 -> 36.
+# Upstream v2.9.0 compiles against `android-37.0` (a platform hash, NOT a
+# bare 37 - AGP 8.13 turns a bare 37 into `android-37`, a package that does
+# not exist) with targetSdk 37, so both problems vanish at the source.
+# android/build.gradle.kts is restored to those upstream values; do NOT
+# reintroduce either hack if a build complains about API 37 - check the
+# compileSdk value first.
 #
 # What it restores, and why each is missing from the repo:
 #   1. android/gradle/wrapper/gradle-wrapper.jar  (binary, gitignored upstream)
@@ -26,29 +37,6 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-
-echo "=== 0. Patch android-36 android.jar (API-37 constants) ==="
-# permission_handler_android 14.1.0 references Build.VERSION_CODES.CINNAMON_BUN
-# and Manifest.permission.ACCESS_LOCAL_NETWORK, both API-37-only, but CI
-# compiles against android-36. PatchAndroidJar (ASM) adds just those two
-# constants to the SDK's android.jar in place, compile-time only. Same fix
-# the manual local build uses (work/android-36-patched.jar). Idempotent:
-# skip when CINNAMON_BUN is already present.
-SDK_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-ANDROID_JAR="$SDK_HOME/platforms/android-36/android.jar"
-if [ -z "$SDK_HOME" ] || [ ! -f "$ANDROID_JAR" ]; then
-  echo "android-36 android.jar not found under ANDROID_HOME=$SDK_HOME" >&2
-  exit 1
-fi
-if javap -classpath "$ANDROID_JAR" 'android.os.Build$VERSION_CODES' 2>/dev/null | grep -q CINNAMON_BUN; then
-  echo "android.jar already patched, skipping"
-else
-  javac -cp scripts/ci/asm-9.7.jar -d scripts/ci scripts/ci/PatchAndroidJar.java
-  java -cp "scripts/ci:scripts/ci/asm-9.7.jar" PatchAndroidJar "$ANDROID_JAR" "$ANDROID_JAR.patched"
-  mv "$ANDROID_JAR.patched" "$ANDROID_JAR"
-  javap -classpath "$ANDROID_JAR" 'android.os.Build$VERSION_CODES' | grep -q CINNAMON_BUN
-  echo "android.jar patched OK"
-fi
 
 echo "=== 1. gradle-wrapper.jar ==="
 WRAPPER_JAR="android/gradle/wrapper/gradle-wrapper.jar"
@@ -170,32 +158,4 @@ else
   echo "torrentserver AAR already present, skipping"
 fi
 ls -l "$AAR"
-echo "=== 6. Lower library-android AAR minCompileSdk 37 -> 36 ==="
-# The prebuilt com.lagradost.api:library-android:1.0.1 AAR declares
-# minCompileSdk=37 in META-INF/com/android/build/gradle/aar-metadata.properties,
-# and AGP's checkAarMetadata fails the build because :app compiles against
-# android-36 (API 37 is not published as a platform package, so bumping
-# compileSdk is not an option). The AAR's classes were already compiled
-# fine against android-36 by the manual local build, which never runs this
-# metadata check. Rewrite only that metadata line, in the CI checkout copy
-# (the committed AAR is untouched). No dependency-verification metadata
-# exists in this repo, so no checksum enforcement to trip over.
-python3 - <<'PY'
-import zipfile, shutil, os
-aar = "packages/cs3_engine/m2/com/lagradost/api/library-android/1.0.1/library-android-1.0.1.aar"
-meta = "META-INF/com/android/build/gradle/aar-metadata.properties"
-z = zipfile.ZipFile(aar)
-txt = z.read(meta).decode()
-assert "minCompileSdk=37" in txt, txt
-tmp = aar + ".tmp"
-with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
-    for item in z.infolist():
-        data = z.read(item.filename)
-        if item.filename == meta:
-            data = txt.replace("minCompileSdk=37", "minCompileSdk=36").encode()
-        out.writestr(item, data)
-z.close()
-shutil.move(tmp, aar)
-print("patched", aar, "minCompileSdk 37 -> 36")
-PY
 echo "CI Android setup complete."

@@ -445,12 +445,13 @@ jobs:
           java-version: '25'
           cache: gradle
 
-      # Android leg only: patch the android-36 android.jar with the two
-      # API-37 constants permission_handler_android references, restore the
-      # gitignored gradle-wrapper.jar, and lower the CloudStream AAR's
-      # minCompileSdk 37 -> 36 (same script release.yml uses; without it
-      # the Android leg fails at javac / checkAarMetadata).
-      - name: Restore Android CI assets + patch android.jar
+      # Android leg only: restore the gitignored gradle-wrapper.jar and
+      # rebuild the native AARs (same script release.yml uses). No android.jar
+      # patching any more: the app compiles against upstream's android-37.0
+      # (see android/build.gradle.kts), so permission_handler_android's
+      # API-37 constants and the CloudStream AAR's minCompileSdk 37 are
+      # satisfied natively.
+      - name: Restore Android CI assets
         if: matrix.name == 'Android'
         run: bash scripts/ci-android-setup.sh
 
@@ -831,10 +832,9 @@ jobs:
           java-version: '25'
           cache: gradle
 
-      # Same Android patch as the build job: the integration-test run
-      # compiles the app, so it needs the patched android-36 jar and the
-      # lowered CloudStream AAR minCompileSdk too.
-      - name: Restore Android CI assets + patch android.jar
+      # Same Android asset restore as the build job: the integration-test
+      # run compiles the app, so it needs the wrapper jar / native AARs too.
+      - name: Restore Android CI assets
         if: matrix.name == 'Android'
         run: bash scripts/ci-android-setup.sh
 

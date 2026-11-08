@@ -15,14 +15,14 @@ allprojects {
 // A platform hash rather than an API level: Google publishes API 37 only as
 // `android-37.0` (and 37.1, 37.2 ...), and AGP 8.13 turns a bare 37 into
 // `android-37`, a package that no longer exists - locally or for CI to fetch.
-extra["projectCompileSdk"] = "android-36.0"
+extra["projectCompileSdk"] = "android-37.0"
 // Android 17. Reviewed against its behaviour changes for apps targeting it
 // (2026-10-02): nothing here reaches the local network itself (casting goes
 // through external apps), plays audio in the background, opts out of
 // large-screen resizing, rewrites static finals through reflection, loads
 // native code with System.load() or draws widgets. A Stremio add-on a user
 // hosts on their own network would now need ACCESS_LOCAL_NETWORK.
-extra["projectTargetSdk"] = 36
+extra["projectTargetSdk"] = 37
 // Pinned rather than inherited from `flutter.ndkVersion` (28.2.13676358).
 // GitHub removes NDK 28 from every runner image on 2026-10-01; r29 is what they
 // keep alongside r27. r29 also emits 16 KB-aligned LOAD segments by default,
