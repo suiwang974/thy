@@ -55,14 +55,15 @@ jobs:
         run: flutter build apk --release --target-platform android-arm64
 
       - name: Rename APK
-        run: mv taohuayuan/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk taohuayuan-android-arm64-v2.9.0.apk
+        # 只打 arm64 一个包（不 split-per-abi），输出就是 app-release.apk，不是 app-arm64-v8a-release.apk。
+        run: mv taohuayuan/build/app/outputs/flutter-apk/app-release.apk taohuayuan-android-arm64-v2.9.0.apk
 
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1
         with:
           tag: taohuayuan-v2.9.0
           name: 桃花源 v2.9.0（重写版）
-          body: "桃花源从零重写版：全新 Flutter 原生，9 源内置，中文搜索，短视频真播。"
+          body: "桃花源从零重写版：全新 Flutter 原生，8 个在线源实时搜，中文搜索，短视频真播。"
           allowUpdates: true
           replacesArtifacts: true
           artifacts: taohuayuan-android-arm64-v2.9.0.apk

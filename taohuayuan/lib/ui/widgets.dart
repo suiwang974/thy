@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/video_item.dart';
 
-/// 封面图：本地 asset 或网络图；没有封面就显示文字卡（标题 + 来源 + 时长），绝不丢掉这条。
+/// 封面图：网络图；没有封面就显示文字卡（标题 + 来源 + 时长），绝不丢掉这条。
 class PosterThumb extends StatelessWidget {
   final VideoItem item;
   final double? height;
@@ -45,6 +45,9 @@ class PosterThumb extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
+          // 没封面的标清楚：不是图挂了，是源站没给封面，标题照样能看。
+          const Text('无封面', style: TextStyle(color: Colors.white38, fontSize: 10)),
+          const SizedBox(height: 4),
           Text(item.title, maxLines: 3, overflow: TextOverflow.ellipsis,
               style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
@@ -56,12 +59,15 @@ class PosterThumb extends StatelessWidget {
   }
 }
 
-/// 一张视频卡片：封面 + 标题 + 作者/批次/时长/来源。
+/// 一张视频卡片：图片占大头（16:9 宽卡），标题只一行放下面，
+/// 再一行小字（推荐理由，没有理由时是作者/来源/时长），不要大段文字抢位置。
+/// 推荐流里图片面积要大于文字面积：图片 16:9，文字最多两行小字。
 class VideoCard extends StatelessWidget {
   final VideoItem item;
   final VoidCallback onTap;
   final VoidCallback? onAuthorTap;
-  const VideoCard({super.key, required this.item, required this.onTap, this.onAuthorTap});
+  final String? reason; // 推荐理由（有就显示，没有就显示作者/来源/时长）
+  const VideoCard({super.key, required this.item, required this.onTap, this.onAuthorTap, this.reason});
 
   @override
   Widget build(BuildContext context) {
@@ -84,20 +90,11 @@ class VideoCard extends StatelessWidget {
                       child: Text(item.durationText, style: const TextStyle(color: Colors.white, fontSize: 11)),
                     ),
                   ),
-                if (!item.playable)
-                  Positioned(
-                    left: 6, top: 6,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(color: Colors.orange.shade800, borderRadius: BorderRadius.circular(4)),
-                      child: const Text('直链待补', style: TextStyle(color: Colors.white, fontSize: 11)),
-                    ),
-                  ),
               ],
             ),
           ),
           const SizedBox(height: 6),
-          Text(item.title, maxLines: 2, overflow: TextOverflow.ellipsis,
+          Text(item.title, maxLines: 1, overflow: TextOverflow.ellipsis,
               style: const TextStyle(color: Colors.white, fontSize: 13.5, fontWeight: FontWeight.w600)),
           const SizedBox(height: 3),
           Row(
@@ -109,9 +106,11 @@ class VideoCard extends StatelessWidget {
                 ),
               if (item.author.isNotEmpty) const SizedBox(width: 8),
               Expanded(
-                child: Text('${item.source}${item.batch.isEmpty ? '' : ' · ${item.batch}'}',
+                child: Text(
+                    reason ??
+                        '${item.source}${item.durationText.isEmpty ? '' : ' · ${item.durationText}'}',
                     maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                    style: TextStyle(color: reason != null ? Colors.pink.shade200 : Colors.white54, fontSize: 12)),
               ),
             ],
           ),

@@ -37,3 +37,17 @@ String mapSearchQuery(String raw) {
   }
   return q.trim().replaceAll(RegExp(r'\s+'), ' ');
 }
+
+/// 分类过滤：中文分类名 -> 匹配用的英文标签词（小写）。
+/// 匹配时看标题和 keywords 里有没有这些词；标题里有中文分类名本身也算命中。
+const Map<String, List<String>> kCategories = {
+  // 中文同义词也放进来：标题是中文的站（niacg、lianzu11）靠它们命中。
+  // “足”会连“足球”也命中，在这个 App 的语境里可以接受（标题含“足”基本都是足内容）。
+  '足控': ['foot', 'footjob', 'feet', 'soles', '足'],
+  '调教': ['femdom', 'domination', 'bdsm', '调教'],
+  '3D': ['3d', '3-d', 'cgi', 'hentai 3d'],
+  '亚洲': ['asian', 'japanese', 'chinese', 'korean', 'jav', '亚洲', '日本'],
+  '角色扮演': ['cosplay', 'roleplay', '角色扮演'],
+  '口交': ['blowjob', 'oral', '口交'],
+};
+

@@ -6,7 +6,7 @@ import '../services/store.dart';
 import 'player_screen.dart';
 import 'widgets.dart';
 
-/// 我的页：源开关、观看记录、关于。
+/// 我的页：源开关、观看记录、口味画像、关于。
 /// 源默认全部启用；关掉某个源后搜索就不再查它。
 class ProfileScreen extends StatefulWidget {
   final Store store;
@@ -31,6 +31,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
     )).then((_) => setState(() => _history = widget.store.historyItems()));
   }
 
+  String _fmtPos(int sec) {
+    final m = sec ~/ 60;
+    final s = sec % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
   @override
   Widget build(BuildContext context) {
     final sources = allSources();
@@ -47,8 +53,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
             final enabled = !widget.store.disabledSources.contains(s.id);
             return SwitchListTile(
               title: Text(s.name, style: const TextStyle(color: Colors.white)),
-              subtitle: Text(s.id == 'catalog' ? '片库 · 62 条在线目录' : '网络源',
-                  style: const TextStyle(color: Colors.white54)),
+              subtitle: const Text('网络源 · 实时搜索', style: TextStyle(color: Colors.white54)),
               value: enabled,
               activeThumbColor: Colors.pinkAccent,
               onChanged: (v) async {
@@ -57,25 +62,68 @@ class _ProfileScreenState extends State<ProfileScreen> {
               },
             );
           }),
-          const SectionTitle('观看记录'),
+          const SectionTitle('我的口味', subtitle: '只存手机本地，不上传；推荐就按这些算'),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '喜欢 ${widget.store.likedIds.length} 条 · 关注 ${widget.store.followedAuthors.length} 位作者 · 搜过 ${widget.store.searchTerms.length} 个词',
+                  style: const TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () async {
+                    await widget.store.clearTaste();
+                    setState(() => _history = widget.store.historyItems());
+                  },
+                  child: const Text('清除口味数据（回到冷启动：足控 / 3D / 亚洲）'),
+                ),
+              ],
+            ),
+          ),
+          const SectionTitle('观看记录', subtitle: '点开能接着看（续播）'),
           if (_history.isEmpty)
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 16),
               child: Text('还没看过片', style: TextStyle(color: Colors.white54)),
             )
           else
-            ..._history.take(20).map((v) => ListTile(
-                  leading: SizedBox(width: 96, child: PosterThumb(item: v, height: 54)),
-                  title: Text(v.title, maxLines: 1, overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: Colors.white, fontSize: 14)),
-                  subtitle: Text('${v.source}${v.durationText.isEmpty ? '' : ' · ${v.durationText}'}',
-                      style: const TextStyle(color: Colors.white54, fontSize: 12)),
-                  onTap: () => _open(v),
-                )),
+            ..._history.take(20).map((v) {
+              final ratio = widget.store.watchRatio(v.id);
+              final pos = widget.store.watchPosition(v.id);
+              return ListTile(
+                leading: SizedBox(width: 96, child: PosterThumb(item: v, height: 54)),
+                title: Text(v.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 14)),
+                subtitle: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${v.source}${v.durationText.isEmpty ? '' : ' · ${v.durationText}'}'
+                      '${ratio > 0 ? ' · 已看到 ${_fmtPos(pos)}（${(ratio * 100).round()}%）' : ''}',
+                      style: const TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                    if (ratio > 0)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: LinearProgressIndicator(
+                          value: ratio,
+                          minHeight: 3,
+                          backgroundColor: Colors.white24,
+                          valueColor: const AlwaysStoppedAnimation<Color>(Colors.pinkAccent),
+                        ),
+                      ),
+                  ],
+                ),
+                onTap: () => _open(v),
+              );
+            }),
           const SectionTitle('关于'),
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 16),
-            child: Text('桃花源 2.9.0 · 从零重写版\n片库 62 条是在线目录，点开走直链在线播，手机上没有下载过任何视频。',
+            child: Text('桃花源 2.9.0 · 从零重写版\n8 个在线源实时搜索，视频均在线播，手机上没有下载过任何视频。',
                 style: TextStyle(color: Colors.white54, fontSize: 13)),
           ),
           const SizedBox(height: 24),

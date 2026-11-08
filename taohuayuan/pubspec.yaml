@@ -1,5 +1,5 @@
 name: taohuayuan
-description: "桃花源 - 视频片库（从零重写，不套 SkyStream）"
+description: "桃花源 - 视频 App（从零重写，不套 SkyStream；8 个在线源实时搜）"
 publish_to: 'none'
 version: 2.9.0+1
 
@@ -24,6 +24,3 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/catalog.json
-    - assets/thumbs/

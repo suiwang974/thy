@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 
-import '../data/catalog.dart';
 import '../models/video_item.dart';
+import '../services/search_service.dart';
 import '../services/store.dart';
 import 'player_screen.dart';
 import 'widgets.dart';
 
 /// 追番页：关注的作者 + 喜欢的视频。
+/// 关注作者的新片走在线源实时搜作者名（最多同时搜 5 位作者，单个源 8 秒超时跳过）；
 /// 点作者名只看他的片；取消关注也在这里。
 class FollowingScreen extends StatefulWidget {
   final Store store;
@@ -18,8 +19,9 @@ class FollowingScreen extends StatefulWidget {
 }
 
 class _FollowingScreenState extends State<FollowingScreen> {
-  List<VideoItem> _catalog = [];
+  List<VideoItem> _followVideos = [];
   List<VideoItem> _liked = [];
+  bool _loading = true;
 
   @override
   void initState() {
@@ -28,11 +30,28 @@ class _FollowingScreenState extends State<FollowingScreen> {
   }
 
   Future<void> _load() async {
-    final catalog = await Catalog.load();
+    final follows = widget.store.followedAuthors.toList()..sort();
+    final svc = SearchService();
+    final found = <VideoItem>[];
+    // 最多同时搜 5 位作者，避免关注太多时拖太久。
+    await Future.wait(follows.take(5).map((author) async {
+      final results = await svc.searchAll(author);
+      final needle = author.toLowerCase();
+      for (final r in results) {
+        for (final v in r.items) {
+          if (v.author.toLowerCase().contains(needle) ||
+              v.title.toLowerCase().contains(needle)) {
+            found.add(v);
+          }
+        }
+      }
+    }));
     if (!mounted) return;
+    final seen = <String>{};
     setState(() {
-      _catalog = catalog;
+      _followVideos = found.where((v) => seen.add(v.id)).take(30).toList();
       _liked = widget.store.likedItems();
+      _loading = false;
     });
   }
 
@@ -45,7 +64,6 @@ class _FollowingScreenState extends State<FollowingScreen> {
   @override
   Widget build(BuildContext context) {
     final follows = widget.store.followedAuthors.toList()..sort();
-    final followVideos = _catalog.where((v) => follows.contains(v.author)).toList();
     return Scaffold(
       backgroundColor: const Color(0xFF141419),
       appBar: AppBar(
@@ -82,8 +100,13 @@ class _FollowingScreenState extends State<FollowingScreen> {
                   )).toList(),
                 ),
               ),
-            if (followVideos.isNotEmpty) ...[
-              const SectionTitle('关注作者的新片'),
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: CircularProgressIndicator(color: Colors.pinkAccent),
+              )
+            else if (_followVideos.isNotEmpty) ...[
+              const SectionTitle('关注作者的新片', subtitle: '8 个源实时搜出来的'),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: GridView.builder(
@@ -92,8 +115,8 @@ class _FollowingScreenState extends State<FollowingScreen> {
                   gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                     crossAxisCount: 2, crossAxisSpacing: 12, mainAxisSpacing: 14, childAspectRatio: 16 / 13,
                   ),
-                  itemCount: followVideos.length,
-                  itemBuilder: (_, i) => VideoCard(item: followVideos[i], onTap: () => _open(followVideos[i])),
+                  itemCount: _followVideos.length,
+                  itemBuilder: (_, i) => VideoCard(item: _followVideos[i], onTap: () => _open(_followVideos[i])),
                 ),
               ),
             ],

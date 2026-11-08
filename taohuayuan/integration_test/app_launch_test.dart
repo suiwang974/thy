@@ -26,7 +26,7 @@ void main() {
 
     expect(find.text('推荐'), findsWidgets);
     expect(find.text('短视频'), findsWidgets);
-    expect(find.text('搜索'), findsWidgets);
+    expect(find.text('时间表'), findsWidgets);
     expect(find.text('追番'), findsWidgets);
     expect(find.text('我的'), findsWidgets);
   });

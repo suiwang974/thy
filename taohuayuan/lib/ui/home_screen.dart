@@ -1,16 +1,19 @@
 import 'package:flutter/material.dart';
 
-import '../data/catalog.dart';
 import '../models/video_item.dart';
+import '../services/recommend.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
 import 'player_screen.dart';
+import 'search_screen.dart';
 import 'widgets.dart';
 
 /// 推荐页：首页。
-/// - 猜你喜欢：按口味加权（足控优先），每条写明推荐理由；
-/// - 关注的作者置顶：关注过的作者的新片排在前面；
-/// - 片库按批次列出；Eporner 热门在最后。
+/// - 数据全部走 8 个在线源的实时热门（没有本地目录）；
+/// - 开 App 先读缓存立刻显示，后台再刷新；
+/// - 猜你喜欢按推荐算法排（标签重合 + 作者加权 + 新鲜度 + 来源偏好，
+///   同一作者太多降权，80% 口味 + 20% 试新），每条写明推荐理由；
+/// - 关注的作者置顶：关注过的作者的新片排在前面。
 class HomeScreen extends StatefulWidget {
   final Store store;
   final void Function(String author) onAuthorTap;
@@ -21,9 +24,10 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  List<VideoItem> _catalog = [];
-  List<VideoItem> _trending = [];
+  List<ScoredItem> _ranked = [];
   bool _loading = true;
+  bool _refreshing = false;
+  String? _error;
 
   @override
   void initState() {
@@ -31,14 +35,51 @@ class _HomeScreenState extends State<HomeScreen> {
     _load();
   }
 
-  Future<void> _load() async {
-    final catalog = await Catalog.load();
-    final feed = await SearchService().homeFeed();
+  List<ScoredItem> _rank(List<VideoItem> items) {
+    return rankRecommendations(items, TasteProfile.fromStore(widget.store));
+  }
+
+  Future<void> _load({bool forceRefresh = false}) async {
+    // 先读缓存：有就立刻显示，不用等网络。
+    if (!forceRefresh) {
+      final (cached, _) = widget.store.loadFeedCache();
+      if (cached.isNotEmpty) {
+        setState(() {
+          _ranked = _rank(cached);
+          _loading = false;
+        });
+      }
+    }
+    setState(() => _refreshing = true);
+    final svc = SearchService();
+    var gotAny = false;
+    final feed = await svc.homeFeed(
+      onResult: (partial) {
+        if (!mounted) return;
+        gotAny = true;
+        setState(() {
+          _ranked = _rank(partial);
+          _loading = false;
+        });
+      },
+      // 慢的源后台再试回来：去重后并进推荐流，重新排。
+      onRetried: (extra) {
+        if (!mounted || extra.isEmpty) return;
+        final seen = _ranked.map((s) => s.item.id).toSet();
+        final fresh = extra.where((v) => !seen.contains(v.id)).toList();
+        if (fresh.isEmpty) return;
+        final all = [..._ranked.map((s) => s.item), ...fresh];
+        setState(() => _ranked = _rank(all));
+      },
+    );
     if (!mounted) return;
+    if (feed.isNotEmpty) {
+      await widget.store.saveFeedCache(feed);
+    }
     setState(() {
-      _catalog = catalog;
-      _trending = feed.where((v) => v.source == 'eporner').toList();
+      _refreshing = false;
       _loading = false;
+      if (!gotAny && _ranked.isEmpty) _error = '8 个源都没回来，检查网络后下拉刷新再试';
     });
   }
 
@@ -50,41 +91,69 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
+    if (_loading && _ranked.isEmpty) {
       return const Center(child: CircularProgressIndicator(color: Colors.pinkAccent));
     }
     final follows = widget.store.followedAuthors;
-    final likedAuthors = _catalog.where((v) => follows.contains(v.author)).toList();
-    final footFirst = _catalog.where((v) => v.keywords.any((k) => k.contains('足') || k == 'foot' || k == 'footjob')).toList();
-    final batches = <String, List<VideoItem>>{};
-    for (final v in _catalog) {
-      (batches[v.batch] ??= []).add(v);
-    }
+    final likedAuthors = _ranked.where((s) => s.item.author.isNotEmpty && follows.contains(s.item.author)).toList();
+    final likedIds = likedAuthors.map((s) => s.item.id).toSet();
+    final rest = _ranked.where((s) => !likedIds.contains(s.item.id)).toList();
+    final playlist = _ranked.map((s) => s.item).toList();
     return RefreshIndicator(
-      onRefresh: _load,
+      onRefresh: () => _load(forceRefresh: true),
       child: ListView(
         children: [
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 16, 16, 4),
             child: Text('桃花源', style: TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.bold)),
           ),
+          // 搜索放推荐页顶部：点一下进搜索页。
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: GestureDetector(
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => SearchScreen(store: widget.store),
+              )),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2A2A35),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.search, color: Colors.white54, size: 20),
+                    SizedBox(width: 8),
+                    Text('搜作者名 / 足、足交、八重神子…',
+                        style: TextStyle(color: Colors.white38, fontSize: 14)),
+                  ],
+                ),
+              ),
+            ),
+          ),
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 16),
             child: Text('猜你喜欢 · 按你的口味挑的', style: TextStyle(color: Colors.white54, fontSize: 13)),
           ),
+          if (_refreshing)
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Text('正在刷新热门…', style: TextStyle(color: Colors.white38, fontSize: 12)),
+            ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Text(_error!, style: const TextStyle(color: Colors.orange, fontSize: 13)),
+            ),
           if (likedAuthors.isNotEmpty) ...[
             const SectionTitle('关注的作者', subtitle: '你关注的作者排在最前面'),
-            _horizontalList(likedAuthors, _catalog),
+            _horizontalList(likedAuthors, playlist),
           ],
-          const SectionTitle('猜你喜欢', subtitle: '理由：足控、足与做爱同框优先，亚洲/游戏角色也算'),
-          _grid(footFirst.isEmpty ? _catalog.take(6).toList() : footFirst, _catalog),
-          for (final entry in batches.entries) ...[
-            SectionTitle('片库 · ${entry.key}', subtitle: '${entry.value.length} 段 · 点开直接在线播'),
-            _grid(entry.value, entry.value),
-          ],
-          if (_trending.isNotEmpty) ...[
-            const SectionTitle('Eporner 热门', subtitle: '全网热门，点开播源站直链'),
-            _grid(_trending.take(10).toList(), _trending),
+          const SectionTitle('猜你喜欢', subtitle: '理由写在每条下面：口味、关注的作者、新鲜热门、试新'),
+          _grid(rest.take(30).toList(), playlist),
+          if (rest.length > 30) ...[
+            const SectionTitle('更多热门', subtitle: '8 个源的实时热门'),
+            _grid(rest.skip(30).toList(), playlist),
           ],
           const SizedBox(height: 24),
         ],
@@ -92,7 +161,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _grid(List<VideoItem> items, List<VideoItem> playlist) {
+  Widget _grid(List<ScoredItem> items, List<VideoItem> playlist) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: GridView.builder(
@@ -103,15 +172,16 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         itemCount: items.length,
         itemBuilder: (_, i) => VideoCard(
-          item: items[i],
-          onTap: () => _open(items[i], playlist: playlist),
-          onAuthorTap: items[i].author.isEmpty ? null : () => widget.onAuthorTap(items[i].author),
+          item: items[i].item,
+          reason: items[i].reason,
+          onTap: () => _open(items[i].item, playlist: playlist),
+          onAuthorTap: items[i].item.author.isEmpty ? null : () => widget.onAuthorTap(items[i].item.author),
         ),
       ),
     );
   }
 
-  Widget _horizontalList(List<VideoItem> items, List<VideoItem> playlist) {
+  Widget _horizontalList(List<ScoredItem> items, List<VideoItem> playlist) {
     return SizedBox(
       height: 190,
       child: ListView.builder(
@@ -121,7 +191,11 @@ class _HomeScreenState extends State<HomeScreen> {
         itemBuilder: (_, i) => Container(
           width: 250,
           margin: const EdgeInsets.only(right: 12),
-          child: VideoCard(item: items[i], onTap: () => _open(items[i], playlist: playlist)),
+          child: VideoCard(
+            item: items[i].item,
+            reason: items[i].reason,
+            onTap: () => _open(items[i].item, playlist: playlist),
+          ),
         ),
       ),
     );
