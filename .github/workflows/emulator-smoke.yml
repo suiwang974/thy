@@ -27,6 +27,12 @@ jobs:
     name: Emulator launch test
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # The runner has no X display: the emulator's Qt UI dies with
+      # "Could not load the Qt platform plugin xcb" (run 42459444821
+      # attempt 4) before the emulator even boots. Offscreen Qt lets
+      # qemu start headless; the app itself never touches Qt.
+      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v7
       - uses: subosito/flutter-action@v2
@@ -97,7 +103,10 @@ jobs:
           # The debug APK is ~280 MB; the emulator's default userdata
           # partition is too small for a streamed install of it (the
           # previous run died with "Broken pipe" mid-install). Enlarge it.
-          emulator-options: -partition-size 4096
+          # -no-window/-no-audio: the runner has no display; without them
+          # the emulator's Qt UI fails to load the xcb plugin and qemu
+          # never boots (run 42459444821 attempt 4).
+          emulator-options: -partition-size 4096 -no-window -no-audio
           script: |
             adb install -r build/app/outputs/flutter-apk/app-debug.apk
             adb logcat -c
