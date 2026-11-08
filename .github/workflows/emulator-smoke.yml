@@ -84,7 +84,7 @@ jobs:
             test -n "$(adb shell pidof dev.akash.skystream)"
       - name: Upload launch evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: emulator-smoke-evidence
           path: |
