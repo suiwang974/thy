@@ -6,6 +6,11 @@ name: Taohuayuan Release
 
 on:
   workflow_dispatch:
+  # workflow_dispatch 在新分支上首次跑之前 API 会 404（workflow 未注册），
+  # 所以同时接受 tag 推送触发：打 tag 即打包。
+  push:
+    tags:
+      - 'taohuayuan-v*'
 
 permissions:
   contents: write
