@@ -279,7 +279,7 @@ class _ExtensionsScreenState extends ConsumerState<ExtensionsScreen>
             }
           },
         ),
-        title: const Text('SkyStream Providers'),
+        title: const Text('桃花源扩展'),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(48),
           child: Center(

@@ -305,6 +305,33 @@ final _joinedRun = RegExp(
   unicode: true,
 );
 
+/// 桃花源:中文搜索词 → 英文的映射.英文站(Eporner/XVideos 等)的 API 只认
+/// 英文,用户输「足」过去是 0 条.片库源自己认中文关键词,所以它
+/// 保持原词.映射表按长词在前:先换「足交」再换「足」,否则「足交」会被
+/// 拆成 foot+交.
+const _cnToEnSearchTerms = <String, String>{
+  '足交': 'footjob',
+  '足控': 'footjob',
+  '足': 'foot',
+  '八重神子': 'yae miko',
+  '甘雨': 'ganyu',
+  '流萤': 'firefly',
+  '芙宁娜': 'furina',
+  '夜兰': 'yelan',
+  '长离': 'changli',
+};
+
+String _localizedSearchQuery(SkyStreamProvider provider, String query) {
+  if (provider.packageName.contains('superlibrary.local')) return query;
+  var out = query;
+  for (final entry in _cnToEnSearchTerms.entries) {
+    if (out.contains(entry.key)) {
+      out = out.replaceAll(entry.key, entry.value);
+    }
+  }
+  return out;
+}
+
 /// Searches [manager]'s extensions for [query], with [others] (Stremio
 /// add-ons' and Nuvio's searchers) under the content filter.
 Stream<SearchAggregateState> searchAllProviders(
@@ -524,7 +551,12 @@ Stream<SearchAggregateState> searchAllProviders(
 
         try {
           debugPrint('[SEARCH DBG] START ${provider.packageName}');
-          final rawResults = await provider.search(query, cancelToken: token);
+          final effectiveQuery =
+              _localizedSearchQuery(provider, query);
+          final rawResults = await provider.search(
+            effectiveQuery,
+            cancelToken: token,
+          );
           debugPrint(
             '[SEARCH DBG] DONE ${provider.packageName} — rawResults=${rawResults.length}',
           );

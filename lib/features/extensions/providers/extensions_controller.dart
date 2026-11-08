@@ -14,7 +14,6 @@ import '../../../../core/extensions/extension_manager.dart';
 import '../../../../core/extensions/providers.dart';
 import '../../../../core/extensions/services/repository_service.dart';
 import '../../../core/models/extension_update_report.dart';
-import '../../../core/storage/settings_repository.dart';
 
 part 'extensions_controller.g.dart';
 
@@ -121,11 +120,10 @@ class ExtensionsController extends _$ExtensionsController {
       final repositoryService = ref.read(repositoryServiceProvider);
 
       // 1. Load Installed Plugins
+      // 桃花源: bundled asset plugins ALWAYS load here too (startup path) —
+      // same reason as loadInstalledPlugins: they are the app's content.
       final plugins = await storageService.listInstalledPlugins();
-      if (ref.read(settingsRepositoryProvider).getDevLoadAssets()) {
-        final assetPlugins = await _loadAssetPlugins();
-        plugins.addAll(assetPlugins);
-      }
+      plugins.addAll(await _loadAssetPlugins());
 
       // 2. Load Repositories.
       //
@@ -243,20 +241,17 @@ class ExtensionsController extends _$ExtensionsController {
       final storageService = ref.read(pluginStorageServiceProvider);
       final plugins = await storageService.listInstalledPlugins();
 
-      // Load Asset Plugins if enabled
-      if (ref.read(settingsRepositoryProvider).getDevLoadAssets()) {
-        final assetPlugins = await _loadAssetPlugins();
-        if (kDebugMode) {
-          debugPrint(
-            "ExtensionsController: Loaded ${assetPlugins.length} asset plugins",
-          );
-        }
-        plugins.addAll(assetPlugins);
-      } else {
-        if (kDebugMode) {
-          debugPrint("ExtensionsController: Asset loading disabled");
-        }
+      // 桃花源: bundled asset plugins (9 built-in sources incl.
+      // local-library) ALWAYS load — they are the app's content, not a dev
+      // option. The old dev_load_assets gate left "已安装" empty on a fresh
+      // install, which is how v2.9.0 shipped with zero sources.
+      final assetPlugins = await _loadAssetPlugins();
+      if (kDebugMode) {
+        debugPrint(
+          "ExtensionsController: Loaded ${assetPlugins.length} asset plugins",
+        );
       }
+      plugins.addAll(assetPlugins);
 
       state = ExtensionsSuccess(
         installedPlugins: plugins,

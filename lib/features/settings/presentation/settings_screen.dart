@@ -59,7 +59,7 @@ class SettingsScreen extends ConsumerWidget {
                   children: [
                     SettingsTile(
                       icon: Icons.extension_rounded,
-                      title: 'SkyStream Providers',
+                      title: '桃花源扩展',
                       subtitle: l10n.installRemoveProviders,
                       onTap: () => const ExtensionsRoute().go(context),
                     ),

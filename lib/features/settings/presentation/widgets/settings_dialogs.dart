@@ -82,8 +82,8 @@ String getHomeScreenLabel(String route, AppLocalizations l10n) {
   switch (route) {
     case '/home':
       return l10n.home;
-    case '/explore':
-      return l10n.explore;
+    case '/shorts':
+      return '短视频';
     case '/search':
       return l10n.search;
     case '/library':
@@ -102,7 +102,7 @@ void showDefaultHomeScreenDialog(
   final l10n = AppLocalizations.of(context)!;
   final options = <Map<String, String>>[
     {'label': l10n.home, 'route': '/home'},
-    {'label': l10n.explore, 'route': '/explore'},
+    {'label': '短视频', 'route': '/shorts'},
     {'label': l10n.search, 'route': '/search'},
     {'label': l10n.library, 'route': '/library'},
   ];

@@ -2,7 +2,6 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:skystream/l10n/generated/app_localizations.dart';
 
 import '../focus/app_focus.dart';
 import 'matte_glass_pill.dart';
@@ -25,32 +24,33 @@ class CustomBottomNavBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final localizations = AppLocalizations.of(context)!;
-    final destinations = <_BottomNavDestination>[
+    // 底部导航标签是硬编码中文，不走 l10n：顺序与 app_router 的分支顺序
+    // 一一对应（推荐 / 短视频 / 搜索 / 追番 / 我的）。
+    const destinations = <_BottomNavDestination>[
       _BottomNavDestination(
         icon: Icons.home_outlined,
         selectedIcon: Icons.home,
-        label: localizations.home,
+        label: '推荐',
+      ),
+      _BottomNavDestination(
+        icon: Icons.play_circle_outline,
+        selectedIcon: Icons.play_circle,
+        label: '短视频',
       ),
       _BottomNavDestination(
         icon: Icons.search_outlined,
         selectedIcon: Icons.search,
-        label: localizations.search,
-      ),
-      _BottomNavDestination(
-        icon: Icons.explore_outlined,
-        selectedIcon: Icons.explore,
-        label: localizations.explore,
+        label: '搜索',
       ),
       _BottomNavDestination(
         icon: Icons.video_library_outlined,
         selectedIcon: Icons.video_library,
-        label: localizations.library,
+        label: '追番',
       ),
       _BottomNavDestination(
-        icon: Icons.settings_outlined,
-        selectedIcon: Icons.settings,
-        label: localizations.settings,
+        icon: Icons.person_outline,
+        selectedIcon: Icons.person,
+        label: '我的',
       ),
     ];
 

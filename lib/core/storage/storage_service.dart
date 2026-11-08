@@ -291,7 +291,8 @@ class StorageService {
   }
 
   bool getDevLoadAssets() {
-    return _settingsBox.get('dev_load_assets', defaultValue: false) as bool;
+    // 桃花源: bundled asset plugins are the app's built-in content.
+    return _settingsBox.get('dev_load_assets', defaultValue: true) as bool;
   }
 
   Future<void> setDevQoeLog(bool enabled) async {

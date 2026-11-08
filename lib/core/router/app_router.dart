@@ -5,7 +5,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:go_router/go_router.dart';
 import 'package:skystream/features/home/presentation/home_screen.dart';
 import 'package:skystream/features/search/presentation/search_screen.dart';
-import '../../features/explore/presentation/explore_screen.dart';
+import 'package:skystream/features/shorts/presentation/shorts_screen.dart';
 import 'package:skystream/features/library/presentation/library_screen.dart';
 import 'package:skystream/features/addons/presentation/addons_screen.dart';
 import 'package:skystream/features/addons/presentation/addon_detail_screen.dart';
@@ -37,11 +37,11 @@ part 'app_router.g.dart';
     TypedStatefulShellBranch<HomeBranchData>(
       routes: [TypedGoRoute<HomeRoute>(path: '/home')],
     ),
+    TypedStatefulShellBranch<ShortsBranchData>(
+      routes: [TypedGoRoute<ShortsRoute>(path: '/shorts')],
+    ),
     TypedStatefulShellBranch<SearchBranchData>(
       routes: [TypedGoRoute<SearchRoute>(path: '/search')],
-    ),
-    TypedStatefulShellBranch<ExploreBranchData>(
-      routes: [TypedGoRoute<ExploreRoute>(path: '/explore')],
     ),
     TypedStatefulShellBranch<LibraryBranchData>(
       routes: [TypedGoRoute<LibraryRoute>(path: '/library')],
@@ -87,6 +87,17 @@ class HomeRoute extends GoRouteData with $HomeRoute {
   Widget build(BuildContext context, GoRouterState state) => const HomeScreen();
 }
 
+class ShortsBranchData extends StatefulShellBranchData {
+  const ShortsBranchData();
+}
+
+class ShortsRoute extends GoRouteData with $ShortsRoute {
+  const ShortsRoute();
+  @override
+  Widget build(BuildContext context, GoRouterState state) =>
+      const ShortsScreen();
+}
+
 class SearchBranchData extends StatefulShellBranchData {
   const SearchBranchData();
 }
@@ -96,17 +107,6 @@ class SearchRoute extends GoRouteData with $SearchRoute {
   @override
   Widget build(BuildContext context, GoRouterState state) =>
       const SearchScreen();
-}
-
-class ExploreBranchData extends StatefulShellBranchData {
-  const ExploreBranchData();
-}
-
-class ExploreRoute extends GoRouteData with $ExploreRoute {
-  const ExploreRoute();
-  @override
-  Widget build(BuildContext context, GoRouterState state) =>
-      const ExploreScreen();
 }
 
 class LibraryBranchData extends StatefulShellBranchData {
@@ -499,8 +499,8 @@ final rootNavigatorKey = GlobalKey<NavigatorState>();
 /// GoRouter an unknown initial location.
 const List<String> kShellBranchRoutes = [
   '/home',
+  '/shorts',
   '/search',
-  '/explore',
   '/library',
   '/settings',
 ];

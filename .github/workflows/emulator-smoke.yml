@@ -103,6 +103,9 @@ jobs:
           # The debug APK is ~280 MB; the emulator's default userdata
           # partition is too small for a streamed install of it (the
           # previous run died with "Broken pipe" mid-install). Enlarge it.
+          # No KVM on GitHub-hosted runners: cold boot takes >600s, so
+          # raise the boot timeout (default 600s timed out before).
+          emulator-boot-timeout: 1800
           # -no-window/-no-audio: the runner has no display; without them
           # the emulator's Qt UI fails to load the xcb plugin and qemu
           # never boots (run 42459444821 attempt 4).

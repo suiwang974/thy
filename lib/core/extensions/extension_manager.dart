@@ -766,7 +766,18 @@ class ActiveProvider extends _$ActiveProvider {
     final id = storage.getActiveProviderId();
 
     if (id == null) {
-      state = null;
+      // 桃花源: first launch has no saved provider — default to the bundled
+      // 片库源 (62-item online catalog) so Home shows content immediately
+      // instead of an empty "no provider" screen.
+      final local = currentProviders
+          .where(
+            (p) => p.packageName.contains('superlibrary.local'),
+          )
+          .toList();
+      final fallback = local.isNotEmpty
+          ? local.first
+          : (currentProviders.isNotEmpty ? currentProviders.first : null);
+      state = fallback;
       _targetProviderId = null;
       ref.read(providerResolutionLoadingProvider.notifier).set(false);
     } else {

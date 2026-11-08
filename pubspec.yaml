@@ -165,6 +165,8 @@ flutter:
   assets:
     - assets/plugins/
     - assets/images/
+    # 片库源（在线片库目录）的视频缩略图：短视频 tab 的封面。
+    - assets/thumbs/
     # The licence text for the bundled type family, shown in the in-app
     # licence page (see AppTheme's LicenseRegistry entry).
     - assets/fonts/OFL.txt

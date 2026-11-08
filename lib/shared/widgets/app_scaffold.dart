@@ -165,9 +165,9 @@ class _AppScaffoldState extends ConsumerState<AppScaffold> {
     switch (route) {
       case '/home':
         return 0;
-      case '/search':
+      case '/shorts':
         return 1;
-      case '/explore':
+      case '/search':
         return 2;
       case '/library':
         return 3;

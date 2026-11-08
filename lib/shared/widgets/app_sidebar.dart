@@ -2,7 +2,6 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:skystream/l10n/generated/app_localizations.dart';
 import 'package:skystream/core/utils/layout_constants.dart';
 
 import '../focus/app_focus.dart';
@@ -128,19 +127,20 @@ class _AppSidebarState extends ConsumerState<AppSidebar> {
 
   @override
   Widget build(BuildContext context) {
-    final l10n = AppLocalizations.of(context)!;
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
 
     // Watch the global D-pad mode provider
     final isDpadMode = ref.watch<bool>(isDpadActiveProvider);
 
+    // 侧边栏标签是硬编码中文，不走 l10n：顺序与 app_router 的分支顺序
+    // 一一对应（推荐 / 短视频 / 搜索 / 追番 / 我的）。
     final destinations = [
-      (Icons.home_outlined, Icons.home, l10n.home),
-      (Icons.search, Icons.search, l10n.search),
-      (Icons.explore_outlined, Icons.explore, l10n.explore),
-      (Icons.video_library_outlined, Icons.video_library, l10n.library),
-      (Icons.settings_outlined, Icons.settings, l10n.settings),
+      (Icons.home_outlined, Icons.home, '推荐'),
+      (Icons.play_circle_outline, Icons.play_circle, '短视频'),
+      (Icons.search, Icons.search, '搜索'),
+      (Icons.video_library_outlined, Icons.video_library, '追番'),
+      (Icons.person_outline, Icons.person, '我的'),
     ];
     assert(
       destinations.length == kSidebarDestinationCount,

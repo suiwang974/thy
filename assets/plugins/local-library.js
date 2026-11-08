@@ -1,5 +1,7 @@
-// Super Library — local-library plugin (SkyStream JS plugin format).
-// Built-in source: the 62 segments already downloaded locally (batches 01/02/03/04/05/07).
+// 桃花源 — 片库源 (SkyStream JS plugin format).
+// Online catalog: 62 entries (batches 01/02/03/04/05/07) with title/author/
+// duration/resolution/poster/direct stream link. Tapping an entry plays the
+// direct link online — nothing is downloaded to the phone.
 // Search is purely local string matching over the embedded catalog, so it
 // returns INSTANTLY (tier 1) — this is the fix for "search 足 = 0 results while
 // deep crawl is still running": instant sources answer first, deep sources
@@ -45,7 +47,7 @@
     try {
       var groups = {};
       LOCAL_CATALOG.forEach(function (v) {
-        var k = v.batch || '本地片库';
+        var k = v.batch || '片库';
         (groups[k] = groups[k] || []).push(toItem(v));
       });
       cb({ success: true, data: groups });
@@ -66,11 +68,11 @@
       var v = null;
       LOCAL_CATALOG.forEach(function (x) { if (x.id === id) v = x; });
       if (!v) throw new Error('not in local catalog: ' + url);
-      if (!v.streamUrl) throw new Error('needs relink: local file exists but no direct link preserved for ' + id + ' (batch 03 — re-scrape the niacg page to restore it)');
+      if (!v.streamUrl) throw new Error('直链待补:这条只有片目,直链待补 ' + id + ' (第 03 批 — 重新抓 niacg 页面可恢复)');
       var item = toItem(v);
-      // needsRelink entries (batch 03: local file exists, per-file direct
+      // needsRelink entries (batch 03: catalog entry exists, per-file direct
       // link was never preserved) get NO stream — a null URL would break
-      // the player. The UI must show "本地文件已下载，直链待补" instead.
+      // the player. The UI must show "直链待补" instead.
       if (v.streamUrl) item.streams = [{ url: v.streamUrl, source: v.sourceSite || 'local', headers: v.referer ? { Referer: v.referer } : {} }];
       cb({ success: true, data: item });
     } catch (e) { cb({ success: false, errorCode: 'LOAD_ERROR', message: String(e) }); }
@@ -82,7 +84,7 @@
       var v = null;
       LOCAL_CATALOG.forEach(function (x) { if (x.id === id) v = x; });
       if (!v) throw new Error('not in local catalog: ' + url);
-      if (!v.streamUrl) throw new Error('needs relink: local file exists but no direct link preserved for ' + id + ' (batch 03 — re-scrape the niacg page to restore it)');
+      if (!v.streamUrl) throw new Error('直链待补:这条只有片目,直链待补 ' + id + ' (第 03 批 — 重新抓 niacg 页面可恢复)');
       // Tier-3 playback: niacg segments MUST be fetched with the niacg page
       // as Referer — a browser <video> cannot do this, but SkyStream's native
       // network layer sends StreamResult.headers, so the player can.
