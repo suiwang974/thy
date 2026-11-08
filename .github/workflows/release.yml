@@ -106,6 +106,18 @@ jobs:
           java-version: '25'
           cache: gradle
 
+      # This repo is pushed as a text-only snapshot (the GitHub connector's
+      # push_files is UTF-8 only, no binaries), so the binary assets the
+      # Android build needs are restored/rebuilt here first: gradle wrapper
+      # jar, Outfit fonts, placeholder launcher icons, the CloudStream m2
+      # repo, and the TorrServer Android AAR. See scripts/ci-android-setup.sh.
+      - name: Set Up Go (for TorrServer AAR rebuild)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Restore binary assets + rebuild native AARs
+        run: bash scripts/ci-android-setup.sh
+
       - name: Install Dependencies
         run: |
           flutter pub get

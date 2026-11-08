@@ -1,0 +1,92 @@
+name: Emulator Smoke Test
+
+# Launch-crash test on a real Android emulator in GitHub Actions.
+# Builds a debug APK from the same text-only snapshot as release.yml, installs
+# it on an x86_64 emulator (API 36), launches MainActivity, and fails the job
+# if the app process is not alive a few seconds later. logcat + screenshot are
+# uploaded as artifacts either way, so a crash leaves a stack trace behind
+# instead of a guess.
+#
+# Caveats (read before treating a pass/fail as final):
+# - The emulator runs x86_64 with SwiftShader Vulkan; Impeller behaviour there
+#   is not identical to a OnePlus Android 16 / Adreno phone. A pass here rules
+#   out missing native libraries / broken packaging, not every GPU-init crash.
+# - The APK built here uses placeholder icons/fonts (see
+#   scripts/ci-android-setup.sh); the real 桃花源 icon is not in this repo.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.7
+
+jobs:
+  smoke:
+    name: Emulator launch test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Set Up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+      - name: Set Up Go (for TorrServer AAR rebuild)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Restore binary assets + rebuild native AARs
+        run: bash scripts/ci-android-setup.sh
+      - name: Install Dependencies
+        run: |
+          flutter pub get
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+      - name: Build Debug APK
+        run: |
+          cat > dart-defines.json << 'JSON_EOF'
+          {
+            "TMDB_API_KEY": "", "SIMKL_CLIENT_ID": "", "SIMKL_CLIENT_SECRET": "",
+            "SIMKL_V2_CLIENT_ID": "", "TRAKT_CLIENT_ID": "", "TRAKT_CLIENT_SECRET": "",
+            "MAL_CLIENT_ID": "", "MAL_CLIENT_SECRET": "", "ANILIST_CLIENT_ID": "",
+            "ANIMESKIP_CLIENT_ID": "", "OPENSUBTITLES_API_KEY": ""
+          }
+          JSON_EOF
+          flutter build apk --debug --dart-define-from-file=dart-defines.json
+      - name: Emulator launch test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          arch: x86_64
+          target: google_apis
+          profile: pixel_7
+          script: |
+            adb install -r build/app/outputs/flutter-apk/app-debug.apk
+            adb logcat -c
+            adb shell am start -n dev.akash.skystream/dev.akash.skystream.MainActivity
+            sleep 12
+            adb shell screencap -p /sdcard/launch.png
+            adb pull /sdcard/launch.png launch.png || true
+            adb logcat -d > logcat.txt || true
+            echo "--- process check ---"
+            adb shell pidof dev.akash.skystream && echo "APP_ALIVE" || echo "APP_NOT_RUNNING"
+            echo "--- fatal lines ---"
+            grep -E "FATAL EXCEPTION|AndroidRuntime|UnsatisfiedLinkError|dlopen failed" logcat.txt | head -40 || true
+            # Fail the job if the app process died.
+            test -n "$(adb shell pidof dev.akash.skystream)"
+      - name: Upload launch evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-smoke-evidence
+          path: |
+            launch.png
+            logcat.txt

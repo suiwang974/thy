@@ -26,7 +26,7 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application
-        android:label="Super Library 超级片库"
+        android:label="桃花源"
         android:name="dev.akash.cs3engine.android.ExtensionHostApplication"
         android:icon="@mipmap/ic_launcher"
         android:banner="@drawable/banner"
@@ -78,7 +78,11 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
-        <!-- Explicitly enable Impeller -->
+        <!-- Explicitly enable Impeller (upstream default). CI control build:
+             keep true here so a Gradle-built APK is a clean A/B against the
+             manual v3 build that set this false. If the Gradle build also
+             crashes instantly on Android 16, Impeller is implicated; if it
+             launches, the manual assembly was at fault. -->
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"
             android:value="true"
