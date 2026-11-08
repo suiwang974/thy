@@ -61,6 +61,20 @@ jobs:
           }
           JSON_EOF
           flutter build apk --debug --dart-define-from-file=dart-defines.json
+      # The debug build leaves several GB of intermediates / Gradle and Go
+      # caches behind, and the emulator step then has to download a ~1 GB
+      # system image on the same 14 GB runner disk: the previous run died
+      # with "No space left on device" installing it. The APK is already
+      # built, so drop everything the launch test no longer needs first.
+      - name: Free disk space for emulator
+        run: |
+          df -h /
+          rm -rf build/app/intermediates build/app/outputs/flutter-apk/app-debug.apk.dSYM 2>/dev/null || true
+          rm -rf .dart_tool/flutter_build
+          rm -rf ~/.gradle/caches ~/.gradle/daemon
+          rm -rf "$ANDROID_HOME"/system-images || true
+          rm -rf /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          df -h /
       - name: Emulator launch test
         uses: reactivecircus/android-emulator-runner@v2
         with:
