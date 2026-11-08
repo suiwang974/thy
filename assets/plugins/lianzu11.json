@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.lianzu11",
+  "name": "lianzu11",
+  "version": 1,
+  "baseUrl": "https://lianzu11.com",
+  "description": "lianzu11 恋足站搜索+直链 mp4, 无需 Referer",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.rule34videos",
+  "name": "rule34videos",
+  "version": 1,
+  "baseUrl": "https://rule34-videos.com",
+  "description": "Rule34Video 搜索 + r34content HLS 直链",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

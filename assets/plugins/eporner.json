@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.eporner",
+  "name": "eporner",
+  "version": 1,
+  "baseUrl": "https://www.eporner.com",
+  "description": "Eporner 官方 API 搜索, 分页拉满",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

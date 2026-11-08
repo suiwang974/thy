@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.niacg",
+  "name": "niacg",
+  "version": 1,
+  "baseUrl": "https://www.niacg.com",
+  "description": "niacg 搜索+直链(需 Referer, 原生层发送)",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.local",
+  "name": "local-library",
+  "version": 1,
+  "baseUrl": "local://",
+  "description": "内置本地源: 62 段已下载视频+封面, 秒回",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

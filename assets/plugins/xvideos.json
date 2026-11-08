@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.xvideos",
+  "name": "xvideos",
+  "version": 1,
+  "baseUrl": "https://www.xvideos.com",
+  "description": "XVideos 搜索",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

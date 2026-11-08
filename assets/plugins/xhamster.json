@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.xhamster",
+  "name": "xhamster",
+  "version": 1,
+  "baseUrl": "https://xhamster.com",
+  "description": "XHamster 搜索",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

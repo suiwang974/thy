@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.spankbang",
+  "name": "spankbang",
+  "version": 1,
+  "baseUrl": "https://spankbang.com",
+  "description": "SpankBang 搜索",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}

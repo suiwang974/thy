@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # scripts/ci-android-setup.sh
 #
-# Rebuilds / fetches the binary assets that cannot be pushed through the
-# GitHub connector's text-only snapshot push (push_files: UTF-8 only, no
-# binaries), so a GitHub Actions Android build can run from the text-only
-# source snapshot in this private repo.
+# Restores / rebuilds the binary assets that are gitignored upstream, so a
+# GitHub Actions Android build can run from the repo checkout:
+#   0. android-36 android.jar: patched in place with the two API-37 constants
+#      permission_handler_android 14.1.0 references (CINNAMON_BUN,
+#      ACCESS_LOCAL_NETWORK); compile-time only.
 #
 # What it restores, and why each is missing from the repo:
 #   1. android/gradle/wrapper/gradle-wrapper.jar  (binary, gitignored upstream)
@@ -25,6 +26,29 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+echo "=== 0. Patch android-36 android.jar (API-37 constants) ==="
+# permission_handler_android 14.1.0 references Build.VERSION_CODES.CINNAMON_BUN
+# and Manifest.permission.ACCESS_LOCAL_NETWORK, both API-37-only, but CI
+# compiles against android-36. PatchAndroidJar (ASM) adds just those two
+# constants to the SDK's android.jar in place, compile-time only. Same fix
+# the manual local build uses (work/android-36-patched.jar). Idempotent:
+# skip when CINNAMON_BUN is already present.
+SDK_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+ANDROID_JAR="$SDK_HOME/platforms/android-36/android.jar"
+if [ -z "$SDK_HOME" ] || [ ! -f "$ANDROID_JAR" ]; then
+  echo "android-36 android.jar not found under ANDROID_HOME=$SDK_HOME" >&2
+  exit 1
+fi
+if javap -classpath "$ANDROID_JAR" 'android.os.Build$VERSION_CODES' 2>/dev/null | grep -q CINNAMON_BUN; then
+  echo "android.jar already patched, skipping"
+else
+  javac -cp scripts/ci/asm-9.7.jar -d scripts/ci scripts/ci/PatchAndroidJar.java
+  java -cp "scripts/ci:scripts/ci/asm-9.7.jar" PatchAndroidJar "$ANDROID_JAR" "$ANDROID_JAR.patched"
+  mv "$ANDROID_JAR.patched" "$ANDROID_JAR"
+  javap -classpath "$ANDROID_JAR" 'android.os.Build$VERSION_CODES' | grep -q CINNAMON_BUN
+  echo "android.jar patched OK"
+fi
 
 echo "=== 1. gradle-wrapper.jar ==="
 WRAPPER_JAR="android/gradle/wrapper/gradle-wrapper.jar"

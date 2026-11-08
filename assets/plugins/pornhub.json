@@ -1,0 +1,17 @@
+{
+  "packageName": "dev.superlibrary.pornhub",
+  "name": "pornhub",
+  "version": 1,
+  "baseUrl": "https://www.pornhub.com",
+  "description": "Pornhub 搜索",
+  "authors": [
+    "super-library"
+  ],
+  "languages": [
+    "en",
+    "zh"
+  ],
+  "categories": [
+    "Adult"
+  ]
+}
