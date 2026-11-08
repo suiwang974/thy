@@ -170,4 +170,32 @@ else
   echo "torrentserver AAR already present, skipping"
 fi
 ls -l "$AAR"
+echo "=== 6. Lower library-android AAR minCompileSdk 37 -> 36 ==="
+# The prebuilt com.lagradost.api:library-android:1.0.1 AAR declares
+# minCompileSdk=37 in META-INF/com/android/build/gradle/aar-metadata.properties,
+# and AGP's checkAarMetadata fails the build because :app compiles against
+# android-36 (API 37 is not published as a platform package, so bumping
+# compileSdk is not an option). The AAR's classes were already compiled
+# fine against android-36 by the manual local build, which never runs this
+# metadata check. Rewrite only that metadata line, in the CI checkout copy
+# (the committed AAR is untouched). No dependency-verification metadata
+# exists in this repo, so no checksum enforcement to trip over.
+python3 - <<'PY'
+import zipfile, shutil, os
+aar = "packages/cs3_engine/m2/com/lagradost/api/library-android/1.0.1/library-android-1.0.1.aar"
+meta = "META-INF/com/android/build/gradle/aar-metadata.properties"
+z = zipfile.ZipFile(aar)
+txt = z.read(meta).decode()
+assert "minCompileSdk=37" in txt, txt
+tmp = aar + ".tmp"
+with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+    for item in z.infolist():
+        data = z.read(item.filename)
+        if item.filename == meta:
+            data = txt.replace("minCompileSdk=37", "minCompileSdk=36").encode()
+        out.writestr(item, data)
+z.close()
+shutil.move(tmp, aar)
+print("patched", aar, "minCompileSdk 37 -> 36")
+PY
 echo "CI Android setup complete."
