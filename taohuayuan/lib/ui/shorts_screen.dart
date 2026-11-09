@@ -12,6 +12,7 @@ import '../services/fullscreen_controls.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
+import '../services/web_search.dart';
 import 'author_screen.dart';
 import 'download_button.dart';
 
@@ -83,7 +84,30 @@ class ShortsScreen extends StatefulWidget {
   final Store store;
   final bool visible; // 短视频栏当前是不是显示的那一栏
   final ShortsRefreshController? refreshController; // 第 49 条：点栏刷新用
-  const ShortsScreen({super.key, required this.store, this.visible = true, this.refreshController});
+  // 第 55 条：搜索流模式——搜索页点进一个结果后竖滑只刷该搜索词的结果。
+  // searchQuery 为空 = 正常模式（推荐/最新/最热门三标签）；
+  // 非空 = 搜索流模式（不显示三标签、不轮换、不碰续播位置）。
+  // searchItems 是搜索页的结果列表（第 1 页），searchStartIndex 是点中的那条
+  // 在搜索流里的位置；webSearch 是搜索页的 WebView 搜索入口（翻页时
+  // niacg/lianzu11/hanime 才能接着翻）。入口回调 onSearchTap 由 main.dart
+  // 传（推 ShortsSearchScreen），避免 shorts_screen ↔ shorts_search_screen
+  // 循环引用。
+  final String? searchQuery;
+  final List<VideoItem>? searchItems;
+  final int searchStartIndex;
+  final WebSearchHandler? webSearch;
+  final VoidCallback? onSearchTap;
+  const ShortsScreen({
+    super.key,
+    required this.store,
+    this.visible = true,
+    this.refreshController,
+    this.searchQuery,
+    this.searchItems,
+    this.searchStartIndex = 0,
+    this.webSearch,
+    this.onSearchTap,
+  });
 
   @override
   State<ShortsScreen> createState() => _ShortsScreenState();
@@ -93,6 +117,22 @@ class ShortsScreen extends StatefulWidget {
 /// 时长未知的留着（没数据不能直接丢）。
 bool isShortForShorts(VideoItem v) => v.durationSec <= 0 || v.durationSec <= 1800;
 
+/// 第 55 条：搜索流 = 搜索结果里能进短视频的条目（30 分钟内或时长未知），
+/// 按网格顺序、去重；超半小时的长片不进竖滑流（第 16 条的规矩），点它进详情页。
+List<VideoItem> shortsSearchStream(List<VideoItem> items) {
+  final seen = <String>{};
+  return items.where((v) => isShortForShorts(v) && seen.add(v.id)).toList();
+}
+
+/// 第 55 条：网格里点中的那条在搜索流里的位置；点中的是长片时返回 -1
+///（调用方改进详情页，不进竖滑流）；越界同样返回 -1。
+int shortsSearchStartIndex(List<VideoItem> items, int tappedIndex) {
+  if (tappedIndex < 0 || tappedIndex >= items.length) return -1;
+  final target = items[tappedIndex];
+  if (!isShortForShorts(target)) return -1;
+  return shortsSearchStream(items).indexWhere((v) => v.id == target.id);
+}
+
 class _ShortsScreenState extends State<ShortsScreen> {
   /// 三个标签的列表（第 48 条）：推荐 = 底流原顺序；最新/最热门 = 各自排好序。
   /// 追加新批次时只在尾部接排好序的新批次，不整体重排——整体重排会让正在播
@@ -100,6 +140,13 @@ class _ShortsScreenState extends State<ShortsScreen> {
   List<VideoItem> _recItems = [];
   List<VideoItem> _newItems = [];
   List<VideoItem> _hotItems = [];
+  /// 第 55 条：搜索流模式的列表——只刷该搜索词的结果，不混进推荐流；
+  /// 超半小时的长片不进（第 16 条），只留能竖滑的。
+  List<VideoItem> _searchItems = [];
+  /// 第 55 条：搜索流翻页——第 1 页就是搜索页已出的结果，滑到底从第 2 页开始翻。
+  int _searchPage = 2;
+  /// 第 55 条：是不是搜索流模式（searchQuery 非空）。
+  bool get _searchMode => widget.searchQuery != null && widget.searchQuery!.isNotEmpty;
   /// “最新”标签额外的新片：eporner API order=latest 真拉的，只进最新，
   /// 不污染推荐。
   List<VideoItem> _latestExtra = [];
@@ -127,7 +174,8 @@ class _ShortsScreenState extends State<ShortsScreen> {
   void initState() {
     super.initState();
     _muted = ValueNotifier<bool>(widget.store.shortsMuted);
-    widget.refreshController?.bind(_refresh);
+    // 第 55 条：搜索流模式不绑点栏刷新（它不在底部栏里，刷新走搜索页重搜）。
+    if (!_searchMode) widget.refreshController?.bind(_refresh);
     _load();
   }
 
@@ -161,6 +209,22 @@ class _ShortsScreenState extends State<ShortsScreen> {
   /// App 启动时跑一次）轮换计数 +1，homeFeed 按它换词、换页取新一批；
   /// 位置从上次刷到的地方继续，不再每次从第 1 条开始。
   Future<void> _load() async {
+    // 第 55 条：搜索流模式——直接用搜索页传过来的结果（只留能竖滑的），
+    // 不轮换、不碰续播位置（推荐/最新/最热门的位置不能被搜索流污染）。
+    if (_searchMode) {
+      final stream = shortsSearchStream(widget.searchItems ?? const []);
+      final start = _clampPos(widget.searchStartIndex, stream.length);
+      setState(() {
+        _searchItems = stream;
+        _loading = false;
+        _currentPage.value = start;
+        _pageController = PageController(initialPage: start);
+      });
+      if (stream.isNotEmpty) {
+        unawaited(StreamResolver.prefetch(stream[(start + 1) % stream.length]));
+      }
+      return;
+    }
     final rotation = widget.store.shortsRotation + 1;
     await widget.store.setShortsRotation(rotation);
     final feed = await SearchService(disabledSources: widget.store.disabledSources)
@@ -186,7 +250,7 @@ class _ShortsScreenState extends State<ShortsScreen> {
   /// 第 48 条：切标签——先把当前标签的位置存下来，再跳到新标签上次的位置；
   /// 各标签互不干扰。第一次进“最新”才拉 eporner 的真新片（只拉一次）。
   Future<void> _switchTab(ShortsTab tab) async {
-    if (tab == _tab || _loading) return;
+    if (_searchMode || tab == _tab || _loading) return;
     await widget.store.setShortsPosition(_tab.name, _currentPage.value);
     if (tab == ShortsTab.newest && !_latestLoaded) {
       _latestLoaded = true;
@@ -209,7 +273,7 @@ class _ShortsScreenState extends State<ShortsScreen> {
   /// 49 是主动点才刷新；刷新后位置从 0 开始，之后随刷随存（下次打开接着续）。
   /// 刷不到新的（断网/源全挂）就留着上一批，不拿空白页充数。
   Future<void> _refresh() async {
-    if (_loading || _refreshing) return;
+    if (_searchMode || _loading || _refreshing) return;
     _refreshing = true;
     final gen = ++_feedGen;
     final rotation = widget.store.shortsRotation + 1;
@@ -287,6 +351,38 @@ class _ShortsScreenState extends State<ShortsScreen> {
   /// 追加的批次内部各自排好序接在尾部，不整体重排正在播的列表。
   Future<void> _loadMore() async {
     if (_loadingMore || _noMore) return;
+    // 第 55 条：搜索流滑到底——按同一个搜索词翻页（走已启用源、中文映射；
+    // WebView 搜索入口从搜索页带过来，niacg/lianzu11/hanime 才能接着翻），
+    // 追加的还是该搜索词的结果，不混推荐流。
+    if (_searchMode) {
+      setState(() => _loadingMore = true);
+      final gen = _feedGen;
+      final page = _searchPage++;
+      try {
+        final more = await SearchService(
+                disabledSources: widget.store.disabledSources, webSearch: widget.webSearch)
+            .searchPage(widget.searchQuery!, page);
+        if (!mounted || gen != _feedGen) {
+          if (mounted) setState(() => _loadingMore = false);
+          return;
+        }
+        final seen = _searchItems.map((v) => v.id).toSet();
+        final fresh = shortsSearchStream(more).where((v) => !seen.contains(v.id)).toList();
+        setState(() {
+          _loadingMore = false;
+          if (fresh.isEmpty) {
+            _emptyBatches++;
+            if (_emptyBatches >= 3) _noMore = true;
+          } else {
+            _emptyBatches = 0;
+            _searchItems = [..._searchItems, ...fresh];
+          }
+        });
+      } catch (_) {
+        if (mounted) setState(() => _loadingMore = false);
+      }
+      return;
+    }
     setState(() => _loadingMore = true);
     final gen = _feedGen;
     final q = _moreQueries[_moreQueryIdx % _moreQueries.length];
@@ -329,9 +425,14 @@ class _ShortsScreenState extends State<ShortsScreen> {
     if (_loading) {
       return const Center(child: CircularProgressIndicator(color: Colors.pinkAccent));
     }
-    final items = _itemsForTab(_tab);
+    final items = _searchMode ? _searchItems : _itemsForTab(_tab);
     if (items.isEmpty) {
-      return const Center(child: Text('短视频流是空的，检查网络后切到推荐页下拉刷新再试', style: TextStyle(color: Colors.white70)));
+      return Center(
+          child: Text(
+              _searchMode
+                  ? '这个搜索词没有能刷的短视频，换个词试试'
+                  : '短视频流是空的，检查网络后切到推荐页下拉刷新再试',
+              style: const TextStyle(color: Colors.white70)));
     }
     return Stack(
       children: [
@@ -342,7 +443,9 @@ class _ShortsScreenState extends State<ShortsScreen> {
           onPageChanged: (i) {
             _currentPage.value = i;
             // 第 46 条：位置随刷随存，退出重进从这里继续。
-            unawaited(widget.store.setShortsPosition(_tab.name, i));
+            // 第 55 条：搜索流不存位置（它不是推荐/最新/最热门任一标签，
+            // 退出搜索流再进还是从搜索页点进来，不续播）。
+            if (!_searchMode) unawaited(widget.store.setShortsPosition(_tab.name, i));
             // 滑到第 i 段，预探第 i+1 段的直链。
             if (i + 1 < items.length) unawaited(StreamResolver.prefetch(items[i + 1]));
             // 快滑到底了，提前加载下一批。
@@ -374,9 +477,16 @@ class _ShortsScreenState extends State<ShortsScreen> {
                   colors: [Colors.black54, Colors.transparent],
                 ),
               ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: ShortsTab.values.map((t) {
+              // 第 55 条：搜索流模式顶上是“‹ 搜索：词”，点 ‹ 回搜索结果页；
+              // 正常模式是三个标签 + 右边一个小放大镜（只要图标，不要输入框、不要文字）。
+              child: _searchMode
+                  ? _searchHeader()
+                  : Row(
+                      children: [
+                        Expanded(
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: ShortsTab.values.map((t) {
                   final selected = t == _tab;
                   return GestureDetector(
                     onTap: () => _switchTab(t),
@@ -402,11 +512,44 @@ class _ShortsScreenState extends State<ShortsScreen> {
                       ),
                     ),
                   );
-                }).toList(),
-              ),
+                            }).toList(),
+                          ),
+                        ),
+                        // 第 55 条：短视频栏顶上的搜索入口——只要一个小放大镜图标，
+                        // 不要输入框、不要文字；点一下打开搜索页，搜索框在搜索页里。
+                        IconButton(
+                          icon: const Icon(Icons.search, color: Colors.white, size: 22),
+                          tooltip: '搜索',
+                          onPressed: () => widget.onSearchTap?.call(),
+                        ),
+                      ],
+                    ),
             ),
           ),
         ),
+      ],
+    );
+  }
+
+  /// 第 55 条：搜索流顶栏——‹ 回搜索结果页 + 当前搜索词（只显示，不可编辑；
+  /// 要换词回搜索页搜）。系统返回键同样回搜索结果页（路由 pop）。
+  Widget _searchHeader() {
+    return Row(
+      children: [
+        IconButton(
+          icon: const Icon(Icons.chevron_left, color: Colors.white, size: 28),
+          tooltip: '回搜索结果',
+          onPressed: () => Navigator.of(context).maybePop(),
+        ),
+        Expanded(
+          child: Text(
+            '搜索：${widget.searchQuery}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+        ),
+        const SizedBox(width: 48),
       ],
     );
   }

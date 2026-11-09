@@ -11,6 +11,7 @@ import 'ui/browser_sources_screen.dart';
 import 'ui/home_screen.dart';
 import 'ui/profile_screen.dart';
 import 'ui/shorts_screen.dart';
+import 'ui/shorts_search_screen.dart';
 
 /// 桃花源：从零重写的视频 App，不套 SkyStream。
 /// 数据走 10 个在线源实时搜，没有本地目录。
@@ -113,10 +114,13 @@ class _HomeShellState extends State<HomeShell> {
     final pages = <Widget>[
       HomeScreen(store: widget.store, onAuthorTap: _openAuthor),
       // 短视频栏不可见时（用户在推荐页），短视频不许自动播出声（第 15 条）。
+      // 第 55 条：顶上的小放大镜点一下进短视频搜索（搜索框在搜索页里）。
       ShortsScreen(
           store: widget.store,
           visible: _index == 1,
-          refreshController: _shortsRefresh),
+          refreshController: _shortsRefresh,
+          onSearchTap: () => Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => ShortsSearchScreen(store: widget.store)))),
       BrowserSourcesScreen(store: widget.store),
       ProfileScreen(store: widget.store, onAuthorTap: _openAuthor),
     ];
