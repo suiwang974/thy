@@ -6,6 +6,7 @@ import '../models/video_item.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
 import 'player_screen.dart';
+import 'web_source_browser.dart';
 import 'widgets.dart';
 
 /// 搜索页：输入中文词，先映射成英文，再默认查全部已启用的源（不单选）。
@@ -25,10 +26,16 @@ class SearchScreen extends StatefulWidget {
 
 class _SearchScreenState extends State<SearchScreen> {
   final _controller = TextEditingController();
-  final _service = SearchService();
+  // 翻页也走开关：_loadMore 用的就是这个 service，之前没过开关，
+  // 搜完翻页会把已关掉的源又翻回来。
+  late final _service = SearchService(disabledSources: widget.store.disabledSources);
   List<VideoItem> _items = [];
   Map<String, int> _perSource = {};
-  List<String> _slowSources = []; // 超时/失败的源（后台再试中）
+  // 逐源状态（源名 -> 状态）：还在搜… / 12 条 / 超时（15秒），后台再试… /
+  // 超时（15秒），已试 3 次 / 没结果。搜了几秒就停、页面一片空白、
+  // 用户不知道哪个源在搜、哪个死了——状态必须逐源显示出来。
+  Map<String, String> _sourceStatus = {};
+  List<String> _queriedNames = [];
   bool _searching = false;
   bool _loadingMore = false;
   String _mappedQuery = '';
@@ -58,45 +65,62 @@ class _SearchScreenState extends State<SearchScreen> {
       _searching = true;
       _items = [];
       _perSource = {};
-      _slowSources = [];
+      _sourceStatus = {};
+      _queriedNames = [];
       _mappedQuery = mapSearchQuery(q);
       _lastQuery = q;
       _page = 1;
       _hasMore = false;
     });
-    // 先读缓存：搜过的词立刻显示，后台再刷新。
+    // 先读缓存：搜过的词立刻显示，后台再刷新。缓存里可能有已关掉的源的旧条目，
+    // 先按开关过滤掉。
     final cached = widget.store.loadSearchCache(q);
     if (cached.isNotEmpty && mounted) {
-      setState(() => _items = _filters.apply(cached));
+      final visible = cached.where((v) => !widget.store.disabledSources.contains(v.source)).toList();
+      setState(() => _items = _filters.apply(visible));
     }
     final enabled = _enabledSources;
     final svc = SearchService(
         sources: enabled.where((s) => _filters.sourceIds.isEmpty || _filters.sourceIds.contains(s.id)).toList());
+    // 先把要查的源都标成“还在搜”，回来的源再逐个改状态。
+    final queried = svc.sources;
+    setState(() {
+      _queriedNames = queried.map((s) => s.name).toList();
+      _sourceStatus = {for (final s in queried) s.name: '还在搜…'};
+    });
     final results = await svc.searchAll(q,
         filters: _filters,
         onResult: (partial) {
           if (!mounted) return;
           final merged = partial.expand((r) => r.items).toList();
           final counts = <String, int>{};
-          final slow = <String>[];
+          final status = Map<String, String>.from(_sourceStatus);
           for (final r in partial) {
             counts[r.sourceName] = r.items.length;
-            if (r.error != null) slow.add(r.sourceName);
+            status[r.sourceName] =
+                r.error != null ? '${r.error}，后台再试…' : '${r.items.length} 条';
           }
           setState(() {
             _items = merged;
             _perSource = counts;
-            _slowSources = slow;
+            _sourceStatus = status;
           });
         },
-        // 慢的源后台再试回来：去重后并进结果，慢源状态里去掉它。
+        // 慢的源后台再试回来：去重后并进结果，状态改成补回的条数。
         onRetried: (retried) {
           if (!mounted) return;
           setState(() {
             final seen = _items.map((v) => v.id).toSet();
             _items = [..._items, ...retried.items.where((v) => !seen.contains(v.id))];
             _perSource[retried.sourceName] = (_perSource[retried.sourceName] ?? 0) + retried.items.length;
-            _slowSources = _slowSources.where((n) => n != retried.sourceName).toList();
+            _sourceStatus[retried.sourceName] = '${retried.items.length} 条（后台补回）';
+          });
+        },
+        // 3 次都失败：状态从“后台再试”改成最终原因，不让用户一直等。
+        onRetryFailed: (failed) {
+          if (!mounted) return;
+          setState(() {
+            _sourceStatus[failed.sourceName] = failed.error ?? '失败';
           });
         });
     if (!mounted) return;
@@ -144,9 +168,26 @@ class _SearchScreenState extends State<SearchScreen> {
     }
   }
 
+  void _openWebSource(Source s) {
+    final q = _lastQuery ?? '';
+    final url = q.isEmpty ? s.webHomeUrl : s.webSearchUrl(q);
+    if (url.isEmpty) return;
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => WebSourceBrowser(
+        title: q.isEmpty ? s.name : '${s.name}：$q',
+        url: url,
+        sourceId: s.id,
+        store: widget.store,
+      ),
+    ));
+  }
+
   @override
   Widget build(BuildContext context) {
     final sources = _enabledSources;
+    // 成人动漫源（Hanime1/HanimeOne）要过 Cloudflare 验证，App 里直接搜不到，
+    // 只能去内置浏览器里搜；按钮放这里，有词就带词搜，没词就开首页。
+    final webSources = sources.where((s) => s.webViewOnly).toList();
     return Scaffold(
       backgroundColor: const Color(0xFF141419),
       appBar: AppBar(
@@ -194,30 +235,66 @@ class _SearchScreenState extends State<SearchScreen> {
               FilterChip(
                 label: const Text('全部'),
                 selected: _filters.sourceIds.isEmpty,
+                // “全部”是切换：全选时点一下取消全选（一个都不选），
+                // 再点一次恢复全选；只选了部分时点一下也是恢复全选。
                 onSelected: (_) => setState(() {
-                  _filters = _filters.copyWith(sourceIds: <String>{});
+                  _filters = _filters.copyWith(
+                      sourceIds: _filters.sourceIds.isEmpty
+                          ? const {SearchFilters.noneMarker}
+                          : <String>{});
                 }),
               ),
               ...sources.map((s) => FilterChip(
                     label: Text(s.name),
                     selected: _filters.sourceIds.isEmpty || _filters.sourceIds.contains(s.id),
                     onSelected: (on) {
-                      final ids = Set<String>.from(
-                          _filters.sourceIds.isEmpty ? sources.map((e) => e.id) : _filters.sourceIds);
+                      final ids = Set<String>.from(_filters.sourceIds)
+                        ..remove(SearchFilters.noneMarker);
+                      if (_filters.sourceIds.isEmpty) {
+                        ids.addAll(sources.map((e) => e.id));
+                      }
                       if (on) {
                         ids.add(s.id);
                       } else {
                         ids.remove(s.id);
                       }
                       setState(() {
-                        // 全选了就回到“空 = 全部”，省得一个个记。
+                        // 全选了就回到“空 = 全部”；一个都不剩就记成全不选标记。
                         _filters = _filters.copyWith(
-                            sourceIds: ids.length == sources.length ? <String>{} : ids);
+                            sourceIds: ids.isEmpty
+                                ? const {SearchFilters.noneMarker}
+                                : ids.length == sources.length
+                                    ? <String>{}
+                                    : ids);
                       });
                     },
                   )),
             ],
           ),
+          // 成人动漫源走内置浏览器（要过 Cloudflare 验证，App 里直接搜不到）。
+          if (webSources.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('成人动漫源要过验证，App 里直接搜不到，去内置浏览器里看：',
+                      style: TextStyle(color: Colors.white54, fontSize: 12)),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    children: webSources
+                        .map((s) => OutlinedButton(
+                              onPressed: () => _openWebSource(s),
+                              child: Text(_lastQuery == null || _lastQuery!.isEmpty
+                                  ? '打开 ${s.name}'
+                                  : '去 ${s.name} 搜「$_lastQuery」'),
+                            ))
+                        .toList(),
+                  ),
+                ],
+              ),
+            ),
           // 分类。
           _chipRow(
             label: '分类',
@@ -334,16 +411,25 @@ class _SearchScreenState extends State<SearchScreen> {
                 ],
               ),
             ),
-          if (_slowSources.isNotEmpty)
+          // 逐源状态：搜到多少条 / 还在搜 / 超时 / 失败，一眼看清哪个源死了。
+          if (_sourceStatus.isNotEmpty)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text('${_slowSources.join('、')} 超时，后台再试…',
-                        style: const TextStyle(color: Colors.orange, fontSize: 12)),
-                  ),
-                ],
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 4,
+                children: _queriedNames
+                    .where((n) => _sourceStatus.containsKey(n))
+                    .map((n) => Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: Colors.white10,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text('$n ${_sourceStatus[n]}',
+                              style: TextStyle(color: _statusColor(_sourceStatus[n]!), fontSize: 12)),
+                        ))
+                    .toList(),
               ),
             ),
           if (!_searching && _items.isNotEmpty)
@@ -364,7 +450,34 @@ class _SearchScreenState extends State<SearchScreen> {
             ),
           Expanded(
             child: _items.isEmpty && !_searching
-                ? const Center(child: Text('输入关键词搜全部源', style: TextStyle(color: Colors.white38)))
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24),
+                      child: _filters.selectsNone
+                          ? const Text('没选任何源，点“全部”恢复全选再搜',
+                              style: TextStyle(color: Colors.white38))
+                          : _lastQuery == null
+                              ? const Text('输入关键词搜全部源',
+                                  style: TextStyle(color: Colors.white38))
+                              : Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text('没搜到结果',
+                                        style: TextStyle(
+                                            color: Colors.white, fontSize: 16)),
+                                    const SizedBox(height: 10),
+                                    ..._emptyReasonLines().map((l) => Padding(
+                                          padding: const EdgeInsets.only(bottom: 4),
+                                          child: Text(l,
+                                              style: const TextStyle(
+                                                  color: Colors.white70,
+                                                  fontSize: 13)),
+                                        )),
+                                  ],
+                                ),
+                    ),
+                  )
                 : ListView(
                     children: [
                       Padding(
@@ -398,6 +511,49 @@ class _SearchScreenState extends State<SearchScreen> {
         ],
       ),
     );
+  }
+
+  Color _statusColor(String s) {
+    if (s.contains('已试') || s.contains('失败')) return Colors.redAccent;
+    if (s.contains('超时') || s.contains('还在搜') || s.contains('再试')) {
+      return Colors.orange;
+    }
+    if (s.contains('条')) return Colors.greenAccent;
+    return Colors.white54; // 没结果
+  }
+
+  /// 空结果时写明原因：是源超时/失败了，还是源回来了但确实没结果，
+  /// 还是搜到了但被筛选条件滤掉了。不要只剩空白页。
+  List<String> _emptyReasonLines() {
+    final lines = <String>[];
+    final failed = <String>[];
+    var anyEmpty = false;
+    var anyOk = false;
+    for (final n in _queriedNames) {
+      final s = _sourceStatus[n];
+      if (s == null) continue;
+      if (s.contains('已试') || s.contains('超时') || s.contains('失败')) {
+        failed.add('$n：$s');
+      } else if (s == '没结果') {
+        anyEmpty = true;
+      } else if (s.contains('条')) {
+        anyOk = true;
+      }
+    }
+    if (anyOk) {
+      lines.add('搜到了结果，但都被筛选条件（时长 / 画质 / 分类）滤掉了，');
+      lines.add('试试放宽条件再搜。');
+      return lines;
+    }
+    lines.addAll(failed);
+    if (failed.isNotEmpty) {
+      lines.add('不是没这个片，是源没回来；换个词或等一会儿再试。');
+    } else if (anyEmpty) {
+      lines.add('各源都回来了，确实没有匹配「$_lastQuery」的片，换个词试试。');
+    } else {
+      lines.add('换个词试试。');
+    }
+    return lines;
   }
 
   Widget _chipRow({required String label, required List<Widget> children}) {

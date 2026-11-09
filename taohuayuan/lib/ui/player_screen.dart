@@ -12,9 +12,11 @@ import '../services/stream_resolver.dart';
 /// 播放页：点开直接在线播。
 /// - 播放一律走直链、原生播（ExoPlayer，HLS/mp4 都行；niacg 的链带 Referer 头）；
 /// - 广告是源站页面和播放器周围加的，视频文件本身没广告；直链播就没广告，
-///   开源站页面才有广告。所以 App 里不放源站页面、不弹广告；
-/// - xvideos 优先直链，拿不到直链的才给“在源站看”当备选，备选页里有广告要如实说，
-///   而且是用户点了才打开，不自动开；
+///   开源站页面才有广告；
+/// - 直链拿不到 / 直链播不起来 / 直链是预览 → 自动切 App 内嵌官方播放器
+///   （WebView，源站播放页在 App 里打开，不踢出到外部浏览器），
+///   原因写在播放器上方，附“重试直链”按钮；有广告的站如实说，
+///   没广告的（niacg、lianzu11）直接嵌官方播；
 /// - 只有一套控制条 + 倍速选择；同列表内有上一段/下一段；
 /// - 打开时预探上一段/下一段的直链，点播放不用等；
 /// - 退出/切段时记看完比例（进推荐画像，已看完的不再推）；
@@ -37,6 +39,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   double _speed = 1.0;
   late VideoItem _current;
   bool _liked = false;
+  // 降权状态（持久保存）：点了图标要亮起，再点取消。之前只有动作、没有状态，
+  // 点了图标不亮、再点也不会恢复，用户以为按钮坏了。
+  bool _disliked = false;
   WebViewController? _webController;
 
   @override
@@ -44,6 +49,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     super.initState();
     _current = widget.item;
     _liked = widget.store.likedIds.contains(_current.id);
+    _disliked = widget.store.isDisliked(_current);
     _play(_current);
     widget.store.addHistory(_current);
     _prefetchNeighbors();
@@ -74,32 +80,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _error = null;
       _current = item;
       _liked = widget.store.likedIds.contains(item.id);
+      _disliked = widget.store.isDisliked(item);
     });
     await _controller?.dispose();
     _controller = null;
+    _webController = null;
     _prefetchNeighbors();
     final stream = await StreamResolver.resolve(item);
     if (!mounted) return;
     if (stream == null) {
-      // 没直链：不自动开源站页面。只给官方播放器/官方页当备选，用户点了才打开，
-      // 有广告的站如实说，没广告的（niacg、lianzu11）直接嵌官方播。
-      setState(() {
-        _loading = false;
-        _error = item.pageUrl != null && item.pageUrl!.isNotEmpty
-            ? (StreamResolver.sourcePageHasAds(item.source)
-                ? '这段拿不到直链，只能去源站看'
-                : '这段拿不到直链，用官方播放器看（无广告）')
-            : '找不到能直接播的地址';
-      });
+      // 没直链：自动切 App 内嵌官方播放器（WebView），不只给外跳按钮当唯一出路。
+      // 用户 2026-11-09 原话：能在本站看就在本站看，不要跑来跑去。
+      _embedOfficial('这段拿不到直链，改用源站官方播放器看');
       return;
     }
     if (stream.isPreview) {
       // 解析时已核出是短预览（比如 Eporner 1 分钟带水印预览）：不标成“能直接播”，
-      // 自动切备选并写明是预览。
-      setState(() {
-        _loading = false;
-        _error = _previewText(item, stream.durationSec);
-      });
+      // 自动切官方播放器并写明是预览。
+      _embedOfficial(_previewText(item, stream.durationSec));
       return;
     }
     try {
@@ -110,16 +108,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await c.initialize();
       if (!mounted) return;
       // mp4 在解析时算不出时长，这里用播放器初始化后的真实时长再核一次：
-      // 真实不到列表一半就是预览，不播，切备选并写明。
+      // 真实不到列表一半就是预览，不播，切官方播放器并写明。
       final actualSec = c.value.duration.inSeconds;
       if (StreamResolver.isPreviewDuration(listedSec: item.durationSec, actualSec: actualSec)) {
         await c.dispose();
         if (!mounted) return;
-        setState(() {
-          _loading = false;
-          _error = _previewText(item, actualSec);
-        });
+        _embedOfficial(_previewText(item, actualSec));
         return;
+      }
+      if (actualSec > 0 && item.durationSec > 0 && actualSec > item.durationSec * 2) {
+        // 真实时长比列表时长长一倍以上：列表写错了（比如列表写 156:52 这种
+        // 离谱值），显示改成真实时长，别让用户以为是另一条片。
+        _current = item.copyWith(durationSec: actualSec);
       }
       setState(() {
         _controller = c;
@@ -135,11 +135,75 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await c.play();
     } catch (e) {
       if (!mounted) return;
+      _embedOfficial('直链播不起来：${_shortReason(e)}');
+    }
+  }
+
+  /// 内嵌官方播放器（WebView 兜底）：源站播放页在 App 里打开，
+  /// 不踢出到外部浏览器；有广告的源站页面里有广告（写清楚），
+  /// niacg/lianzu11 官方站本身没广告。
+  /// 注意之前这里有个死代码 bug：_error 非空时 _buildVideoArea 永远走报错分支，
+  /// WebView 永远渲染不出来，点“在源站看”什么都没发生。
+  /// 现在 _webController 优先渲染（见 _buildVideoArea），_error 只当原因横幅。
+  void _embedOfficial(String reason) {
+    final embed = _current.embedUrl;
+    if (embed.isEmpty) {
       setState(() {
         _loading = false;
-        _error = '播不起来：$e';
+        _error = '$reason；这段也没有官方播放页可嵌';
       });
+      return;
     }
+    final wc = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(
+        onNavigationRequest: (req) {
+          // 官方播放器页内跳转放行；点到站外广告/下载链接时拦住，别把人带走。
+          final u = req.url;
+          if (u.contains('eporner.com') ||
+              u.contains('rule34-videos.com') ||
+              u.contains('niacg.com') ||
+              u.contains('lianzu11.com') ||
+              u.contains('hanime1.me') ||
+              u.contains('hanimeone.me') ||
+              u.contains('xvideos.com') ||
+              u.contains('xhamster.com') ||
+              u.contains('pornhub.com') ||
+              u.contains('spankbang.com') ||
+              u.startsWith('about:blank') ||
+              u.startsWith('data:')) {
+            return NavigationDecision.navigate;
+          }
+          return NavigationDecision.prevent;
+        },
+      ))
+      ..loadRequest(Uri.parse(embed));
+    _webController = wc;
+    setState(() {
+      _loading = false;
+      _error = reason;
+    });
+  }
+
+  /// 重试直链：清掉解析缓存（直链地址可能已过期），关掉官方播放器，重新解析播。
+  Future<void> _retryDirect() async {
+    StreamResolver.clearCacheFor(_current.id);
+    _webController = null;
+    await _play(_current);
+  }
+
+  /// 关掉官方播放器，回到报错界面（可以再重试直链或重新嵌官方）。
+  void _closeWeb() {
+    _webController = null;
+    setState(() {
+      _error = _error ?? '已关掉官方播放器';
+    });
+  }
+
+  /// 播放器报错的简短原因（PlatformException 的 message 太长，截到一行）。
+  String _shortReason(Object e) {
+    final s = e.toString().replaceAll(RegExp(r'\s+'), ' ');
+    return s.length > 90 ? '${s.substring(0, 90)}…' : s;
   }
 
   /// 预览提示：直链实际时长 + 列表时长都写出来，不假装是正片。
@@ -150,13 +214,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   /// 备选按钮文案（通用规则）：有广告的站如实说，没广告的直接说官方播放器。
+  /// 按钮点开是在 App 里嵌官方播放器，不踢出到外部浏览器。
   String get _fallbackButtonLabel => StreamResolver.sourcePageHasAds(_current.source)
-      ? '在源站看 ↗（源站页面有广告）'
-      : '在官方播放器看（无广告）';
+      ? '用官方播放器看（源站页面有广告）'
+      : '用官方播放器看（无广告）';
 
-  String get _fallbackNote => StreamResolver.sourcePageHasAds(_current.source)
-      ? '广告是源站页面加的，视频本身没广告；直链播就没有广告。'
-      : '${_current.source}官方站本身没广告，直接嵌官方播放器播。';
+  /// 报错区里的一行版说明（视频框只有约 220px 高，放不下两行说明）。
+  String get _fallbackNoteShort => StreamResolver.sourcePageHasAds(_current.source)
+      ? '广告是源站页面加的，视频本身没广告。'
+      : '官方站本身没广告，直接嵌官方播放器播。';
 
   void _playNext(int delta) {
     final list = widget.playlist;
@@ -207,13 +273,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   },
                 ),
                 IconButton(
-                  icon: const Icon(Icons.thumb_down_outlined, color: Colors.white70),
+                  icon: Icon(
+                      _disliked ? Icons.thumb_down : Icons.thumb_down_outlined,
+                      color: _disliked ? Colors.pinkAccent : Colors.white70),
                   tooltip: '不喜欢这类推荐',
                   onPressed: () async {
                     final messenger = ScaffoldMessenger.of(context);
-                    await widget.store.dislikeItem(_current);
+                    final now = await widget.store.toggleDislike(_current);
+                    if (!mounted) return;
+                    setState(() => _disliked = now);
                     messenger.showSnackBar(
-                      const SnackBar(content: Text('已降权这类推荐')),
+                      SnackBar(
+                          content:
+                              Text(now ? '已降权这类推荐' : '已取消降权')),
                     );
                   },
                 ),
@@ -225,6 +297,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
             aspectRatio: _isFullscreen ? 16 / 9 : 16 / 9,
             child: Container(
               color: Colors.black,
+              // 报错内容超高时裁掉，不许溢出画到下面的标题上（v3 截图里
+              // “在源站看”按钮就压在标题文字上了，就是这里没裁剪）。
+              clipBehavior: Clip.hardEdge,
               child: _buildVideoArea(c),
             ),
           ),
@@ -235,52 +310,96 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Widget _buildVideoArea(VideoPlayerController? c) {
+    // 内嵌官方播放器优先渲染（修死代码 bug：之前 _error 非空就永远走报错分支，
+    // WebView 永远渲染不出来，点“在源站看”什么都没发生）。
+    if (_webController != null) {
+      return Column(
+        children: [
+          Expanded(child: WebViewWidget(controller: _webController!)),
+          Container(
+            width: double.infinity,
+            color: const Color(0xFF2A2A35),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _error ?? '正在用源站官方播放器播',
+                  style: const TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: _retryDirect,
+                        child: const Text('重试直链'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: _closeWeb,
+                        child: const Text('关掉官方播放器'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      );
+    }
     if (_loading) {
       return const Center(child: CircularProgressIndicator(color: Colors.pinkAccent));
     }
     if (_error != null) {
+      // 报错区必须塞进 16:9 的视频框里（手机上约 220px 高）：图标、文字、
+      // 按钮全部收紧，超长报错截两行，说明只留一行。之前图标 48 + 三行报错 +
+      // 两行说明 + 大按钮，内容比框高，居中溢出后按钮直接画到下面的标题上。
       return Center(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.error_outline, color: Colors.white54, size: 48),
-              const SizedBox(height: 12),
-              Text(_error!, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)),
-              if (_current.pageUrl != null) ...[
-                const SizedBox(height: 8),
-                Text(_fallbackNote,
-                    textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54, fontSize: 12)),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: () {
-                    setState(() {
-                      _webController = WebViewController()
-                        ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                        ..loadRequest(Uri.parse(_current.pageUrl!));
-                    });
-                  },
-                  child: Text(_fallbackButtonLabel),
+              const Icon(Icons.error_outline, color: Colors.white54, size: 32),
+              const SizedBox(height: 6),
+              Text(_error!,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white70, fontSize: 13)),
+              if (_current.embedUrl.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(_fallbackNoteShort,
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: _retryDirect,
+                        child: const Text('重试'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => _embedOfficial('已切换到源站官方播放器'),
+                        child: Text(_fallbackButtonLabel),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ],
           ),
         ),
-      );
-    }
-    if (_webController != null) {
-      return Stack(
-        children: [
-          WebViewWidget(controller: _webController!),
-          Positioned(
-            right: 8, top: 8,
-            child: ElevatedButton(
-              onPressed: () => setState(() => _webController = null),
-              child: const Text('返回'),
-            ),
-          ),
-        ],
       );
     }
     if (c == null || !c.value.isInitialized) {
@@ -387,19 +506,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ),
               ],
             ),
-          // 备选只在直链播不起来时出现（_controller 为空），播得起来就不给源站页面入口。
-          if (_current.pageUrl != null && _controller == null) ...[
+          // 备选只在加载中出现：报错时视频区里已经有 [重试] [用官方播放器看]
+          // 两个按钮，这里再放一个同样的按钮纯属重复（v3 里两个“在源站看”
+          // 上下叠着，上面那个还压住了标题）。
+          // 点开是在 App 里嵌官方播放器，不踢出到外部浏览器。
+          if (_error == null && _current.embedUrl.isNotEmpty && _controller == null && _webController == null) ...[
             const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
               child: OutlinedButton(
-                onPressed: () {
-                  setState(() {
-                    _webController = WebViewController()
-                      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                      ..loadRequest(Uri.parse(_current.pageUrl!));
-                  });
-                },
+                onPressed: () => _embedOfficial('已切换到源站官方播放器'),
                 child: Text(_fallbackButtonLabel),
               ),
             ),

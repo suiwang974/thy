@@ -121,13 +121,50 @@ class Store {
   // ---- 不喜欢的标签（点“不喜欢”就降权这类推荐）----
   Set<String> get dislikedTags => _strList(_dislikedTagsKey).toSet();
 
+  /// 已降权的条目 id（持久保存，图标亮不亮就看这个）。
+  static const _dislikedItemsKey = 'taohuayuan_disliked_items';
+
+  Set<String> get dislikedItemIds => _strList(_dislikedItemsKey).toSet();
+
+  bool isDisliked(VideoItem item) => dislikedItemIds.contains(item.id);
+
   Future<void> dislikeItem(VideoItem item) async {
-    final tags = dislikedTags;
+    if (isDisliked(item)) return;
+    await toggleDislike(item);
+  }
+
+  /// 点一下降权、再点一下取消（切换），状态持久保存。
+  /// 降权时把这条的关键词按条目 id 存下来，取消时只撤掉这条贡献的标签——
+  /// 别的已降权条目共用的标签不会被误撤。返回切换后的状态（true=已降权）。
+  Future<bool> toggleDislike(VideoItem item) async {
+    final ids = dislikedItemIds;
+    final tagKey = 'taohuayuan_disliked_tags_${item.id}';
+    if (ids.contains(item.id)) {
+      ids.remove(item.id);
+      await _prefs.setStringList(_dislikedItemsKey, ids.toList());
+      await _prefs.remove(tagKey);
+      await _rebuildDislikedTags();
+      return false;
+    }
+    ids.add(item.id);
+    await _prefs.setStringList(_dislikedItemsKey, ids.toList());
+    final tags = <String>{};
     for (final k in item.keywords) {
       final t = k.trim().toLowerCase();
       if (t.isNotEmpty) tags.add(t);
     }
     if (item.author.isNotEmpty) tags.add('author:${item.author.toLowerCase()}');
+    await _prefs.setStringList(tagKey, tags.toList());
+    await _rebuildDislikedTags();
+    return true;
+  }
+
+  /// 降权标签 = 所有仍在降权状态的条目贡献的标签的并集。
+  Future<void> _rebuildDislikedTags() async {
+    final tags = <String>{};
+    for (final id in dislikedItemIds) {
+      tags.addAll(_prefs.getStringList('taohuayuan_disliked_tags_$id') ?? []);
+    }
     await _prefs.setStringList(_dislikedTagsKey, tags.toList());
   }
 

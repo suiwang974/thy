@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_item.dart';
 import '../services/search_service.dart';
@@ -31,7 +32,7 @@ class _ShortsScreenState extends State<ShortsScreen> {
   }
 
   Future<void> _load() async {
-    final feed = await SearchService().homeFeed();
+    final feed = await SearchService(disabledSources: widget.store.disabledSources).homeFeed();
     if (!mounted) return;
     setState(() {
       // 实时热门流：直接拿来竖滑真播（解析不到直链的段，进页后显示“暂时播不了”，可继续滑走）。
@@ -77,6 +78,7 @@ class _ShortPage extends StatefulWidget {
 
 class _ShortPageState extends State<_ShortPage> {
   VideoPlayerController? _controller;
+  WebViewController? _webController;
   String? _error;
   bool _liked = false;
   late VideoItem _displayItem; // 预探补全后的条目（封面/时长补上了就用补全版）
@@ -95,12 +97,12 @@ class _ShortPageState extends State<_ShortPage> {
     // 解析完用补全后的条目显示和核时长（详情页预探时顺带补了封面/时长）。
     _displayItem = StreamResolver.enrich(widget.item);
     if (stream == null) {
-      setState(() => _error = '这段拿不到直链，滑走看下一段');
+      _embedOfficial('这段拿不到直链，用官方播放器看');
       return;
     }
     if (stream.isPreview) {
-      // 解析时已核出是短预览：不播，滑走看下一段。
-      setState(() => _error = '这段只有预览，滑走看下一段');
+      // 解析时已核出是短预览：不播直链，嵌官方播放器看正片。
+      _embedOfficial('这段直链只有预览，用官方播放器看');
       return;
     }
     try {
@@ -113,15 +115,70 @@ class _ShortPageState extends State<_ShortPage> {
       if (StreamResolver.isPreviewDuration(listedSec: _displayItem.durationSec, actualSec: actualSec)) {
         await c.dispose();
         if (!mounted) return;
-        setState(() => _error = '这段只有预览，滑走看下一段');
+        _embedOfficial('这段直链只有预览，用官方播放器看');
         return;
+      }
+      if (actualSec > 0 && _displayItem.durationSec > 0 && actualSec > _displayItem.durationSec * 2) {
+        // 真实时长比列表时长长一倍以上：列表写错了，显示改成真实时长。
+        _displayItem = _displayItem.copyWith(durationSec: actualSec);
       }
       setState(() => _controller = c);
       await c.setLooping(true);
       await c.play();
     } catch (e) {
-      if (mounted) setState(() => _error = '播不起来');
+      if (mounted) {
+        final s = e.toString().replaceAll(RegExp(r'\s+'), ' ');
+        _embedOfficial('播不起来：${s.length > 90 ? '${s.substring(0, 90)}…' : s}');
+      }
     }
+  }
+
+  /// 内嵌官方播放器（WebView 兜底）：源站播放页在 App 里打开，不踢出到外部浏览器。
+  /// 原因写在顶部横幅，附“重试直链”按钮。
+  void _embedOfficial(String reason) {
+    final embed = _displayItem.embedUrl;
+    if (embed.isEmpty) {
+      setState(() => _error = '$reason；这段也没有官方播放页可嵌，滑走看下一段');
+      return;
+    }
+    final wc = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(
+        onNavigationRequest: (req) {
+          final u = req.url;
+          if (u.contains('eporner.com') ||
+              u.contains('rule34-videos.com') ||
+              u.contains('niacg.com') ||
+              u.contains('lianzu11.com') ||
+              u.contains('hanime1.me') ||
+              u.contains('hanimeone.me') ||
+              u.contains('xvideos.com') ||
+              u.contains('xhamster.com') ||
+              u.contains('pornhub.com') ||
+              u.contains('spankbang.com') ||
+              u.startsWith('about:blank') ||
+              u.startsWith('data:')) {
+            return NavigationDecision.navigate;
+          }
+          return NavigationDecision.prevent;
+        },
+      ))
+      ..loadRequest(Uri.parse(embed));
+    setState(() {
+      _webController = wc;
+      _error = reason;
+    });
+  }
+
+  /// 重试直链：清掉解析缓存，关掉官方播放器，重新解析播。
+  Future<void> _retryDirect() async {
+    StreamResolver.clearCacheFor(widget.item.id);
+    _webController = null;
+    _error = null;
+    await _controller?.dispose();
+    _controller = null;
+    setState(() {});
+    await _init();
   }
 
   @override
@@ -158,12 +215,75 @@ class _ShortPageState extends State<_ShortPage> {
               if (c == null) return;
               setState(() => c.value.isPlaying ? c.pause() : c.play());
             },
-            child: c != null && c.value.isInitialized
-                ? Center(child: AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c)))
-                : _error != null
-                    ? Center(child: Text(_error!, style: const TextStyle(color: Colors.white70)))
-                    : const Center(child: CircularProgressIndicator(color: Colors.pinkAccent)),
+            child: _webController != null
+                ? WebViewWidget(controller: _webController!)
+                : c != null && c.value.isInitialized
+                    ? Center(child: AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c)))
+                    : _error != null
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(_error!, textAlign: TextAlign.center,
+                                      style: const TextStyle(color: Colors.white70, fontSize: 15)),
+                                  const SizedBox(height: 16),
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      ElevatedButton(
+                                        onPressed: _retryDirect,
+                                        child: const Text('重试直链'),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      OutlinedButton(
+                                        onPressed: () => _embedOfficial('已切换到源站官方播放器'),
+                                        child: const Text('官方播放器'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        : const Center(child: CircularProgressIndicator(color: Colors.pinkAccent)),
           ),
+          if (_webController != null)
+            Positioned(
+              left: 12, right: 12, top: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(_error ?? '正在用源站官方播放器播',
+                        style: const TextStyle(color: Colors.white70, fontSize: 13)),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        ElevatedButton(
+                          onPressed: _retryDirect,
+                          child: const Text('重试直链'),
+                        ),
+                        const SizedBox(width: 8),
+                        OutlinedButton(
+                          onPressed: () => setState(() {
+                            _webController = null;
+                            _error = '已关掉官方播放器，可重试直链或滑走';
+                          }),
+                          child: const Text('关掉官方播放器'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
           if (c != null && !c.value.isPlaying)
             const Center(child: Icon(Icons.play_circle_fill, color: Colors.white70, size: 80)),
           Positioned(

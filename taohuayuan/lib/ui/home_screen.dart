@@ -40,18 +40,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _load({bool forceRefresh = false}) async {
-    // 先读缓存：有就立刻显示，不用等网络。
+    // 先读缓存：有就立刻显示，不用等网络。缓存里可能有已关掉的源的旧条目，
+    // 显示前先按开关过滤掉，关掉的源一条都不许出现。
     if (!forceRefresh) {
       final (cached, _) = widget.store.loadFeedCache();
-      if (cached.isNotEmpty) {
+      final visible = cached.where((v) => !widget.store.disabledSources.contains(v.source)).toList();
+      if (visible.isNotEmpty) {
         setState(() {
-          _ranked = _rank(cached);
+          _ranked = _rank(visible);
           _loading = false;
         });
       }
     }
     setState(() => _refreshing = true);
-    final svc = SearchService();
+    final svc = SearchService(disabledSources: widget.store.disabledSources);
     var gotAny = false;
     final feed = await svc.homeFeed(
       onResult: (partial) {
@@ -79,7 +81,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _refreshing = false;
       _loading = false;
-      if (!gotAny && _ranked.isEmpty) _error = '8 个源都没回来，检查网络后下拉刷新再试';
+      if (!gotAny && _ranked.isEmpty) _error = '所有源都没回来，检查网络后下拉刷新再试';
     });
   }
 
@@ -152,7 +154,7 @@ class _HomeScreenState extends State<HomeScreen> {
           const SectionTitle('猜你喜欢', subtitle: '理由写在每条下面：口味、关注的作者、新鲜热门、试新'),
           _grid(rest.take(30).toList(), playlist),
           if (rest.length > 30) ...[
-            const SectionTitle('更多热门', subtitle: '8 个源的实时热门'),
+            const SectionTitle('更多热门', subtitle: '各源的实时热门'),
             _grid(rest.skip(30).toList(), playlist),
           ],
           const SizedBox(height: 24),

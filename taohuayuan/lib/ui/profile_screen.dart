@@ -4,6 +4,7 @@ import '../data/sources.dart';
 import '../models/video_item.dart';
 import '../services/store.dart';
 import 'player_screen.dart';
+import 'web_source_browser.dart';
 import 'widgets.dart';
 
 /// 我的页：源开关、观看记录、口味画像、关于。
@@ -53,7 +54,25 @@ class _ProfileScreenState extends State<ProfileScreen> {
             final enabled = !widget.store.disabledSources.contains(s.id);
             return SwitchListTile(
               title: Text(s.name, style: const TextStyle(color: Colors.white)),
-              subtitle: const Text('网络源 · 实时搜索', style: TextStyle(color: Colors.white54)),
+              subtitle: Text(
+                s.webViewOnly ? '成人动漫 · 要过验证，在内置浏览器里打开' : '网络源 · 实时搜索',
+                style: const TextStyle(color: Colors.white54),
+              ),
+              // 成人动漫源点右侧图标进内置浏览器（首页）。
+              secondary: s.webViewOnly
+                  ? IconButton(
+                      icon: const Icon(Icons.open_in_browser, color: Colors.pinkAccent),
+                      tooltip: '在内置浏览器里打开',
+                      onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => WebSourceBrowser(
+                          title: s.name,
+                          url: s.webHomeUrl,
+                          sourceId: s.id,
+                          store: widget.store,
+                        ),
+                      )),
+                    )
+                  : null,
               value: enabled,
               activeThumbColor: Colors.pinkAccent,
               onChanged: (v) async {

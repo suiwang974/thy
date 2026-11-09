@@ -1,5 +1,7 @@
-/// 一个视频条目：来自 8 个在线源之一的搜索/热门结果。
-/// 没有本地目录：所有数据都是实时从网上查来的。
+// 一个视频条目：来自 10 个在线源之一的搜索/热门结果。
+// 没有本地目录：所有数据都是实时从网上查来的。
+import 'dart:convert';
+
 class VideoItem {
   final String id;
   final String title;
@@ -37,6 +39,16 @@ class VideoItem {
 
   /// 能不能直接播（有直链）。
   bool get playable => streamUrl != null && streamUrl!.isNotEmpty;
+
+  /// App 内嵌官方播放器用的地址：eporner 走官方 embed 页
+  /// （https://www.eporner.com/embed/{id}/，干净的播放器页，比视频详情页广告少）；
+  /// 其他源直接用视频页。
+  String get embedUrl {
+    if (source == 'eporner' && id.startsWith('eporner-')) {
+      return 'https://www.eporner.com/embed/${id.substring('eporner-'.length)}/';
+    }
+    return pageUrl ?? '';
+  }
 
   VideoItem copyWith({
     String? title,
@@ -76,6 +88,42 @@ class VideoItem {
     return r.contains('1080') || r.contains('2160') || r.contains('4k') || r.contains('1440');
   }
 
+  /// 乱码修复：UTF-8 字节被当成 latin1 解出来的标题（比如 "Iâ€™m" 其实是 "I'm"、
+  /// "â€¦" 其实是 "…"），按字节重新拼回来再按 UTF-8 解。
+  /// 乱码特征：含 â 或 Ã（UTF-8 多字节的首字节被当成 latin1 字符）。
+  /// Eporner 的 API 甚至直接在 JSON 里写 \u00e2\u0080\u0099 这种转义，
+  /// 乱码长在数据里，光改解码还不够，标题进屏前必须过这一道。
+  /// 修完还有替换符、或特征还在、或有无法映射的字符的，原样返回，不硬修。
+  static String repairMojibake(String s) {
+    if (!s.contains('â') && !s.contains('Ã')) return s;
+    const cp1252 = <int, int>{
+      0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85,
+      0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A,
+      0x2039: 0x8B, 0x0152: 0x8C, 0x017D: 0x8E, 0x2018: 0x91, 0x2019: 0x92,
+      0x201C: 0x93, 0x201D: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97,
+      0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A, 0x203A: 0x9B, 0x0153: 0x9C,
+      0x017E: 0x9E, 0x0178: 0x9F,
+    };
+    try {
+      final bytes = <int>[];
+      for (final unit in s.codeUnits) {
+        if (unit <= 0xFF) {
+          bytes.add(unit);
+        } else if (cp1252.containsKey(unit)) {
+          bytes.add(cp1252[unit]!);
+        } else {
+          return s; // 有正常多字节字符，说明不是纯乱码，不动它
+        }
+      }
+      final fixed = utf8.decode(bytes);
+      if (fixed.contains('�')) return s;
+      if (fixed.contains('â') || fixed.contains('Ã')) return s;
+      return fixed;
+    } catch (_) {
+      return s;
+    }
+  }
+
   String get durationText {
     if (durationSec <= 0) return '';
     final m = durationSec ~/ 60;
@@ -103,8 +151,10 @@ class VideoItem {
 
   factory VideoItem.fromJson(Map<String, dynamic> j) => VideoItem(
         id: (j['id'] ?? '') as String,
-        title: (j['title'] ?? '') as String,
-        author: (j['author'] ?? '') as String,
+        // 缓存/记录里可能存着旧的乱码标题（latin1 误解 UTF-8 的产物），
+        // 读出来时顺手修掉，乱码标题不许再上屏。
+        title: repairMojibake((j['title'] ?? '') as String),
+        author: repairMojibake((j['author'] ?? '') as String),
         batch: (j['batch'] ?? '') as String,
         durationSec: ((j['durationSec'] ?? 0) as num).toInt(),
         resolution: (j['resolution'] ?? '') as String,

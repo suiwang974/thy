@@ -54,9 +54,9 @@ void main() {
     expect(items[0].title, '恋足视频一');
   });
 
-  test('8 个在线源，没有本地目录源', () {
+  test('10 个在线源，没有本地目录源', () {
     final ids = allSources().map((s) => s.id).toList();
-    expect(ids, ['eporner', 'rule34videos', 'niacg', 'lianzu11', 'xvideos', 'xhamster', 'pornhub', 'spankbang']);
+    expect(ids, ['eporner', 'rule34videos', 'niacg', 'lianzu11', 'hanime1', 'hanimeone', 'xvideos', 'xhamster', 'pornhub', 'spankbang']);
     expect(ids, isNot(contains('catalog')));
   });
 
@@ -119,5 +119,84 @@ void main() {
     expect(items.length, 2);
     expect(items[0].durationSec, 30);
     expect(items[1].durationSec, 300);
+  });
+
+  test('标题乱码修复：Eporner API 里的 \\u00e2\\u0080\\u0099 其实是 ’，进屏前修回来', () {
+    // 2026-11-09 用户截图：标题显示成 "(RM) Iâ€™m Getting In Shape For You, My Belovedâ€¦"。
+    // API 的 JSON 里直接写着 \u00e2\u0080\u0099（UTF-8 字节被当 latin1 转义进来的），
+    // 乱码长在数据里，光改解码不够，标题进屏前必须修。
+    final items = EpornerSource.parseVideos([
+      {
+        'id': 'tYHgyWTFB3A',
+        'title': '(RM) Iâ\u0080\u0099m Getting In Shape For You, My Belovedâ\u0080¦ But My Trainerâ\u0080\u0099s Intense Back Piston Is So Amazing',
+        'length_sec': 9412,
+        'url': 'https://www.eporner.com/video-tYHgyWTFB3A/',
+      },
+    ]);
+    expect(items.length, 1);
+    expect(items[0].title,
+        "(RM) I’m Getting In Shape For You, My Beloved… But My Trainer’s Intense Back Piston Is So Amazing");
+    // 乱码特征不许再出现。
+    expect(items[0].title.contains('â'), isFalse);
+  });
+
+  test('标题清洗：r34 相关视频 alt 里末尾的 " thumbnail" 要去掉', () {
+    const html = '''
+<a href=/video/chun-li-gym-doggy-da><img alt="Chun-Li Gym Doggy! thumbnail"><span>3:56</span></a>
+<a href=/video/other><img alt="Plain Title"><span>1:02</span></a>
+''';
+    final items = Rule34VideosSource.parseSearchHtml(html);
+    expect(items.length, 2);
+    expect(items[0].title, 'Chun-Li Gym Doggy!');
+    expect(items[1].title, 'Plain Title');
+  });
+
+  test('标题清洗：标题里的画质词是标题本身，不动（真机截图里就是 "4k ultra hd"）', () {
+    final items = EpornerSource.parseVideos([
+      {
+        'id': 'x1',
+        'title': 'milf footjob and long cumshot tasty blowjob 4k ultra hd alena lamlam',
+        'length_sec': 860,
+        'url': 'https://www.eporner.com/video-x1/',
+      },
+    ]);
+    expect(items[0].title,
+        'milf footjob and long cumshot tasty blowjob 4k ultra hd alena lamlam');
+  });
+
+  test('Hanime1 解析：按 Kazumi 规则结构（href 带 watch 的链接 + div.title）', () {
+    // 注意：这是按 Kazumi Hanime1.json v0.3 结构写的假 HTML；
+    // 真页没见过（VM 下 hanime1.me 被 Cloudflare 403），手机上若 HTTP 通了按此解析。
+    const html = '''
+<a href="/watch?v=12345"><div class="title">Test Hentai Title</div><img src="https://cdn.example.com/poster.jpg"><span>24:36</span></a>
+<a href="/watch?v=67890"><div class="home-rows-videos-title">Second Title</div></a>
+<a href="/videos/999">不是 watch 链接，不收</a>
+''';
+    final items = HanimeSource.parseSearchHtml(html, 'hanime1.me', 'hanime1');
+    expect(items.length, 2);
+    expect(items[0].title, 'Test Hentai Title');
+    expect(items[0].pageUrl, 'https://hanime1.me/watch?v=12345');
+    expect(items[0].poster, 'https://cdn.example.com/poster.jpg');
+    expect(items[0].durationSec, 1476);
+    expect(items[0].source, 'hanime1');
+    expect(items[1].title, 'Second Title');
+  });
+
+  test('Hanime 源：webViewOnly，搜索地址带 genre=裏番', () {
+    final h1 = HanimeSource('hanime1.me');
+    final hone = HanimeSource('hanimeone.me');
+    expect(h1.id, 'hanime1');
+    expect(hone.id, 'hanimeone');
+    expect(h1.webViewOnly, isTrue);
+    expect(hone.webViewOnly, isTrue);
+    expect(h1.webSearchUrl('foot'),
+        'https://hanime1.me/search?query=foot&page=1&genre=%E8%A3%8F%E7%95%AA');
+    expect(hone.webHomeUrl, 'https://hanimeone.me/');
+    // 10 个源里有它俩。
+    final ids = allSources().map((s) => s.id).toList();
+    expect(ids.length, 10);
+    expect(ids, containsAll(['hanime1', 'hanimeone']));
+    expect(allSources().where((s) => s.webViewOnly).map((s) => s.id),
+        ['hanime1', 'hanimeone']);
   });
 }

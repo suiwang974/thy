@@ -30,7 +30,7 @@ class _AuthorScreenState extends State<AuthorScreen> {
   }
 
   Future<void> _load() async {
-    final results = await SearchService().searchAll(widget.author);
+    final results = await SearchService(disabledSources: widget.store.disabledSources).searchAll(widget.author);
     if (!mounted) return;
     final needle = widget.author.toLowerCase();
     final all = results.expand((r) => r.items).toList();

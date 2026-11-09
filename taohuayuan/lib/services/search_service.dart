@@ -15,6 +15,14 @@ enum SortOrder { relevance, newest, mostViewed, longest }
 /// - hdOnly：只留 1080p+；分辨率未知的条目同样不丢（源站没给数据）。
 class SearchFilters {
   final Set<String> sourceIds;
+
+  /// “一个都不选”的标记：sourceIds 里只有这个值时表示全不选。
+  /// 空集 = 全选（历史约定），所以全不选不能用空集表示，只能用标记。
+  /// 搜索页点“全部”就是在“全选”和“全不选”之间切换。
+  static const noneMarker = '__none__';
+
+  /// 当前是不是“一个源都没选”。
+  bool get selectsNone => sourceIds.length == 1 && sourceIds.contains(noneMarker);
   final String category;
   final int minDurationSec;
   final int maxDurationSec;
@@ -79,7 +87,10 @@ class SearchFilters {
 }
 
 /// 多源搜索：默认查全部已启用的源，并行发出，结果随到随回。
-/// - 每个源单独 8 秒超时：超时的源跳过、不拖全场（返回一条带 error 的结果）；
+/// - 每个源单独超时：普通源 8 秒，慢源（niacg、lianzu11、hanime1、hanimeone）
+///   15 秒；超时的源跳过、不拖全场（返回一条带 error 的结果）；
+/// - 慢源后台继续试：第一次失败后 2 秒试第 2 次、再 8 秒后试第 3 次，
+///   成功了通过 onRetried 补回来，3 次都失败通过 onRetryFailed 告诉界面；
 /// - 中文词映射走所有搜索路径（searchAll / searchPage / homeFeed 的兜底搜索
 ///   都先过 mapSearchQuery，33a1582 只接一条路导致供应商页搜“足” 0 结果的教训）。
 class SearchService {
@@ -88,19 +99,46 @@ class SearchService {
   /// 单个源最多等 8 秒，超时就跳过，不拖全场。
   static const sourceTimeout = Duration(seconds: 8);
 
+  /// 慢源（niacg、lianzu11、hanime1、hanimeone：抓页面慢、还常被墙）
+  /// 第一次放宽到 15 秒——用户只开这两个源时，8 秒一刀切会让两个都超时、
+  /// 看起来全死了。放宽后首屏慢一点，但状态会显示“还在搜”，不无声停掉。
+  static const slowSourceTimeout = Duration(seconds: 15);
+  static const _slowSourceIds = {'niacg', 'lianzu11', 'hanime1', 'hanimeone'};
+
+  /// 慢源后台最多再试次数（不含第一次）：第 1 次失败后 2 秒试第 2 次，
+  /// 再失败 8 秒后试第 3 次；3 次都失败才算死，通过 onRetryFailed 告诉界面。
+  static const maxRetries = 2;
+  static const _retryDelays = [Duration(seconds: 2), Duration(seconds: 8)];
+
+  Duration _timeoutFor(Source s) =>
+      _slowSourceIds.contains(s.id) ? slowSourceTimeout : sourceTimeout;
+
   /// 最近一次搜索/热门流里每个源花了多少毫秒（源 id -> 毫秒）。
   final Map<String, int> lastLatencies = {};
 
-  SearchService({List<Source>? sources}) : sources = sources ?? allSources();
+  /// 关掉的源（“我的”里的开关）：这些源不查、不出现在任何结果里。
+  /// 之前只在搜索页过滤，推荐页和短视频用的 homeFeed 根本没过开关，
+  /// 用户只开 Niacg/Lianzu11，推荐里照样出现 eporner——开关只是摆设。
+  /// 现在服务层强制生效：推荐、短视频、搜索、追番、作者页全走这一道。
+  final Set<String> disabledSources;
+
+  SearchService({List<Source>? sources, Set<String> disabledSources = const {}})
+      : disabledSources = disabledSources,
+        sources = (sources ?? allSources())
+            .where((s) => !disabledSources.contains(s.id))
+            .toList();
 
   /// 搜一次：先把中文词映射成英文，再并行查所有源。
   /// 每当某个源返回，就调一次 onResult（带着目前为止的全部结果，先回来的先显示）。
-  /// 慢的源后台再试：超时/失败的源不挡首屏，2 秒后再试一次，成功了通过 onRetried 补回来。
+  /// 慢的源后台继续试：超时/失败的源不挡首屏，2 秒后试第 2 次、再 8 秒后试
+  /// 第 3 次，成功了通过 onRetried 补回来；3 次都失败通过 onRetryFailed
+  /// 告诉界面“已试 3 次”，不让用户对着空白页猜。
   Future<List<SourceResult>> searchAll(
     String rawQuery, {
     SearchFilters? filters,
     void Function(List<SourceResult> partial)? onResult,
     void Function(SourceResult retried)? onRetried,
+    void Function(SourceResult failed)? onRetryFailed,
   }) async {
     final query = mapSearchQuery(rawQuery);
     final active = _activeSources(filters);
@@ -109,9 +147,12 @@ class SearchService {
       final sw = Stopwatch()..start();
       SourceResult r;
       try {
-        r = await s.search(query).timeout(sourceTimeout);
+        r = await s.search(query).timeout(_timeoutFor(s));
       } on TimeoutException {
-        r = SourceResult(sourceId: s.id, sourceName: s.name, error: '超时（8秒）');
+        r = SourceResult(
+            sourceId: s.id,
+            sourceName: s.name,
+            error: '超时（${_timeoutFor(s).inSeconds}秒）');
       } catch (e) {
         r = SourceResult(sourceId: s.id, sourceName: s.name, error: e.toString());
       }
@@ -122,32 +163,54 @@ class SearchService {
       done.add(r);
       onResult?.call(List.of(done));
     }));
-    if (onRetried != null) {
+    if (onRetried != null || onRetryFailed != null) {
       for (final r in done.where((r) => r.error != null)) {
         final s = active.firstWhere((e) => e.id == r.sourceId);
-        unawaited(_retrySearch(s, query, filters, onRetried));
+        unawaited(_retrySearch(s, query, filters, onRetried, onRetryFailed));
       }
     }
     return done;
   }
 
-  Future<void> _retrySearch(Source s, String query, SearchFilters? filters, void Function(SourceResult) onRetried) async {
-    await Future.delayed(const Duration(seconds: 2));
-    try {
-      final sw = Stopwatch()..start();
-      final r = await s.search(query).timeout(sourceTimeout);
-      sw.stop();
-      lastLatencies[s.id] = sw.elapsedMilliseconds;
-      if (r.items.isEmpty) return;
-      onRetried(SourceResult(
-        sourceId: r.sourceId,
-        sourceName: r.sourceName,
-        items: filters != null ? filters.apply(r.items) : r.items,
-        elapsedMs: sw.elapsedMilliseconds,
-      ));
-    } catch (_) {
-      // 后台再试失败也不打扰用户。
+  Future<void> _retrySearch(Source s, String query, SearchFilters? filters,
+      void Function(SourceResult)? onRetried,
+      void Function(SourceResult)? onRetryFailed) async {
+    String lastError = '失败';
+    for (var attempt = 0; attempt < maxRetries; attempt++) {
+      await Future.delayed(_retryDelays[attempt]);
+      try {
+        final sw = Stopwatch()..start();
+        final r = await s.search(query).timeout(_timeoutFor(s));
+        sw.stop();
+        lastLatencies[s.id] = sw.elapsedMilliseconds;
+        if (r.items.isEmpty && r.error == null) {
+          // 空结果不是失败：确实没结果，不继续试了。
+          onRetryFailed?.call(SourceResult(
+              sourceId: s.id, sourceName: s.name, error: '没结果'));
+          return;
+        }
+        if (r.items.isEmpty) {
+          lastError = r.error ?? '失败';
+          continue;
+        }
+        onRetried?.call(SourceResult(
+          sourceId: r.sourceId,
+          sourceName: r.sourceName,
+          items: filters != null ? filters.apply(r.items) : r.items,
+          elapsedMs: sw.elapsedMilliseconds,
+        ));
+        return;
+      } on TimeoutException {
+        lastError = '超时（${_timeoutFor(s).inSeconds}秒）';
+      } catch (e) {
+        lastError = e.toString();
+      }
     }
+    // 3 次都失败：把最终原因告诉界面，状态从“后台再试”改成“已试 3 次”。
+    onRetryFailed?.call(SourceResult(
+        sourceId: s.id,
+        sourceName: s.name,
+        error: '$lastError，已试 ${maxRetries + 1} 次'));
   }
 
   /// 分页搜第 page 页（搜索页“加载更多”用）：每个源只抓这一页，并行返回合并后的条目。
@@ -160,7 +223,7 @@ class SearchService {
     final active = _activeSources(filters);
     final results = await Future.wait(active.map((s) async {
       try {
-        return await s.searchPage(query, page).timeout(sourceTimeout);
+        return await s.searchPage(query, page).timeout(_timeoutFor(s));
       } catch (_) {
         return SourceResult(sourceId: s.id, sourceName: s.name);
       }
@@ -170,7 +233,7 @@ class SearchService {
     return items;
   }
 
-  /// 首页推荐流：8 个源并行取热门。
+  /// 首页推荐流：各源并行取热门。
   /// 有 home() 的源走 home()；没有的（niacg 首页无列表、xvideos 等）走默认词搜索兜底，
   /// 默认词按源的站内偏好分（3D 站搜 3d、综合站搜足控/亚洲），冷启动口味一致。
   /// 每当某个源回结果就调一次 onResult，先回来的先显示；单个源 8 秒超时跳过。
@@ -185,9 +248,9 @@ class SearchService {
       final sw = Stopwatch()..start();
       SourceResult r;
       try {
-        r = await s.home().timeout(sourceTimeout);
+        r = await s.home().timeout(_timeoutFor(s));
         if (r.items.isEmpty) {
-          r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(sourceTimeout);
+          r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(_timeoutFor(s));
         }
       } catch (_) {
         r = SourceResult(sourceId: s.id, sourceName: s.name);
@@ -210,23 +273,29 @@ class SearchService {
   }
 
   Future<void> _retryHome(Source s, void Function(List<VideoItem>) onRetried) async {
-    await Future.delayed(const Duration(seconds: 2));
-    try {
-      final sw = Stopwatch()..start();
-      var r = await s.home().timeout(sourceTimeout);
-      if (r.items.isEmpty) {
-        r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(sourceTimeout);
+    for (var attempt = 0; attempt < maxRetries; attempt++) {
+      await Future.delayed(_retryDelays[attempt]);
+      try {
+        final sw = Stopwatch()..start();
+        var r = await s.home().timeout(_timeoutFor(s));
+        if (r.items.isEmpty) {
+          r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(_timeoutFor(s));
+        }
+        sw.stop();
+        lastLatencies[s.id] = sw.elapsedMilliseconds;
+        if (r.items.isNotEmpty) {
+          onRetried(r.items);
+          return;
+        }
+      } catch (_) {
+        // 3 次都失败就安静收尾，不打扰用户。
       }
-      sw.stop();
-      lastLatencies[s.id] = sw.elapsedMilliseconds;
-      if (r.items.isNotEmpty) onRetried(r.items);
-    } catch (_) {
-      // 后台再试失败也不打扰用户。
     }
   }
 
   List<Source> _activeSources(SearchFilters? filters) {
     if (filters == null || filters.sourceIds.isEmpty) return sources;
+    if (filters.selectsNone) return [];
     return sources.where((s) => filters.sourceIds.contains(s.id)).toList();
   }
 
@@ -235,6 +304,8 @@ class SearchService {
       case 'niacg':
       case 'lianzu11':
       case 'rule34videos':
+      case 'hanime1':
+      case 'hanimeone':
         return '3d';
       case 'xhamster':
       case 'spankbang':

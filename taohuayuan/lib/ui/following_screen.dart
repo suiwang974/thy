@@ -31,7 +31,7 @@ class _FollowingScreenState extends State<FollowingScreen> {
 
   Future<void> _load() async {
     final follows = widget.store.followedAuthors.toList()..sort();
-    final svc = SearchService();
+    final svc = SearchService(disabledSources: widget.store.disabledSources);
     final found = <VideoItem>[];
     // 最多同时搜 5 位作者，避免关注太多时拖太久。
     await Future.wait(follows.take(5).map((author) async {
@@ -106,7 +106,7 @@ class _FollowingScreenState extends State<FollowingScreen> {
                 child: CircularProgressIndicator(color: Colors.pinkAccent),
               )
             else if (_followVideos.isNotEmpty) ...[
-              const SectionTitle('关注作者的新片', subtitle: '8 个源实时搜出来的'),
+              const SectionTitle('关注作者的新片', subtitle: '各源实时搜出来的'),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: GridView.builder(

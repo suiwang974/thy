@@ -49,7 +49,53 @@ void main() {
     }
   }, timeout: const Timeout(Duration(seconds: 60)));
 
-  test('直链可达：r34 搜 foot 取第一条解析 master.m3u8', () async {
+  test('Hanime1/HanimeOne 状态（只记录，不判死刑：VM 下 Cloudflare 403 是已知的墙）', () async {
+    // 2026-11-09 VM 实测：hanime1.me、hanimeone.me 的搜索页都返回 403
+    // Cloudflare "Just a moment..."，纯 HTTP 过不了验证。
+    // 所以这两个源在 App 里标 webViewOnly，走内置浏览器 + 视频页嗅直链；
+    // 这个测试只记录状态，不判失败——手机真机上 WebView 那条路要另验。
+    for (final host in ['hanime1.me', 'hanimeone.me']) {
+      try {
+        final res = await http
+            .get(Uri.parse('https://$host/search?query=foot&page=1&genre=%E8%A3%8F%E7%95%AA'),
+                headers: {'User-Agent': _ua})
+            .timeout(const Duration(seconds: 25));
+        // ignore: avoid_print
+        print('$host 搜 foot：HTTP ${res.statusCode}（200 说明 HTTP 通了，解析按 Kazumi 规则走；'
+            '403 说明仍被 Cloudflare 拦，走 WebView）');
+      } catch (e) {
+        // ignore: avoid_print
+        print('$host 搜 foot 异常（VM 网络问题，待手机真机复验）：$e');
+      }
+    }
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('直链可达：eporner 搜 foot 取第一条走签名流程（裸 gvideo 链 403 是死路）', () async {
+    final res = await http
+        .get(Uri.parse('https://www.eporner.com/api/v2/video/search/?query=foot&per_page=3&page=1&format=json'),
+            headers: {'User-Agent': _ua})
+        .timeout(const Duration(seconds: 25));
+    final json = jsonDecode(res.body) as Map<String, dynamic>;
+    final items = EpornerSource.parseVideos((json['videos'] ?? []) as List);
+    expect(items, isNotEmpty);
+    final stream = await StreamResolver.resolve(items.first);
+    // ignore: avoid_print
+    print('eporner 第一条解析结果：${stream?.url ?? 'null（签名流程失败，走 App 内嵌官方播放器）'}');
+    if (stream != null) {
+      // 签名地址在 vid-*-cdn.eporner.com 上，绝不是裸 gvideo 链。
+      expect(stream.url, contains('cdn.eporner.com'));
+      expect(stream.url.contains('gvideo.eporner.com'), isFalse);
+      expect(StreamResolver.isSaneStreamUrl(stream.url), isTrue);
+      // 签名地址现拉现验：Range 拉前 1KB 要 206。
+      final head = await http.get(Uri.parse(stream.url),
+          headers: {'User-Agent': _ua, 'Range': 'bytes=0-1023'}).timeout(const Duration(seconds: 25));
+      // ignore: avoid_print
+      print('eporner 签名直链 Range 拉流：HTTP ${head.statusCode}');
+      expect(head.statusCode, 206);
+    }
+  }, timeout: const Timeout(Duration(seconds: 90)));
+
+  test('直链可达：r34 搜 foot 取第一条解析直链（优先 contentUrl mp4，其次 master.m3u8）', () async {
     final res = await http
         .get(Uri.parse('https://rule34-videos.com/search/?q=foot'), headers: {'User-Agent': _ua})
         .timeout(const Duration(seconds: 25));
@@ -57,9 +103,12 @@ void main() {
     expect(items, isNotEmpty);
     final stream = await StreamResolver.resolve(items.first);
     // ignore: avoid_print
-    print('r34 第一条解析结果：${stream?.url ?? 'null（解析不到，走“在源站看”）'}');
+    print('r34 第一条解析结果：${stream?.url ?? 'null（解析不到，走 App 内嵌官方播放器）'}');
     if (stream != null) {
-      expect(stream.url, contains('m3u8'));
+      // 直链必须是 mp4 或 m3u8，且过 sanity 检查（之前兜底正则抓出几 KB
+      // 垃圾地址导致 Source error 的教训）。
+      expect(stream.url.contains('.mp4') || stream.url.contains('.m3u8'), isTrue);
+      expect(StreamResolver.isSaneStreamUrl(stream.url), isTrue);
     }
   }, timeout: const Timeout(Duration(seconds: 60)));
 

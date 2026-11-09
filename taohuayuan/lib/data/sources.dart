@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 
 import '../models/video_item.dart';
 
-/// 全部 8 个在线源：直接照 JS 插件（~/workspace/super-library/plugins/）逐条搬成 Dart。
+/// 全部 10 个在线源：直接照 JS 插件（~/workspace/super-library/plugins/）逐条搬成 Dart，
 /// 规则（用户 2026-11-07 定下的，一直沿用）：
 /// - 有标题就收录，没封面也不丢，只显示文字卡；
 /// - 热门词不能只返回 20 条，能翻页就翻页。
@@ -26,6 +26,16 @@ class SourceResult {
 abstract class Source {
   String get id;
   String get name;
+
+  /// true = 这个源要过 Cloudflare 验证，App 的纯 HTTP 请求会被拦，
+  /// 只能在 WebView 内置浏览器里打开（真浏览器带 JS，验证能过）。
+  /// 目前只有 Hanime1 / HanimeOne。
+  bool get webViewOnly => false;
+
+  /// 内置浏览器用的搜索地址 / 首页地址（只有 webViewOnly 的源有，其他源返回 ''）。
+  String webSearchUrl(String query) => '';
+  String get webHomeUrl => '';
+
   Future<SourceResult> search(String query);
   Future<SourceResult> home();
 
@@ -105,6 +115,31 @@ String _absUrl(String url, String base) {
   return url;
 }
 
+/// HTTP 正文一律按 UTF-8 解（不要用 res.body：Dart 的 http 包在服务端
+/// 不给 charset 时默认按 latin1 解，中文/全角标点标题会变成乱码，
+/// 比如 eporner 标题里的 ’ 会变成 â€™）。
+String _decodeBody(http.Response res) {
+  try {
+    return utf8.decode(res.bodyBytes);
+  } catch (_) {
+    return res.body;
+  }
+}
+
+/// 标题清洗（所有解析入口最后都过这一道）：
+/// - 先修乱码（UTF-8 被当 latin1 解的产物，见 VideoItem.repairMojibake）；
+/// - 去掉页面垃圾后缀：img alt 里的 " thumbnail"（r34 详情页相关视频的 alt
+///   都是 "<标题> thumbnail"）；
+/// - 压空白。注意：不要动标题里的画质词（比如 "4k ultra hd" 是标题本身，
+///   用户真机截图里就这么显示，剥了反而改了他认得的标题）。
+/// 洗完是空的返回 ''，由调用方按“没真标题”处理。
+String _cleanTitle(String raw) {
+  var t = VideoItem.repairMojibake(raw);
+  // 末尾的 " thumbnail"（可能连着好几个）去掉；不区分大小写。
+  t = t.replaceAll(RegExp(r'(\s+thumbnail)+$', caseSensitive: false), '');
+  return t.replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
 /// 标题是不是“假标题”：只有星号（xhamster 占位符）、只有时长数字、只有标点——
 /// 这种不要，宁可丢掉这条也不拿空卡充数。
 bool _isJunkTitle(String title) {
@@ -122,6 +157,15 @@ class EpornerSource implements Source {
   String get id => 'eporner';
   @override
   String get name => 'Eporner';
+
+  @override
+  bool get webViewOnly => false;
+
+  @override
+  String webSearchUrl(String query) => '';
+
+  @override
+  String get webHomeUrl => '';
 
   /// 供单元测试直接验：把 Eporner API 返回的 videos 数组转成条目。
   static List<VideoItem> parseVideos(List vids) {
@@ -142,7 +186,7 @@ class EpornerSource implements Source {
       }
       return VideoItem(
         id: 'eporner-${m['id']}',
-        title: (m['title'] ?? '(no title)').toString(),
+        title: _cleanTitle((m['title'] ?? '(no title)').toString()),
         durationSec: len.toInt(),
         poster: ((m['default_thumb'] as Map?)?['src'] ?? '').toString(),
         source: 'eporner',
@@ -158,7 +202,7 @@ class EpornerSource implements Source {
     final uri = Uri.parse('https://www.eporner.com/api/v2/video/search/'
         '?query=${Uri.encodeComponent(query)}&per_page=$perPage&page=$page&format=json');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 20));
-    final json = jsonDecode(res.body) as Map<String, dynamic>;
+    final json = jsonDecode(_decodeBody(res)) as Map<String, dynamic>;
     final vids = (json['videos'] ?? []) as List;
     return SourceResult(sourceId: id, sourceName: name, items: parseVideos(vids));
   }
@@ -195,7 +239,7 @@ class EpornerSource implements Source {
       final uri = Uri.parse('https://www.eporner.com/api/v2/video/search/'
           '?query=&per_page=100&page=1&order=most-popular&format=json');
       final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 20));
-      final json = jsonDecode(res.body) as Map<String, dynamic>;
+      final json = jsonDecode(_decodeBody(res)) as Map<String, dynamic>;
       final vids = (json['videos'] ?? []) as List;
       return SourceResult(sourceId: id, sourceName: name, items: parseVideos(vids));
     } catch (e) {
@@ -212,6 +256,15 @@ class Rule34VideosSource implements Source {
   String get id => 'rule34videos';
   @override
   String get name => 'Rule34Video';
+
+  @override
+  bool get webViewOnly => false;
+
+  @override
+  String webSearchUrl(String query) => '';
+
+  @override
+  String get webHomeUrl => '';
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   static List<VideoItem> parseSearchHtml(String html) {
@@ -235,7 +288,7 @@ class Rule34VideosSource implements Source {
       final text = _stripTags(inner);
       out.add(VideoItem(
         id: 'r34-$href',
-        title: alt ?? (text.isEmpty ? href : text.substring(0, text.length > 80 ? 80 : text.length)),
+        title: _cleanTitle(alt ?? (text.isEmpty ? href : text.substring(0, text.length > 80 ? 80 : text.length))),
         durationSec: _parseDuration(durText),
         poster: poster,
         source: 'rule34videos',
@@ -251,7 +304,7 @@ class Rule34VideosSource implements Source {
     try {
       final uri = Uri.parse('$_base/search/?q=${Uri.encodeComponent(query)}');
       final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(res.body));
+      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
     }
@@ -262,7 +315,7 @@ class Rule34VideosSource implements Source {
     try {
       final uri = Uri.parse('$_base/search/?q=${Uri.encodeComponent(query)}&page=$page');
       final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(res.body));
+      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
     }
@@ -272,7 +325,7 @@ class Rule34VideosSource implements Source {
   Future<SourceResult> home() async {
     try {
       final res = await http.get(Uri.parse('$_base/'), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(res.body));
+      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
     }
@@ -292,6 +345,15 @@ class NiacgSource implements Source {
   @override
   String get name => 'Niacg';
 
+  @override
+  bool get webViewOnly => false;
+
+  @override
+  String webSearchUrl(String query) => '';
+
+  @override
+  String get webHomeUrl => '';
+
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   static List<VideoItem> parseSearchHtml(String html) {
     final out = <VideoItem>[];
@@ -302,7 +364,7 @@ class NiacgSource implements Source {
       seen.add(m.group(2)!);
       out.add(VideoItem(
         id: 'niacg-${m.group(2)}',
-        title: m.group(3) ?? '',
+        title: _cleanTitle(m.group(3) ?? ''),
         source: 'niacg',
         pageUrl: 'https://www.niacg.com${m.group(1)}',
       ));
@@ -313,7 +375,7 @@ class NiacgSource implements Source {
   Future<SourceResult> _fetchSearchPage(String query, int page) async {
     final uri = Uri.parse('https://www.niacg.com/e/search/?searchget=1&keyboard=${Uri.encodeComponent(query)}&show=title&classid=21&page=$page');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-    return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(res.body));
+    return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
   }
 
   @override
@@ -352,6 +414,15 @@ class Lianzu11Source implements Source {
   @override
   String get name => 'Lianzu11';
 
+  @override
+  bool get webViewOnly => false;
+
+  @override
+  String webSearchUrl(String query) => '';
+
+  @override
+  String get webHomeUrl => '';
+
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   static List<VideoItem> parseSearchHtml(String html) {
     final out = <VideoItem>[];
@@ -368,7 +439,7 @@ class Lianzu11Source implements Source {
       final durText = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), inner) ?? '';
       out.add(VideoItem(
         id: 'lianzu11-$href',
-        title: text.length > 120 ? text.substring(0, 120) : text,
+        title: _cleanTitle(text.length > 120 ? text.substring(0, 120) : text),
         durationSec: _parseDuration(durText),
         poster: _pickPoster(inner, 'https://lianzu11.com'),
         source: 'lianzu11',
@@ -381,7 +452,7 @@ class Lianzu11Source implements Source {
   Future<SourceResult> _fetchSearchPage(String query, int page) async {
     final uri = Uri.parse('https://lianzu11.com/${page > 1 ? 'page/$page/' : ''}?s=${Uri.encodeComponent(query)}');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-    return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(res.body));
+    return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
   }
 
   @override
@@ -413,7 +484,7 @@ class Lianzu11Source implements Source {
     // WordPress 首页就是最新文章列表，同一套解析能用。
     try {
       final res = await http.get(Uri.parse('https://lianzu11.com/'), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(res.body));
+      return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
     }
@@ -437,6 +508,15 @@ class HtmlSearchSource implements Source {
   String get id => _id;
   @override
   String get name => _name;
+
+  @override
+  bool get webViewOnly => false;
+
+  @override
+  String webSearchUrl(String query) => '';
+
+  @override
+  String get webHomeUrl => '';
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   /// 标题优先级：<a> 的 title 属性（pornhub）> img alt > aria-label（xhamster）
@@ -482,6 +562,7 @@ class HtmlSearchSource implements Source {
           title = Uri.decodeComponent(slug).replaceAll(RegExp(r'[_\-]+'), ' ').trim();
         }
       }
+      title = _cleanTitle(title);
       if (_isJunkTitle(title)) continue;
       var durText = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), inner) ?? '';
       if (durText.isEmpty) {
@@ -515,7 +596,7 @@ class HtmlSearchSource implements Source {
   Future<SourceResult> _fetchPage(String query, int page) async {
     final url = _url(query, page);
     final res = await http.get(Uri.parse(url), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-    return SourceResult(sourceId: id, sourceName: name, items: parse(res.body, _baseOf(url)));
+    return SourceResult(sourceId: id, sourceName: name, items: parse(_decodeBody(res), _baseOf(url)));
   }
 
   @override
@@ -561,6 +642,15 @@ class XhamsterSource implements Source {
   @override
   String get name => 'XHamster';
 
+  @override
+  bool get webViewOnly => false;
+
+  @override
+  String webSearchUrl(String query) => '';
+
+  @override
+  String get webHomeUrl => '';
+
   /// 供单元测试直接验：搜索页 HTML 里的 videoThumbProps JSON -> 条目。
   static List<VideoItem> parseJson(String html) {
     final m = RegExp(r'"videoThumbProps":\[(.*?)\]\s*,\s*"', dotAll: true).firstMatch(html);
@@ -572,7 +662,7 @@ class XhamsterSource implements Source {
         final landing = v['landing'] as Map<String, dynamic>?;
         return VideoItem(
           id: 'xhamster-${v['id']}',
-          title: (v['title'] ?? '').toString(),
+          title: _cleanTitle((v['title'] ?? '').toString()),
           author: (landing?['name'] ?? '').toString(),
           durationSec: ((v['duration'] ?? 0) as num).toInt(),
           resolution: (v['isUHD'] == true) ? '2160p' : '',
@@ -591,10 +681,10 @@ class XhamsterSource implements Source {
   Future<SourceResult> _fetchPage(String query, int page) async {
     final uri = Uri.parse('https://xhamster.com/search/${Uri.encodeComponent(query)}?pagenumber=$page');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
-    var items = parseJson(res.body);
+    var items = parseJson(_decodeBody(res));
     if (items.isEmpty) {
       // JSON 拿不到时退回通用锚点解析（只有前十来张是真的，标题可能是 *** 占位符）。
-      items = HtmlSearchSource.parseHtml(res.body, 'https://xhamster.com', 'xhamster', r'https:\/\/xhamster\.com\/videos\/[^"]+');
+      items = HtmlSearchSource.parseHtml(_decodeBody(res), 'https://xhamster.com', 'xhamster', r'https:\/\/xhamster\.com\/videos\/[^"]+');
     }
     return SourceResult(sourceId: id, sourceName: name, items: items);
   }
@@ -627,12 +717,126 @@ class XhamsterSource implements Source {
   Future<SourceResult> home() async => SourceResult(sourceId: id, sourceName: name);
 }
 
-/// 全部 8 个在线源（默认全部启用；用户可以在“我的”里关掉某个源）。
+/// 成人动漫源 Hanime1 / HanimeOne（hanime1.me / hanimeone.me，互为镜像）。
+/// 接法按 Kazumi 规则 Hanime1.json v0.3（AzlmZ-del/Kazumi-Plus-Rules）：
+/// 搜 `https://hanime1.me/search?query={词}&page={页}&genre=裏番`，
+/// 结果是 href 里带 "watch" 的链接，标题在 div.title 或
+/// div.home-rows-videos-title 里。
+/// ！！！未验（2026-11-09，VM 实测）：hanime1.me 和 hanimeone.me 在 VM 下都被
+/// Cloudflare 拦（403 "Just a moment..." / "Attention Required!"），
+/// 没见过真实搜索页 HTML，上面这套解析是按 Kazumi 规则写的，没跑通过真页。
+/// 所以这两个源标 webViewOnly：App 里 HTTP 搜不到就走内置浏览器（WebView），
+/// 在视频页里嗅到 <video> 直链再切原生播放器；不要把没验过的写成已验。
+class HanimeSource implements Source {
+  final String _host; // 'hanime1.me' 或 'hanimeone.me'
+  HanimeSource(this._host);
+
+  @override
+  String get id => _host == 'hanime1.me' ? 'hanime1' : 'hanimeone';
+
+  @override
+  String get name => _host == 'hanime1.me' ? 'Hanime1 (hanime1.me)' : 'HanimeOne (hanimeone.me)';
+
+  @override
+  bool get webViewOnly => true;
+
+  @override
+  String get webHomeUrl => 'https://$_host/';
+
+  /// 内置浏览器用的搜索地址（genre=裏番，只搜成人动漫）。
+  @override
+  String webSearchUrl(String query, [int page = 1]) =>
+      'https://$_host/search?query=${Uri.encodeComponent(query)}&page=$page&genre=%E8%A3%8F%E7%95%AA';
+
+  @override
+  Future<SourceResult> search(String query) async => _fetch(webSearchUrl(query));
+
+  @override
+  Future<SourceResult> searchPage(String query, int page) async =>
+      _fetch(webSearchUrl(query, page));
+
+  @override
+  Future<SourceResult> home() async => _fetch(webHomeUrl);
+
+  Future<SourceResult> _fetch(String url) async {
+    try {
+      final res = await http
+          .get(Uri.parse(url), headers: {'User-Agent': _ua, 'Referer': 'https://$_host/'})
+          .timeout(const Duration(seconds: 20));
+      if (res.statusCode != 200) {
+        // Cloudflare 验证页：App 的纯 HTTP 请求过不了，内置浏览器里才能开。
+        return SourceResult(
+            sourceId: id, sourceName: name, error: 'Cloudflare 验证拦住了（去内置浏览器里开）');
+      }
+      return SourceResult(
+          sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res), _host, id));
+    } catch (e) {
+      return SourceResult(sourceId: id, sourceName: name, error: e.toString());
+    }
+  }
+
+  /// 供单元测试直接验：搜索页 HTML -> 条目（按 Kazumi 规则结构写的假 HTML；
+  /// 真页没见过，手机上若 HTTP 通了按此解析，否则走 WebView）。
+  static List<VideoItem> parseSearchHtml(String html, String host, String sourceId) {
+    final base = 'https://$host';
+    final items = <VideoItem>[];
+    final seen = <String>{};
+    final anchorRe = RegExp(r'<a\b[^>]*href="([^"]*watch[^"]*)"[^>]*>(.*?)</a>',
+        dotAll: true, caseSensitive: false);
+    for (final m in anchorRe.allMatches(html)) {
+      final pageUrl = _absUrl(m.group(1)!, base);
+      if (!seen.add(pageUrl)) continue;
+      final inner = m.group(2)!;
+      // 标题：div.title / div.home-rows-videos-title 优先，其次锚点文字。
+      var title = '';
+      final titleDiv = RegExp(
+              r'<div[^>]*class="[^"]*(?:title|home-rows-videos-title)[^"]*"[^>]*>(.*?)</div>',
+              dotAll: true)
+          .firstMatch(inner)
+          ?.group(1);
+      if (titleDiv != null && titleDiv.trim().isNotEmpty) {
+        title = _decodeEntities(_stripTags(titleDiv));
+      } else {
+        title = _decodeEntities(_stripTags(inner));
+      }
+      title = _cleanTitle(title);
+      if (_isJunkTitle(title)) continue;
+      String poster = '';
+      final img = RegExp(r'''<img[^>]+(?:data-src|src)=["']([^"']+)["']''')
+          .firstMatch(inner)
+          ?.group(1);
+      if (img != null && img.isNotEmpty && _isRealPoster(img)) {
+        poster = _absUrl(img, base);
+      }
+      final dur = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), inner);
+      items.add(VideoItem(
+        id: '$sourceId-$pageUrl',
+        title: title,
+        durationSec: dur == null ? 0 : _parseDuration(dur),
+        poster: poster,
+        source: sourceId,
+        pageUrl: pageUrl,
+      ));
+    }
+    return items;
+  }
+}
+
+/// 全部 10 个在线源（默认全部启用；用户可以在“我的”里关掉某个源）。
+/// 网站版（3D Video Library）的源列表是 10 个（见 server/src/sources.ts），
+/// App 之前只有 8 个，缺 Hanime1 / HanimeOne 两个——2026-11-09 补上。
+/// 注意：用户问“少了哪三个”是数错了——网站版 10 个减 App 8 个是 2 个，
+/// lianzu11 那个 chips App 里本来就有，不是缺的。
 List<Source> allSources() => [
       EpornerSource(),
       Rule34VideosSource(),
       NiacgSource(),
       Lianzu11Source(),
+      // 成人动漫源（网站版有、App 之前缺的两个，2026-11-09 补上）：
+      // Hanime1 / HanimeOne 要过 Cloudflare 验证，纯 HTTP 搜不到，
+      // 走内置浏览器（WebView）+ 视频页嗅直链；见 HanimeSource 上的“未验”说明。
+      HanimeSource('hanime1.me'),
+      HanimeSource('hanimeone.me'),
       // xvideos 链接收紧成 /video.xxx/…：/videos-i-like 这种导航链接不再混进来。
       HtmlSearchSource('xvideos', 'XVideos',
           (q, p) => 'https://www.xvideos.com/?k=${Uri.encodeComponent(q)}&p=$p', r'\/video\.[^"]+'),

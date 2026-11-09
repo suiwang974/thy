@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:http/http.dart' as http;
 
 import '../models/video_item.dart';
@@ -13,7 +15,7 @@ import '../models/video_item.dart';
 /// - xvideos 详情页里有 setVideoUrlHigh/Low/HLS，优先直链；
 /// - xhamster/pornhub/spankbang 暂无直链解析，返回 null，
 ///   播放页会显示官方播放器/官方页备选（有广告的站要如实说，见 sourcePageHasAds）。
-/// - 通用规则（用户 2026-11-08 定）：所有 8 个源都这样——直链优先，
+/// - 通用规则（用户 2026-11-08 定）：所有源都这样——直链优先，
 ///   拿不到直链就走官方播放器/官方页；官方页有广告的要如实说，
 ///   没广告的（niacg、lianzu11）直接嵌官方播。
 /// - 详情页预探直链时顺带把时长和封面一起探回来（og:image / og:video:duration），
@@ -97,11 +99,105 @@ class StreamResolver {
     if (cached != null) return cached;
     var resolved = await _resolveUncached(item);
     if (resolved != null) {
+      // 解析出来的地址先过 sanity 检查：垃圾地址（r34 兜底正则的教训）
+      // 直接当没解析到，走官方播放器，不拿去给播放器报错。
+      if (!isSaneStreamUrl(resolved.url)) return null;
       resolved = await _verifyDuration(item, resolved);
-      if (_cache.length > 50) _cache.clear();
-      _cache[item.id] = resolved;
+      // eporner 签名地址约 2 小时过期还绑 IP，不进缓存：每次播都现算。
+      if (item.source != 'eporner') {
+        if (_cache.length > 50) _cache.clear();
+        _cache[item.id] = resolved;
+      }
     }
     return resolved;
+  }
+
+  /// Eporner 签名直链（供单元测试直接验 hash 转换 + xhr 解析）：
+  /// ① embed 页取 EP.video.player.hash；② 四组 8 位 hex 转 36 进制拼起来；
+  /// ③ 调 xhr/video 拿 sources.mp4 里 default=true 的那档（一般是 720p HD）。
+  /// 任何一步失败返回 null（播放页自动嵌官方播放器，不硬播裸 gvideo 链）。
+  static String convertEpornerHash(String hash32) {
+    final buf = StringBuffer();
+    for (var i = 0; i < 32; i += 8) {
+      buf.write(_toBase36(int.parse(hash32.substring(i, i + 8), radix: 16)));
+    }
+    return buf.toString();
+  }
+
+  static String _toBase36(int n) {
+    const digits = '0123456789abcdefghijklmnopqrstuvwxyz';
+    if (n == 0) return '0';
+    var out = '';
+    var v = n;
+    while (v > 0) {
+      out = digits[v % 36] + out;
+      v ~/= 36;
+    }
+    return out;
+  }
+
+  /// xhr/video 接口的 JSON -> 签名 mp4 直链（优先 default=true，其次 720p，
+  /// 再次第一档）。duration 也从这里拿（xhr 自带真实时长）。
+  static ({String url, int durationSec})? parseEpornerXhr(String body) {
+    try {
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final mp4 = (json['sources'] as Map?)?['mp4'] as Map?;
+      if (mp4 == null || mp4.isEmpty) return null;
+      // 注意：不要用 entries.firstWhere(..., orElse: ...)——jsonDecode 出来的
+      // 是 _Map<String, dynamic>，firstWhere 的 orElse 在运行时会因为
+      // MapEntry<dynamic, dynamic> 不是 MapEntry<String, dynamic> 的子类型
+      // 而抛错（2026-11-09 实测踩坑）。手动循环最稳。
+      String? best720;
+      String? first;
+      for (final e in mp4.entries) {
+        final v = e.value as Map?;
+        final src = v?['src']?.toString() ?? '';
+        if (src.isEmpty) continue;
+        first ??= src;
+        if (v?['default'] == true) {
+          final duration = (json['duration'] as num?)?.toInt() ?? 0;
+          return (url: src, durationSec: duration);
+        }
+        if ((e.key as String).contains('720')) best720 ??= src;
+      }
+      final url = best720 ?? first ?? '';
+      if (url.isEmpty) return null;
+      final duration = (json['duration'] as num?)?.toInt() ?? 0;
+      return (url: url, durationSec: duration);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<ResolvedStream?> _resolveEporner(VideoItem item) async {
+    final vid = RegExp(r'eporner-([A-Za-z0-9]+)').firstMatch(item.id)?.group(1) ??
+        RegExp(r'video-([A-Za-z0-9]+)').firstMatch(item.pageUrl ?? '')?.group(1) ??
+        RegExp(r'embed/([A-Za-z0-9]+)').firstMatch(item.pageUrl ?? '')?.group(1);
+    if (vid == null || vid.isEmpty) return null;
+    try {
+      final embedUrl = 'https://www.eporner.com/embed/$vid/';
+      final embedRes = await http
+          .get(Uri.parse(embedUrl), headers: {'User-Agent': _ua})
+          .timeout(const Duration(seconds: 15));
+      if (embedRes.statusCode != 200) return null;
+      final hash = RegExp(r"""EP\.video\.player\.hash\s*=\s*['"]([0-9a-fA-F]{32})['"]""")
+          .firstMatch(utf8.decode(embedRes.bodyBytes))
+          ?.group(1);
+      if (hash == null) return null;
+      final xhrUrl = 'https://www.eporner.com/xhr/video/$vid'
+          '?hash=${convertEpornerHash(hash)}&domain=www.eporner.com&embed=true&supportedFormats=hls,mp4';
+      final xhrRes = await http
+          .get(Uri.parse(xhrUrl), headers: {'User-Agent': _ua, 'Referer': embedUrl})
+          .timeout(const Duration(seconds: 15));
+      if (xhrRes.statusCode != 200) return null;
+      final parsed = parseEpornerXhr(utf8.decode(xhrRes.bodyBytes));
+      if (parsed == null) return null;
+      // xhr 自带真实时长：不到列表一半就是预览，不标成“能直接播”。
+      final preview = isPreviewDuration(listedSec: item.durationSec, actualSec: parsed.durationSec);
+      return ResolvedStream(parsed.url, {}, parsed.durationSec, preview);
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 直链时长核对：m3u8 在解析时就算播放列表总时长，和列表时长对不上就标预览。
@@ -154,18 +250,60 @@ class StreamResolver {
   static Future<int?> _m3u8Duration(String url) async {
     try {
       final res = await http.get(Uri.parse(url), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 8));
-      final body = res.body;
+      final body = utf8.decode(res.bodyBytes);
       final direct = parseM3u8Duration(body);
       if (direct != null) return direct;
       final variant = parseM3u8Variant(body);
       if (variant == null) return null;
       final variantUrl = variant.startsWith('http') ? variant : Uri.parse(url).resolve(variant).toString();
       final res2 = await http.get(Uri.parse(variantUrl), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 8));
-      return parseM3u8Duration(res2.body);
+      return parseM3u8Duration(utf8.decode(res2.bodyBytes));
     } catch (_) {
       return null;
     }
   }
+
+  /// 供单元测试直接验：r34 详情页 HTML -> 直链。
+  /// 实测（2026-11-09，curl 探针）：详情页里根本没有绝对地址的 master.m3u8，
+  /// 只有两样真的东西——
+  /// ① JSON-LD 里的 contentUrl：https://r34content.b-cdn.net/videos/{id}/360p.mp4，
+  ///    HEAD 200、无需任何请求头，ffprobe 能读出真实时长（Chun-Li 那条 236.7 秒，
+  ///    和列表写的 3:56 完全一致），优先拿它；
+  /// ② 相对地址的 master.m3u8：/media/videos/{id}/master.m3u8，
+  ///    拼成 https://rule34-videos.com/media/videos/{id}/master.m3u8 能拉到
+  ///    含 720p/480p/360p/240p 变体的主播放列表，备选。
+  /// 教训：之前那条 `https://[^"']+/master.m3u8` 的兜底正则会横跨整个
+  /// 不加引号的 HTML、抓出几 KB 长的垃圾地址（从 canonical 链接一路吃到
+  /// master.m3u8），播放器拿它去播就报 Source error——用户截图 1 就是这么来的。
+  /// 所以：只认上面两种精确格式，再也不用“包含 master.m3u8 就行”的宽松匹配。
+  /// r34 直链：优先相对地址的 master.m3u8（HLS，最高 720p，ExoPlayer 原生播），
+  /// 其次 JSON-LD 的 contentUrl mp4（只有 360p——720p/480p mp4 直拼是 404，
+  /// 2026-11-09 实测）。注意真站的属性大量不加引号（href=/media/...），
+  /// JS 里用反引号（const b=`/media/...`），所以分隔符认引号/反引号/= 三种，
+  /// 只认 /media/videos/{id}/master.m3u8 这种精确路径，不会横跨整页抓垃圾地址。
+  static String? parseR34DirectLink(String html) {
+    final rel = RegExp(r'''["'`=]\s*\/media\/videos\/(\d+)\/master\.m3u8''')
+        .firstMatch(html)
+        ?.group(1);
+    if (rel != null) return 'https://rule34-videos.com/media/videos/$rel/master.m3u8';
+    final mp4 = RegExp(r'https:\/\/r34content\.b-cdn\.net\/videos\/\d+\/\d+p\.mp4')
+        .firstMatch(html)
+        ?.group(0);
+    if (mp4 != null && mp4.isNotEmpty) return mp4;
+    return null;
+  }
+
+  /// 直链地址 sanity 检查：长度、空白、尖括号——几 KB 长的垃圾地址、
+  /// 带空格或 < > 的地址一律不算直链（r34 兜底正则抓垃圾地址的教训）。
+  static bool isSaneStreamUrl(String url) {
+    if (url.isEmpty || url.length > 500) return false;
+    if (url.contains(RegExp(r'\s'))) return false;
+    if (url.contains('<') || url.contains('>')) return false;
+    return url.startsWith('https://');
+  }
+
+  /// 重试用：清掉某条的解析缓存，下次重新解析详情页。
+  static void clearCacheFor(String itemId) => _cache.remove(itemId);
 
   /// 供单元测试直接验：xvideos 详情页 HTML -> 直链。
   /// 优先高清 mp4（setVideoUrlHigh），其次 HLS，再次低清 mp4；都没有返回 null。
@@ -197,13 +335,15 @@ class StreamResolver {
     // 3. 按来源解析详情页。
     try {
       final res = await http.get(Uri.parse(page), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 20));
-      final html = res.body;
+      final html = utf8.decode(res.bodyBytes);
       // 预探直链的同时顺带补封面/时长（og:image / og:video:duration），别让用户点开再等。
       _enrichFromDetail(item, html);
       if (item.source == 'rule34videos') {
-        final m = RegExp(r'https:\/\/r34content\.b-cdn\.net\/videos\/\d+\/master\.m3u8').firstMatch(html) ??
-            RegExp(r'''https:\/\/[^"']+\/master\.m3u8''').firstMatch(html);
-        if (m != null) return ResolvedStream(m.group(0)!);
+        // 只认两种精确格式（见 parseR34DirectLink 的注释）：相对地址的
+        // master.m3u8（HLS，最高 720p）优先，其次 JSON-LD 的 360p.mp4。
+        // 宽松的“包含 master.m3u8 就行”已删，它会抓出几 KB 垃圾地址导致 Source error。
+        final url = parseR34DirectLink(html);
+        if (url != null) return ResolvedStream(url);
       }
       if (item.source == 'niacg') {
         final m = RegExp(r'''https:\/\/file\.xunge\.cyou\/1080\/[^"' ]+\.mp4''').firstMatch(html);
@@ -215,9 +355,24 @@ class StreamResolver {
         if (m != null) return ResolvedStream(m.group(0)!);
       }
       if (item.source == 'eporner') {
-        // Eporner 详情页：embed 页里找 mp4。
-        final m = RegExp(r'''https:\/\/[^"' ]+\.mp4''').firstMatch(html);
-        if (m != null) return ResolvedStream(m.group(0)!);
+        // Eporner 直链必须走签名流程（裸 gvideo mp4 一律 403，不是直链）：
+        // embed 页里的 EP.video.player.hash（32 位 hex）→ 四组 8 位 hex 各自
+        // 16 进制转整数再转 36 进制拼起来 → 调 xhr/video 接口拿签名 mp4。
+        // 这套是网站版 2026-11-07 逆向并用 curl 验过的，2026-11-09 VM 再验通：
+        // 签名 720p Range 拉流 206、ffprobe 475.96 秒，和 API 的 475 秒一致。
+        // 签名地址约 2 小时过期、还绑解析时的出口 IP——必须在点开播那一刻现算，
+        // 不能跨会话缓存（resolve 里 eporner 不进缓存）；播不起来就自动切
+        // App 内嵌官方播放器，不只给外跳按钮。
+        return await _resolveEporner(item);
+      }
+      if (item.source == 'hanime1' || item.source == 'hanimeone') {
+        // 未验（2026-11-09，VM 实测）：hanime1.me/hanimeone.me 都被 Cloudflare 403，
+        // 没见过真实 watch 页。按常见结构找 mp4：<video>/<source src> 或直链。
+        // HTTP 通不过时返回 null，播放页自动嵌官方播放器（WebView 能过验证）。
+        final m = RegExp(r'''<source[^>]+src=["']([^"']+\.mp4[^"']*)["']''').firstMatch(html) ??
+            RegExp(r'''<video[^>]+src=["']([^"']+\.mp4[^"']*)["']''').firstMatch(html) ??
+            RegExp(r'''https:\/\/[^"' ]+\.mp4''').firstMatch(html);
+        if (m != null) return ResolvedStream(m.group(1)!, {'Referer': page});
       }
       if (item.source == 'xvideos') {
         // xvideos 优先直链：高清 mp4 -> HLS -> 低清 mp4。

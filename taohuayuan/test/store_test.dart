@@ -31,4 +31,28 @@ void main() {
     await store.dislikeItem(item);
     expect(store.dislikedTags, contains('femdom'));
   });
+
+  test('降权是切换：点一下亮、再点取消，状态持久保存', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    final a = VideoItem(
+        id: 'a', title: 't', source: 'eporner', keywords: ['femdom', 'asian'], author: 'X');
+    final b = VideoItem(
+        id: 'b', title: 't2', source: 'eporner', keywords: ['femdom'], author: 'Y');
+    expect(store.isDisliked(a), isFalse);
+    expect(await store.toggleDislike(a), isTrue);
+    expect(store.isDisliked(a), isTrue);
+    expect(store.dislikedTags, contains('femdom'));
+    expect(store.dislikedTags, contains('author:x'));
+    // 另一条共用 femdom 标签也降权。
+    await store.toggleDislike(b);
+    // 取消 a 的降权：femdom 还在（b 贡献的），author:x 没了。
+    expect(await store.toggleDislike(a), isFalse);
+    expect(store.isDisliked(a), isFalse);
+    expect(store.dislikedTags, contains('femdom'));
+    expect(store.dislikedTags, isNot(contains('author:x')));
+    // 取消 b：femdom 也没了。
+    await store.toggleDislike(b);
+    expect(store.dislikedTags, isEmpty);
+  });
 }
