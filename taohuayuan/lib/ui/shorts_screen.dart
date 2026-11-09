@@ -10,6 +10,7 @@ import '../models/video_item.dart';
 import '../services/adblock_service.dart';
 import '../services/fullscreen_controls.dart';
 import '../services/search_service.dart';
+import '../services/shorts_preload.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import '../services/web_search.dart';
@@ -170,6 +171,9 @@ class _ShortsScreenState extends State<ShortsScreen> {
   int _emptyBatches = 0;
   // 续批用的词：按各源默认偏好轮着搜（3d / asian / footjob）。
   static const _moreQueries = ['3d', 'asian', 'footjob'];
+  // 第 66 条：真预加载器——提前给后面 1–2 条建播放器并 initialize，
+  // 滑过去直接用现成的播（只解析地址不算预加载，v15 的教训）。
+  final _preloader = ShortsPreloader();
   // 当前是第几段 + 是不是静音：所有段共用，换段不重置。
   final ValueNotifier<int> _currentPage = ValueNotifier<int>(0);
   PageController? _pageController;
@@ -190,6 +194,7 @@ class _ShortsScreenState extends State<ShortsScreen> {
 
   @override
   void dispose() {
+    _preloader.dispose();
     _pageController?.dispose();
     _currentPage.dispose();
     _muted.dispose();
@@ -230,7 +235,8 @@ class _ShortsScreenState extends State<ShortsScreen> {
         _pageController = PageController(initialPage: start);
       });
       if (stream.isNotEmpty) {
-        unawaited(StreamResolver.prefetch(stream[(start + 1) % stream.length]));
+        // 第 66 条：真预加载——提前给后两条建播放器并 initialize，滑过去直接播。
+        _preloader.precache(stream, start);
       }
       return;
     }
@@ -251,8 +257,8 @@ class _ShortsScreenState extends State<ShortsScreen> {
       _pageController = PageController(initialPage: start);
     });
     if (base.isNotEmpty) {
-      // 预探第 2 段的直链，滑过去不用等。
-      unawaited(StreamResolver.prefetch(base[1 % base.length]));
+      // 第 66 条：真预加载——提前给后两条建播放器并 initialize，滑过去直接播。
+      _preloader.precache(base, start);
     }
   }
 
@@ -301,6 +307,8 @@ class _ShortsScreenState extends State<ShortsScreen> {
       );
       return;
     }
+    // 第 66 条：流换了一批，旧的预加载全废（旧地址别留着）。
+    _preloader.reset();
     setState(() {
       _recItems = base;
       _newItems = sortShortsByNewest(base);
@@ -329,7 +337,8 @@ class _ShortsScreenState extends State<ShortsScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('已换一批新的'), duration: Duration(seconds: 1)),
     );
-    unawaited(StreamResolver.prefetch(base[1 % base.length]));
+    // 第 66 条：新流从第 1 条开始，真预加载后两条。
+    _preloader.precache(base, 0);
   }
 
   /// 第 48 条：“最新”标签的真新片：eporner API order=latest。
@@ -455,10 +464,9 @@ class _ShortsScreenState extends State<ShortsScreen> {
             // 第 55 条：搜索流不存位置（它不是推荐/最新/最热门任一标签，
             // 退出搜索流再进还是从搜索页点进来，不续播）。
             if (!_searchMode) unawaited(widget.store.setShortsPosition(_tab.name, i));
-            // 第 65 条：滑到第 i 段，预探第 i+1、i+2 段的直链（进缓存，
-            // 滑过去时 _init 直接命中，不用等解析）。
-            if (i + 1 < items.length) unawaited(StreamResolver.prefetch(items[i + 1]));
-            if (i + 2 < items.length) unawaited(StreamResolver.prefetch(items[i + 2]));
+            // 第 66 条：滑到第 i 段，真预加载第 i+1、i+2 段的播放器
+            // （建好并 initialize，滑过去直接播，不用等）。
+            _preloader.precache(items, i);
             // 快滑到底了，提前加载下一批。
             if (i >= items.length - 3) unawaited(_loadMore());
           },
@@ -471,6 +479,7 @@ class _ShortsScreenState extends State<ShortsScreen> {
             tabVisible: widget.visible,
             currentPage: _currentPage,
             muted: _muted,
+            preloader: _preloader,
           ),
         ),
         // 第 48 条：顶上三个标签（推荐 / 最新 / 最热门），各记各的位置。
@@ -574,6 +583,8 @@ class _ShortPage extends StatefulWidget {
   final bool tabVisible;
   final ValueNotifier<int> currentPage;
   final ValueNotifier<bool> muted;
+  // 第 66 条：真预加载器——_init 先拿它建好的播放器，滑过去直接播。
+  final ShortsPreloader preloader;
   const _ShortPage({
     super.key,
     required this.item,
@@ -583,6 +594,7 @@ class _ShortPage extends StatefulWidget {
     required this.tabVisible,
     required this.currentPage,
     required this.muted,
+    required this.preloader,
   });
 
   @override
@@ -726,25 +738,27 @@ class _ShortPageState extends State<_ShortPage>
     super.dispose();
   }
 
+  /// 第 66 条：先拿预加载好的播放器（已 initialize、只等接手），
+  /// 滑过去直接播；没有现成的（刚进流、滑得太快、预加载失败）就现建一个，
+  /// 和以前一样。预加载失败返回 null 时走官方播放器兜底。
   Future<void> _init() async {
-    final stream = await StreamResolver.resolve(widget.item);
-    if (!mounted) return;
     // 解析完用补全后的条目显示和核时长（详情页预探时顺带补了封面/时长）。
     _displayItem = StreamResolver.enrich(widget.item);
-    _currentStreamUrl = stream?.url;
-    if (stream == null) {
+    final preloaded = await widget.preloader.take(widget.item);
+    if (!mounted) {
+      // 页面已经没了（滑远被回收），预加载的播放器不能留着。
+      if (preloaded != null) unawaited(preloaded.controller.dispose());
+      return;
+    }
+    if (preloaded == null) {
       _embedOfficial('这段拿不到直链，用官方播放器看');
       return;
     }
-    if (stream.isPreview) {
-      // 解析时已核出是短预览：不播直链，嵌官方播放器看正片。
-      _embedOfficial('这段直链只有预览，用官方播放器看');
-      return;
-    }
+    final stream = preloaded.stream;
+    _currentStreamUrl = stream.url;
+    final c = preloaded.controller;
     try {
-      final c = VideoPlayerController.networkUrl(Uri.parse(stream.url), httpHeaders: stream.headers);
-      await c.initialize();
-      if (!mounted) return;
+      // 预加载时已经 initialize + 循环 + 静音；这里只按当前状态补设置。
       // mp4 靠播放器初始化后的真实时长再核一次：是预览就不播。
       // 时长用补全后的条目（详情页预探时可能补了真实时长）。
       // 第 37 条：先纠正离谱的列表时长（比如把图片尺寸当成时长），再判预览——
@@ -778,6 +792,9 @@ class _ShortPageState extends State<_ShortPage>
       if (_isCurrent) unawaited(_maybeResolveAuthor());
       unawaited(_loadVariants());
     } catch (e) {
+      await _controller?.dispose();
+      _controller = null;
+      _controllerNotifier.value = null;
       if (mounted) {
         final s = e.toString().replaceAll(RegExp(r'\s+'), ' ');
         _embedOfficial('播不起来：${s.length > 90 ? '${s.substring(0, 90)}…' : s}');
@@ -894,6 +911,8 @@ class _ShortPageState extends State<_ShortPage>
   /// 重试直链：清掉解析缓存，关掉官方播放器，重新解析播。
   Future<void> _retryDirect() async {
     StreamResolver.clearCacheFor(widget.item.id);
+    // 第 66 条：旧地址可能已过期/被限流，预加载里的那份也一起废掉，别再拿它播。
+    widget.preloader.drop(widget.item.id);
     _webController = null;
     _error = null;
     await _controller?.dispose();
