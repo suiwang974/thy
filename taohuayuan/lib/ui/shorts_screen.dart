@@ -636,7 +636,8 @@ class _ShortPageState extends State<_ShortPage> {
                 ),
                 const SizedBox(height: 8),
                 // 下载入口（第 27 条）：短视频点一下就开始下。
-                DownloadButton(item: widget.item, size: 30),
+                // 第 30 条：22px，跟旁边点赞/静音/全屏图标收齐，别挡画面。
+                DownloadButton(item: widget.item, size: 22),
               ],
             ),
           ),

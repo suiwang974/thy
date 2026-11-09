@@ -84,7 +84,7 @@ class VideoCard extends StatelessWidget {
                 Positioned.fill(child: PosterThumb(item: item)),
                 if (item.durationText.isNotEmpty)
                   Positioned(
-                    right: 6, bottom: 6,
+                    left: 6, bottom: 6,
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                       decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(4)),
@@ -93,12 +93,14 @@ class VideoCard extends StatelessWidget {
                   ),
                 // 下载入口（第 27 条：每个视频都要有，点一下就开始下；
                 // 点它不进播放页——IconButton 的手势赢了外层卡片的 onTap）。
+                // 第 30 条：放封面右下角的小图标（16px + shrinkWrap），
+                // 不要中间一个大圆圈挡画面；时长 chip 让位到左下角。
                 Positioned(
-                  left: 6, bottom: 6,
+                  right: 6, bottom: 6,
                   child: Container(
                     decoration: const BoxDecoration(color: Colors.black87, shape: BoxShape.circle),
                     padding: const EdgeInsets.all(2),
-                    child: DownloadButton(item: item, size: 18),
+                    child: DownloadButton(item: item, size: 16),
                   ),
                 ),
               ],

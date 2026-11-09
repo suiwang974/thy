@@ -8,9 +8,13 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_item.dart';
 import '../services/adblock_service.dart';
+import '../services/downloader.dart';
+import '../services/sniffer.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import 'download_button.dart';
+import 'sniff_sheet.dart';
+import 'web_source_browser.dart';
 
 /// 播放页：点开直接在线播。
 /// - 播放一律走直链、原生播（ExoPlayer，HLS/mp4 都行；niacg 的链带 Referer 头）；
@@ -54,6 +58,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String? _variantLabel;
   // 无画面看门狗：原生播放器播出声音但画面纹理一直没出帧时自动切官方播放器。
   Timer? _watchdog;
+  // 第 33 条：官方播放器上方那排提示条改成一行瘦条，可关闭；
+  // 关掉后留一个小 ⓘ 按钮可 reopen，每段视频重置关闭状态。
+  bool _webBarDismissed = false;
+  // 第 32 条：官方播放器页主框加载失败时的原因（不拿空白页充数）。
+  String? _webError;
+  // 第 34 条：官方播放器 WebView 里嗅到的媒体（和内置浏览器同一套嗅探）。
+  List<SniffedMedia> _embedSniffed = [];
+  String _embedPageTitle = '';
 
   @override
   void initState() {
@@ -129,6 +141,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _disliked = widget.store.isDisliked(item);
       _variants = [];
       _variantLabel = null;
+      _webBarDismissed = false;
+      _webError = null;
+      _embedSniffed = [];
     });
     await _controller?.dispose();
     _controller = null;
@@ -277,6 +292,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   /// 注意之前这里有个死代码 bug：_error 非空时 _buildVideoArea 永远走报错分支，
   /// WebView 永远渲染不出来，点“在源站看”什么都没发生。
   /// 现在 _webController 优先渲染（见 _buildVideoArea），_error 只当原因横幅。
+  /// 第 32 条：embedUrl 只嵌视频播放器本身（embed 播放页），不嵌整个网站——
+  /// 见 VideoItem.embedUrl（pornhub/xhamster/xvideos 各走官方 embed 页）。
   void _embedOfficial(String reason) {
     final embed = _current.embedUrl;
     if (embed.isEmpty) {
@@ -286,6 +303,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       });
       return;
     }
+    _webBarDismissed = false;
+    _webError = null;
+    _embedSniffed = [];
     // 控制器先声明出来，再挂回调：回调里要调 _injectAdblock(wc)，
     // 写成级联 (..setNavigationDelegate) 会在声明完成前引用 wc，编译不过。
     final wc = WebViewController();
@@ -293,6 +313,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
     wc.setNavigationDelegate(NavigationDelegate(
       onPageFinished: (_) async {
         await _injectAdblock(wc);
+        await _sniffEmbed(wc);
+      },
+      onWebResourceError: (error) {
+        // 第 32 条：主框加载失败别拿空白页充数——写明原因，给重试/去浏览器看。
+        if (error.isForMainFrame == true && mounted) {
+          setState(() => _webError = '官方播放器打不开：${_shortReason(error.description)}');
+        }
       },
       onNavigationRequest: (req) {
         // 官方播放器页内跳转放行；点到站外广告/下载链接时拦住，别把人带走。
@@ -320,6 +347,75 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _loading = false;
       _error = reason;
     });
+  }
+
+  /// 官方播放器 WebView 里嗅视频（第 34 条）：和内置浏览器同一套嗅探，
+  /// 嗅到就出瘦条（播/下载），嗅不到不打扰。
+  Future<void> _sniffEmbed(WebViewController wc) async {
+    try {
+      final r = await Sniffer.sniff(wc, pageUrl: _current.pageUrl ?? '');
+      if (!mounted || _webController == null) return;
+      setState(() {
+        _embedSniffed = r.items;
+        _embedPageTitle = r.pageTitle;
+      });
+      // 视频可能是懒加载的：4 秒后再嗅一次。
+      await Future.delayed(const Duration(seconds: 4));
+      if (!mounted || _webController == null) return;
+      final r2 = await Sniffer.sniff(wc, pageUrl: _current.pageUrl ?? '');
+      if (!mounted || _webController == null) return;
+      setState(() {
+        _embedSniffed = r2.items;
+        _embedPageTitle = r2.pageTitle;
+      });
+    } catch (_) {}
+  }
+
+  /// 嗅到的清单里最适合播/下的那条：mp4 优先，其次 m3u8；blob 和下不了的不要。
+  SniffedMedia? _bestSniffed(List<SniffedMedia> items) {
+    for (final m in items) {
+      if (m.kind == 'mp4' && m.downloadable) return m;
+    }
+    for (final m in items) {
+      if (m.kind == 'm3u8' && m.downloadable) return m;
+    }
+    for (final m in items) {
+      if (m.downloadable) return m;
+    }
+    return null;
+  }
+
+  /// 嗅到的直链直接播（不重新解析）：关掉官方播放器，用原生播放器播这条链。
+  Future<void> _playSniffed(String url) async {
+    await _controller?.dispose();
+    _controller = null;
+    _webController = null;
+    _embedSniffed = [];
+    _webError = null;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final c = VideoPlayerController.networkUrl(
+        Uri.parse(url),
+        httpHeaders: {'Referer': _current.pageUrl ?? ''},
+      );
+      await c.initialize();
+      if (!mounted) return;
+      setState(() {
+        _controller = c;
+        _currentStreamUrl = url;
+        _loading = false;
+      });
+      _userPaused = false;
+      await c.setPlaybackSpeed(_speed);
+      await c.play();
+      _startWatchdog(c);
+    } catch (e) {
+      if (!mounted) return;
+      _embedOfficial('嗅到的地址播不起来：${_shortReason(e)}');
+    }
   }
 
   /// 广告拦截 JS 注入（第 26 条）：官方播放器页里也有广告，加载完注一次
@@ -467,38 +563,179 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return Column(
         children: [
           Expanded(child: WebViewWidget(controller: _webController!)),
-          Container(
-            width: double.infinity,
-            color: const Color(0xFF2A2A35),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  _error ?? '正在用源站官方播放器播',
-                  style: const TextStyle(color: Colors.white70, fontSize: 13),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: _retryDirect,
-                        child: const Text('重试直链'),
-                      ),
+          // 第 33 条：提示条改成一行瘦条（原因一行省略 + [重试直链] 小按钮 + ✕），
+          // 可关闭；关掉后留一个小 ⓘ 按钮可 reopen，不挡视频。
+          if (!_webBarDismissed)
+            Container(
+              width: double.infinity,
+              color: const Color(0xFF2A2A35),
+              padding: const EdgeInsets.only(left: 12, top: 2, bottom: 2, right: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _error ?? '正在用源站官方播放器播',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white70, fontSize: 12),
                     ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: _closeWeb,
-                        child: const Text('关掉官方播放器'),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+                  ),
+                  TextButton(
+                    onPressed: _retryDirect,
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('重试直链', style: TextStyle(fontSize: 12)),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white70, size: 18),
+                    tooltip: '收起提示',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: () => setState(() => _webBarDismissed = true),
+                  ),
+                ],
+              ),
+            )
+          else
+            Container(
+              width: double.infinity,
+              color: const Color(0xFF2A2A35),
+              padding: const EdgeInsets.only(left: 12, top: 2, bottom: 2, right: 4),
+              child: Row(
+                children: [
+                  TextButton.icon(
+                    onPressed: () => setState(() => _webBarDismissed = false),
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    icon: const Icon(Icons.info_outline, size: 14, color: Colors.white54),
+                    label: const Text('官方播放器', style: TextStyle(color: Colors.white54, fontSize: 12)),
+                  ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: _closeWeb,
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('关掉官方播放器', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
             ),
-          ),
+          // 第 32 条：官方播放器主框加载失败——写明原因，给重试/去浏览器看，
+          // 不拿空白页充数。
+          if (_webError != null)
+            Container(
+              width: double.infinity,
+              color: const Color(0xFF3A1F1F),
+              padding: const EdgeInsets.only(left: 12, top: 2, bottom: 2, right: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(_webError!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                  ),
+                  TextButton(
+                    onPressed: _retryDirect,
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('重试直链', style: TextStyle(fontSize: 12)),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => WebSourceBrowser(
+                          title: _current.title,
+                          url: _current.pageUrl ?? '',
+                          sourceId: _current.source,
+                          store: widget.store,
+                        ),
+                      ));
+                    },
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('去浏览器看', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
+          // 第 34 条：官方播放器里嗅到的视频——瘦条（播/下载两个按钮）。
+          if (_embedSniffed.isNotEmpty)
+            Container(
+              width: double.infinity,
+              color: const Color(0xFF1F2A1F),
+              padding: const EdgeInsets.only(left: 12, top: 2, bottom: 2, right: 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text('嗅到 ${_embedSniffed.length} 个视频',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                  ),
+                  TextButton(
+                    onPressed: () => SniffSheet.show(
+                      context,
+                      items: _embedSniffed,
+                      pageTitle: _embedPageTitle.isEmpty ? _current.title : _embedPageTitle,
+                      sourceId: _current.source,
+                      pageUrl: _current.pageUrl ?? '',
+                      store: widget.store,
+                    ),
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('查看', style: TextStyle(fontSize: 12)),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      final best = _bestSniffed(_embedSniffed);
+                      if (best != null) _playSniffed(best.url);
+                    },
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('播', style: TextStyle(fontSize: 12)),
+                  ),
+                  TextButton(
+                    onPressed: () async {
+                      final best = _bestSniffed(_embedSniffed);
+                      if (best == null) return;
+                      final messenger = ScaffoldMessenger.of(context);
+                      await DownloadManager.instance.startDownloadFromUrl(
+                        id: 'sniff-${best.url.hashCode.abs()}',
+                        title: _current.title,
+                        source: _current.source,
+                        url: best.url,
+                        headers: {'Referer': _current.pageUrl ?? ''},
+                        durationSec: best.durationSec ?? 0,
+                      );
+                      if (!mounted) return;
+                      messenger.showSnackBar(
+                        const SnackBar(content: Text('开始下载，去「我的 · 下载管理」看进度')),
+                      );
+                    },
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('下载', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
+              ),
+            ),
         ],
       );
     }

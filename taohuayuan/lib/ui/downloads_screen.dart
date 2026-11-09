@@ -167,7 +167,7 @@ class DownloadsScreen extends StatelessWidget {
             style: const TextStyle(color: Colors.white, fontSize: 14)),
         subtitle: Text(
           '${t.source}${t.durationSec > 0 ? ' · ${item.durationText}' : ''} · ${t.sizeText}'
-          '${t.kind == DownloadKind.hls ? ' · HLS 分段拼成' : ''}',
+          '${t.kind == DownloadKind.hls ? (t.remuxedToMp4 ? ' · 已转 mp4' : ' · HLS 分段拼成 .ts') : ''}',
           style: const TextStyle(color: Colors.white54, fontSize: 12),
         ),
         trailing: IconButton(

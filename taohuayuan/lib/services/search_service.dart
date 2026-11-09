@@ -154,6 +154,9 @@ class SearchService {
     final query = mapSearchQuery(rawQuery);
     final active = _activeSources(filters);
     final done = <SourceResult>[];
+    // 第 36 条：跨源/跨页合并时去重（同一视频在多源/多页出现，id 现在
+    // 是归一化的视频 key，dedupeById 能认出来；不去重总数会对不上）。
+    final seenIds = <String>{};
     await Future.wait(active.map((s) async {
       final sw = Stopwatch()..start();
       SourceResult r;
@@ -169,8 +172,9 @@ class SearchService {
       }
       sw.stop();
       lastLatencies[s.id] = sw.elapsedMilliseconds;
-      final items = filters != null ? filters.apply(r.items) : r.items;
-      r = SourceResult(sourceId: r.sourceId, sourceName: r.sourceName, items: items, error: r.error, elapsedMs: sw.elapsedMilliseconds);
+      final filtered = filters != null ? filters.apply(r.items) : r.items;
+      final items = filtered.where((v) => seenIds.add(v.id)).toList();
+      r = SourceResult(sourceId: r.sourceId, sourceName: r.sourceName, items: items, error: r.error, elapsedMs: sw.elapsedMilliseconds, rawItemCount: filtered.length);
       done.add(r);
       onResult?.call(List.of(done));
     }));
@@ -241,7 +245,8 @@ class SearchService {
     }));
     var items = results.expand((r) => r.items).toList();
     if (filters != null) items = filters.apply(items);
-    return items;
+    // 第 36 条：翻页合并也去重（同一视频可能在第 1 页和第 2 页都出现）。
+    return dedupeById(items);
   }
 
   /// 首页推荐流：各源并行取热门。

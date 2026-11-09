@@ -40,14 +40,47 @@ class VideoItem {
   /// 能不能直接播（有直链）。
   bool get playable => streamUrl != null && streamUrl!.isNotEmpty;
 
-  /// App 内嵌官方播放器用的地址：eporner 走官方 embed 页
-  /// （https://www.eporner.com/embed/{id}/，干净的播放器页，比视频详情页广告少）；
-  /// 其他源直接用视频页。
+  /// App 内嵌官方播放器用的地址：只嵌视频播放器本身（embed 播放页），
+  /// 不要嵌整个源站网站（第 32 条：嵌整站根本看不了视频）。
+  /// - eporner：https://www.eporner.com/embed/{id}/（官方 embed 页）；
+  /// - pornhub：https://www.pornhub.com/embed/{viewkey}（VM 验通：200，
+  ///   页里有 mediaDefinitions，干净的播放器页）；
+  /// - xhamster：https://xhamster.com/embed/{id}（VM 验通数字 id：200，
+  ///   新式字母 id 按同一规则拼，未验真页）；
+  /// - xvideos：https://www.xvideos.com/embedframe/{id}（VM 验通真 id：
+  ///   200，页里有 setVideoUrlHigh + mp4 直链）；
+  /// - spankbang：embed 格式 VM 下 403 没法验，暂留视频页（整页能播，
+  ///   手机待验后补 embed）；
+  /// - r34/niacg/lianzu11/hanime：没有单独的 embed 页，视频页本身就是
+  ///   播放器页，直接用视频页。
   String get embedUrl {
     if (source == 'eporner' && id.startsWith('eporner-')) {
       return 'https://www.eporner.com/embed/${id.substring('eporner-'.length)}/';
     }
-    return pageUrl ?? '';
+    final page = pageUrl ?? '';
+    if (page.isEmpty) return '';
+    if (source == 'pornhub') {
+      final key = RegExp(r'viewkey=([A-Za-z0-9]+)').firstMatch(page)?.group(1);
+      if (key != null) return 'https://www.pornhub.com/embed/$key';
+      return page;
+    }
+    if (source == 'xhamster') {
+      final m = RegExp(r'/videos/([^/?#]+)').firstMatch(page);
+      if (m != null) {
+        final slug = m.group(1)!;
+        // 新式 id（xhu72iL）直接用；老式 slug（footjob-14468644）取尾部数字。
+        final num = RegExp(r'(\d+)$').firstMatch(slug)?.group(1);
+        final embId = slug.startsWith('xh') ? slug : (num ?? slug);
+        return 'https://xhamster.com/embed/$embId';
+      }
+      return page;
+    }
+    if (source == 'xvideos') {
+      final m = RegExp(r'/video\.([^/?#]+)').firstMatch(page);
+      if (m != null) return 'https://www.xvideos.com/embedframe/${m.group(1)}';
+      return page;
+    }
+    return page;
   }
 
   VideoItem copyWith({

@@ -47,6 +47,12 @@ class _SearchScreenState extends State<SearchScreen> {
   String? _lastQuery;
   int _page = 1;
   bool _hasMore = false;
+  // 第 36 条：搜索代际——两次 _doSearch 并发时，旧搜索的回调直接忽略，
+  // 不许互相覆盖结果/计数。
+  int _searchGen = 0;
+  // 各源返回的原始总数（去重前）；显示数永远从 _items 派生，两边恒一致，
+  // 差额写明口径（“各源返回 X 条，去重后显示 Y 条”）。
+  int _rawReturned = 0;
 
   SearchFilters _filters = const SearchFilters();
 
@@ -88,9 +94,28 @@ class _SearchScreenState extends State<SearchScreen> {
     return '共 ${_queriedNames.length} 个源：${parts.join(' · ')}';
   }
 
+  /// 显示列表里各源的条数（第 36 条：计数一律从 _items 派生，
+  /// 各源计数之和恒等于总数，不再由 onResult/onRetried 各自加）。
+  Map<String, int> _countsFromItems(List<VideoItem> items) {
+    final counts = <String, int>{};
+    for (final v in items) {
+      final name = _sourceNameById(v.source);
+      counts[name] = (counts[name] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  String _sourceNameById(String id) {
+    for (final s in allSources()) {
+      if (s.id == id) return s.name;
+    }
+    return id;
+  }
+
   Future<void> _doSearch(String raw) async {
     final q = raw.trim();
     if (q.isEmpty) return;
+    final gen = ++_searchGen;
     await widget.store.recordSearchTerm(q);
     setState(() {
       _searching = true;
@@ -103,6 +128,7 @@ class _SearchScreenState extends State<SearchScreen> {
       _lastQuery = q;
       _page = 1;
       _hasMore = false;
+      _rawReturned = 0;
     });
     // 先读缓存：搜过的词立刻显示，后台再刷新。缓存里可能有已关掉的源的旧条目，
     // 先按开关过滤掉。
@@ -123,43 +149,45 @@ class _SearchScreenState extends State<SearchScreen> {
     final results = await svc.searchAll(q,
         filters: _filters,
         onResult: (partial) {
-          if (!mounted) return;
-          final merged = partial.expand((r) => r.items).toList();
-          final counts = <String, int>{};
+          if (!mounted || gen != _searchGen) return;
+          final merged = SearchService.dedupeById(partial.expand((r) => r.items).toList());
           final status = Map<String, String>.from(_sourceStatus);
           for (final r in partial) {
-            counts[r.sourceName] = r.items.length;
             status[r.sourceName] =
                 r.error != null ? '${r.error}，后台再试…' : '${r.items.length} 条';
           }
           setState(() {
             _items = merged;
-            _perSource = counts;
+            _perSource = _countsFromItems(merged);
+            _rawReturned = partial.fold(0, (s, r) => s + r.returnedCount);
             _sourceStatus = status;
           });
         },
         // 慢的源后台再试回来：去重后并进结果，状态改成补回的条数。
         onRetried: (retried) {
-          if (!mounted) return;
+          if (!mounted || gen != _searchGen) return;
           setState(() {
             final seen = _items.map((v) => v.id).toSet();
             _items = [..._items, ...retried.items.where((v) => !seen.contains(v.id))];
-            _perSource[retried.sourceName] = (_perSource[retried.sourceName] ?? 0) + retried.items.length;
+            _perSource = _countsFromItems(_items);
+            _rawReturned += retried.returnedCount;
             _sourceStatus[retried.sourceName] = '${retried.items.length} 条（后台补回）';
           });
         },
         // 3 次都失败：状态从“后台再试”改成最终原因，不让用户一直等。
         onRetryFailed: (failed) {
-          if (!mounted) return;
+          if (!mounted || gen != _searchGen) return;
           setState(() {
             _sourceStatus[failed.sourceName] = failed.error ?? '失败';
           });
         });
-    if (!mounted) return;
-    final merged = results.expand((r) => r.items).toList();
+    if (!mounted || gen != _searchGen) return;
+    final merged = SearchService.dedupeById(results.expand((r) => r.items).toList());
     if (merged.isNotEmpty) await widget.store.saveSearchCache(q, merged);
     setState(() {
       _items = merged;
+      _perSource = _countsFromItems(merged);
+      _rawReturned = results.fold(0, (s, r) => s + r.returnedCount);
       _searching = false;
       _hasMore = merged.isNotEmpty;
     });
@@ -178,6 +206,7 @@ class _SearchScreenState extends State<SearchScreen> {
         _page = next;
         final seen = _items.map((v) => v.id).toSet();
         _items = [..._items, ...more.where((v) => !seen.contains(v.id))];
+        _perSource = _countsFromItems(_items);
         _hasMore = true;
       } else {
         _hasMore = false;
@@ -574,8 +603,11 @@ class _SearchScreenState extends State<SearchScreen> {
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                 child: Text(
-                  '共 ${_items.length} 条${_perSource.isEmpty ? '' : '（${_perSource.entries.map((e) => '${e.key} ${e.value}').join(' · ')}）'}',
-                  maxLines: 1,
+                  // 第 36 条：总数 = 显示的条数，各源计数之和恒等于它；
+                  // 去重/过滤掉的写明口径，不再出现“总数比单源还小”。
+                  '共 ${_items.length} 条${_perSource.isEmpty ? '' : '（${_perSource.entries.map((e) => '${e.key} ${e.value}').join(' · ')}）'}'
+                  '${_rawReturned > _items.length ? ' · 各源返回 $_rawReturned 条，去重后显示 ${_items.length} 条' : ''}',
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Colors.white70, fontSize: 13),
                 ),

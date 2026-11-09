@@ -237,6 +237,23 @@ void main() {
     // 回落 home(page: 2)，照样是新一批，不是第 1 页那批。
     expect((await svc.homeFeed(rotation: 6)).map((i) => i.id), ['home-2-a']);
   });
+
+  test('第 36 条：跨源重复去重（同一视频两个源都返回，只留一条；总数口径一致）', () async {
+    // 两个源返回同一条（id 相同）+ 各自独有的一条。
+    final svc = SearchService(sources: [
+      FakeSource('a', items: [v('dup', title: 'dup'), v('a-only', title: 'a')]),
+      FakeSource('b', items: [v('dup', title: 'dup'), v('b-only', title: 'b')]),
+    ]);
+    final results = await svc.searchAll('foot');
+    final merged = results.expand((r) => r.items).toList();
+    // 两个源谁先回来不一定，排个序再比（只断言去重结果，不依赖到达顺序）。
+    final ids = merged.map((i) => i.id).toList()..sort();
+    expect(ids, ['a-only', 'b-only', 'dup']);
+    // 原始返回总数 4 条（每源 2 条），去重后显示 3 条——差额就是口径说明。
+    final raw = results.fold(0, (s, r) => s + r.returnedCount);
+    expect(raw, 4);
+    expect(merged.length, 3);
+  });
 }
 
 /// 按词/页返回不同条目的假源：验 homeFeed 轮换是不是真换了批。

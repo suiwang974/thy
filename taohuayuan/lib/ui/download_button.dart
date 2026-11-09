@@ -8,6 +8,9 @@ import '../services/downloader.dart';
 /// 状态：没下过 = 下载图标；下载中/排队 = 进度环；已下完 = 打勾；
 /// 失败 = 红色感叹号（点一下重新下）。
 /// 点一下就开始（画质默认最高档，不先弹选项）；下载管理在「我的」里。
+/// 尺寸（第 30 条）：IconButton 默认最小点按目标是 48×48，光设 constraints
+/// 压不小，图标 18px、按钮还是 48px 大圆圈挡画面——必须加
+/// tapTargetSize: shrinkWrap，视觉尺寸才跟得上 size。
 class DownloadButton extends StatelessWidget {
   final VideoItem item;
   final double size;
@@ -15,7 +18,7 @@ class DownloadButton extends StatelessWidget {
   const DownloadButton({
     super.key,
     required this.item,
-    this.size = 24,
+    this.size = 20,
     this.color = Colors.white,
   });
 
@@ -41,7 +44,7 @@ class DownloadButton extends StatelessWidget {
           icon = Icon(Icons.download, color: Colors.amber, size: size);
           tip = '已暂停，点一下继续下';
         } else {
-          // 下载中/排队：进度环 + 百分比。
+          // 下载中/排队：进度环 + 百分比（小尺寸只画环，不挤数字）。
           icon = SizedBox(
             width: size,
             height: size,
@@ -54,8 +57,9 @@ class DownloadButton extends StatelessWidget {
                   color: Colors.pinkAccent,
                   backgroundColor: Colors.white24,
                 ),
-                Text('${(task.progress * 100).round()}',
-                    style: const TextStyle(color: Colors.white, fontSize: 8)),
+                if (size >= 24)
+                  Text('${(task.progress * 100).round()}',
+                      style: const TextStyle(color: Colors.white, fontSize: 8)),
               ],
             ),
           );
@@ -66,6 +70,12 @@ class DownloadButton extends StatelessWidget {
           tooltip: tip,
           padding: EdgeInsets.zero,
           constraints: const BoxConstraints(),
+          // 第 30 条：不加这个，按钮最小 48×48，图标再小也没用。
+          // IconButton 没有直接的 tapTargetSize 参数，走 style。
+          style: IconButton.styleFrom(
+            padding: EdgeInsets.zero,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
           onPressed: () async {
             final messenger = ScaffoldMessenger.of(context);
             if (task != null && task.status == DownloadStatus.error) {
@@ -73,8 +83,11 @@ class DownloadButton extends StatelessWidget {
             }
             final started = await manager.startDownload(item);
             if (started == null && context.mounted) {
+              // 第 29 条：写明具体原因（哪个源、为什么没给直链），
+              // 不要只给一句“下不了”。
               messenger.showSnackBar(
-                const SnackBar(content: Text('这段拿不到直链，下不了，只能在线看')),
+                SnackBar(
+                    content: Text(manager.lastFailureReason ?? '这段拿不到直链，下不了，只能在线看')),
               );
             } else if (context.mounted) {
               messenger.showSnackBar(

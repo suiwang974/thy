@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:taohuayuan/services/stream_resolver.dart';
 
@@ -257,5 +259,66 @@ setVideoUrlLow('https://xh2-cdn.example.com/video_360p.mp4')
     // 已经是媒体播放列表（没有 STREAM-INF）返回空。
     const media = '#EXTM3U\n#EXTINF:10.0,\nseg0.ts\n#EXTINF:10.0,\nseg1.ts\n';
     expect(StreamResolver.parseM3u8VariantList(media, 'https://example.com/master.m3u8'), isEmpty);
+  });
+
+  test('第 29 条：pornhub mediaDefinitions 夹具解析（真页抠的 5 条）', () async {
+    final fixture = await File('test/fixtures/pornhub-mediadefinitions.json').readAsString();
+    final html = '<script>var player={ "mediaDefinitions": $fixture };</script>';
+    final defs = StreamResolver.parsePornhubMediaDefinitions(html);
+    expect(defs.length, 5);
+    // 1080 HLS 优先（最高档）。
+    final hls1080 = defs.where((d) => d.format == 'hls' && d.quality == '1080').toList();
+    expect(hls1080.length, 1);
+    expect(hls1080.first.url, contains('1080P_4000K'));
+    expect(hls1080.first.url, contains('master.m3u8'));
+    // get_media 接口地址认出来（format mp4、quality 为空）。
+    final mp4 = defs.where((d) => d.format == 'mp4').toList();
+    expect(mp4.length, 1);
+    expect(mp4.first.url, contains('/video/get_media'));
+    // 没 mediaDefinitions 返回空。
+    expect(StreamResolver.parsePornhubMediaDefinitions('<html>no json</html>'), isEmpty);
+  });
+
+  test('第 29 条：pornhub get_media JSON 数组 -> 签名 mp4', () {
+    const body = '''[{"quality":"480","videoUrl":"https://ee.phncdn.com/videos/480P_2000K.mp4?validfrom=1&hash=abc"},'''
+        '''{"quality":"720","videoUrl":"https://ee.phncdn.com/videos/720P_4000K.mp4?validfrom=1&hash=def"}]''';
+    final got = StreamResolver.parsePornhubGetMedia(body);
+    expect(got.length, 2);
+    expect(got.map((e) => e.quality).toList(), ['480', '720']);
+    expect(got[1].url, contains('720P_4000K.mp4'));
+    expect(StreamResolver.parsePornhubGetMedia('not json'), isEmpty);
+  });
+
+  test('第 29 条：xhamster 合成夹具解析（noscript mp4 + HLS，thumb 预览排除）', () async {
+    final html = await File('test/fixtures/xhamster-video.html').readAsString();
+    final (mp4: mp4, hls: hls) = StreamResolver.parseXhamsterDirectLinks(html);
+    expect(mp4, contains('video7.xhcdn.com'));
+    expect(mp4, contains('720p.h264.mp4'));
+    expect(hls, contains('video-nss.xhcdn.com'));
+    expect(hls, endsWith('.m3u8'));
+    // 缩略图预览不认：全是 thumb 的页返回 null。
+    const thumbsOnly = '<video src="https://thumb-v1.xhcdn.com/abc/526x298/t.mp4"></video>';
+    final (mp4: m2, hls: h2) = StreamResolver.parseXhamsterDirectLinks(thumbsOnly);
+    expect(m2, isNull);
+    expect(h2, isNull);
+  });
+
+  test('第 29 条：通用兜底扫描（排除 thumb/preview/广告域名）', () {
+    const html = '''
+      <script src="https://www.googletagmanager.com/gtag.js"></script>
+      <video src="https://cdn.example.com/thumb-preview.mp4"></video>
+      <a href="https://cdn.example.com/real-video.mp4?x=1">play</a>
+    ''';
+    expect(StreamResolver.genericMediaScan(html), 'https://cdn.example.com/real-video.mp4?x=1');
+    expect(StreamResolver.genericMediaScan('<html>nothing here</html>'), isNull);
+    expect(StreamResolver.genericMediaScan('https://doubleclick.net/ads/video.mp4'), isNull);
+  });
+
+  test('第 29 条：extractJsonArray 括号计数（字符串里的括号不算）', () {
+    const html = 'x = {"mediaDefinitions": [{"a": "[not array]", "b": 1}, {"c": 2}]}; y=1';
+    final raw = StreamResolver.extractJsonArray(html, '"mediaDefinitions"');
+    expect(raw, startsWith('[{"a": "[not array]"'));
+    expect(raw, endsWith('}]'));
+    expect(StreamResolver.extractJsonArray(html, '"missing"'), isNull);
   });
 }

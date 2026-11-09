@@ -240,6 +240,40 @@ class _ProfileScreenState extends State<ProfileScreen> {
             ),
           ),
           _sectionCard(
+            title: '浏览器与下载',
+            subtitle: '翻译默认开；下载的 ts 分段默认转 mp4',
+            child: Column(
+              children: [
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('浏览器默认翻译成中文',
+                      style: TextStyle(color: Colors.white)),
+                  subtitle: const Text('内置浏览器打开页面就翻成中文；AppBar 的翻译按钮可随时切回原文',
+                      style: TextStyle(color: Colors.white54)),
+                  value: widget.store.translateEnabled,
+                  activeThumbColor: Colors.pinkAccent,
+                  onChanged: (v) async {
+                    await widget.store.setTranslateEnabled(v);
+                    setState(() {});
+                  },
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('下载的 ts 转成 mp4',
+                      style: TextStyle(color: Colors.white)),
+                  subtitle: const Text('HLS 的 .ts 分段下完重封装成 mp4；转不了就保留 .ts',
+                      style: TextStyle(color: Colors.white54)),
+                  value: widget.store.tsToMp4,
+                  activeThumbColor: Colors.pinkAccent,
+                  onChanged: (v) async {
+                    await widget.store.setTsToMp4(v);
+                    setState(() {});
+                  },
+                ),
+              ],
+            ),
+          ),
+          _sectionCard(
             title: '启用的源',
             subtitle: '默认全部启用；关掉后搜索不再查它',
             child: Column(

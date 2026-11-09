@@ -251,6 +251,28 @@ class Store {
     await _prefs.setInt(_feedRotationKey, value);
   }
 
+  // ---- 内置浏览器默认翻译成中文（第 35 条，用户定）----
+  // 默认 true：浏览器打开页面就走 translate.goog 翻成中文；
+  // AppBar 里的翻译按钮可随时切回原文，选择持久保存。
+  static const _translateKey = 'taohuayuan_translate_enabled';
+
+  bool get translateEnabled => _prefs.getBool(_translateKey) ?? true;
+
+  Future<void> setTranslateEnabled(bool v) async {
+    await _prefs.setBool(_translateKey, v);
+  }
+
+  // ---- 下载的 ts 转 mp4（第 34 条，1DM 同款勾选项）----
+  // 默认 true：HLS 的 .ts 分段下完后重封装成 mp4（纯 Dart 解包，
+  // 没 ffmpeg）；转不了就保留 .ts，不标下载失败。
+  static const _tsToMp4Key = 'taohuayuan_ts_to_mp4';
+
+  bool get tsToMp4 => _prefs.getBool(_tsToMp4Key) ?? true;
+
+  Future<void> setTsToMp4(bool v) async {
+    await _prefs.setBool(_tsToMp4Key, v);
+  }
+
   // ---- 清除口味数据（喜欢/关注/记录/搜过的词/不喜欢），源开关不动 ----
   Future<void> clearTaste() async {
     await _prefs.remove(_likesKey);

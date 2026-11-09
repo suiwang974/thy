@@ -9,7 +9,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/video_item.dart';
+import 'store.dart';
 import 'stream_resolver.dart';
+import 'ts_remuxer.dart';
 
 /// 视频下载（第 27、28 条）+ 下载管理。
 ///
@@ -57,6 +59,8 @@ class DownloadTask {
   String? contentUri; // MediaStore Uri
   String? error;
   final int createdAtMs;
+  // HLS 下完后 ts 转 mp4 是否成功（第 34 条）：成功了管理页写“已转 mp4”。
+  bool remuxedToMp4;
   // 断点续传记账：mp4 是每段已下字节数；HLS 是已下完的分片序号。
   List<int> segmentDone;
   // HLS 分片总数（mp4 为 0）。
@@ -82,6 +86,7 @@ class DownloadTask {
     int? createdAtMs,
     List<int>? segmentDone,
     this.segmentTotal = 0,
+    this.remuxedToMp4 = false,
   }) : createdAtMs = createdAtMs ?? DateTime.now().millisecondsSinceEpoch,
        segmentDone = segmentDone ?? [];
 
@@ -138,6 +143,7 @@ class DownloadTask {
         'createdAtMs': createdAtMs,
         'segmentDone': segmentDone,
         'segmentTotal': segmentTotal,
+        'remuxedToMp4': remuxedToMp4,
       };
 
   factory DownloadTask.fromJson(Map<String, dynamic> j) => DownloadTask(
@@ -164,6 +170,7 @@ class DownloadTask {
             .map((e) => (e as num).toInt())
             .toList(),
         segmentTotal: ((j['segmentTotal'] ?? 0) as num).toInt(),
+        remuxedToMp4: (j['remuxedToMp4'] as bool?) ?? false,
       );
 }
 
@@ -195,6 +202,36 @@ class DownloadManager extends ChangeNotifier {
   final List<DownloadTask> tasks = [];
   final Map<String, _DownloadJob> _jobs = {};
   bool _loaded = false;
+
+  /// 最近一次点下载却下不了的原因（第 29 条）：具体原因，不只一句“下不了”。
+  /// 失败时 DownloadButton 的 SnackBar 显示它。
+  String? lastFailureReason;
+
+  /// 速度取样（第 31 条）：每任务最近 3 秒的（时间, 累计字节）取样点。
+  /// 速度 = 窗口内实际字节数 / 窗口秒数，不写死、不估算。
+  final Map<String, List<(int, int)>> _speedSamples = {};
+
+  /// 每下来一块字节就记一笔（onBytes 回调里调），顺带算出当前速度。
+  void _recordBytes(DownloadTask task) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final list = _speedSamples.putIfAbsent(task.id, () => []);
+    list.add((now, task.downloadedBytes));
+    while (list.length > 2 && now - list.first.$1 > 3000) {
+      list.removeAt(0);
+    }
+    if (list.length > 60) list.removeRange(0, list.length - 60);
+    if (list.length >= 2) {
+      final dt = list.last.$1 - list.first.$1;
+      final db = list.last.$2 - list.first.$2;
+      task.speedBps = dt > 0 ? db * 1000 / dt : 0;
+    }
+  }
+
+  /// 任务停了（暂停/完成/失败）：速度清零，取样丢掉。
+  void _clearSpeed(DownloadTask task) {
+    task.speedBps = 0;
+    _speedSamples.remove(task.id);
+  }
 
   List<DownloadTask> get activeTasks =>
       tasks.where((t) => t.status == DownloadStatus.downloading || t.status == DownloadStatus.queued).toList();
@@ -270,7 +307,12 @@ class DownloadManager extends ChangeNotifier {
       kind = best.url.contains('.m3u8') ? DownloadKind.hls : DownloadKind.mp4;
     } else {
       final resolved = await StreamResolver.resolve(item);
-      if (resolved == null) return null; // 没直链，下不了（不假装能下）
+      if (resolved == null) {
+        // 没直链：把具体原因记下来（哪个源、为什么没给直链），
+        // 别只给一句“下不了”。解析不到的再走 WebView 嗅探（见第 34 条）。
+        lastFailureReason = StreamResolver.lastFailureReason ?? '这个源站没给直链';
+        return null;
+      }
       url = resolved.url;
       headers = resolved.headers;
       kind = url.contains('.m3u8') ? DownloadKind.hls : DownloadKind.mp4;
@@ -378,11 +420,28 @@ class DownloadManager extends ChangeNotifier {
       await dir.create(recursive: true);
       final ext = task.kind == DownloadKind.hls ? '.ts' : '.mp4';
       final tmpPath = '${dir.path}/${task.id}$ext.tmp';
-      String finalPath;
+      var finalPath = '';
       if (task.kind == DownloadKind.hls) {
         finalPath = await _downloadHls(job, tmpPath, task);
       } else {
         finalPath = await _downloadMp4(job, tmpPath, task);
+      }
+      // HLS 的 .ts 分段下完后转 mp4（第 34 条，1DM 同款勾选项，默认开）：
+      // 纯 Dart 重封装（TsRemuxer，没 ffmpeg 也能转）；转不了就保留 .ts，
+      // 不标下载失败（文件本身能播）。
+      if (task.kind == DownloadKind.hls && finalPath.endsWith('.ts.tmp')) {
+        try {
+          final store = await Store.load();
+          if (store.tsToMp4) {
+            final mp4Path = finalPath.replaceAll(RegExp(r'\.ts\.tmp$'), '.mp4.tmp');
+            await TsRemuxer.remuxFile(finalPath, mp4Path);
+            await File(finalPath).delete();
+            finalPath = mp4Path;
+            task.remuxedToMp4 = true;
+          }
+        } catch (_) {
+          // 转失败：保留 .ts，照常落盘。
+        }
       }
       // fMP4 的 HLS 拼出来是 .mp4（_downloadHls 会改后缀），落盘扩展名按实际文件取，
       // 别按 kind 写死，否则 .mp4 文件会被存成 .ts。
@@ -403,14 +462,17 @@ class DownloadManager extends ChangeNotifier {
       task.status = DownloadStatus.done;
       task.progress = 1.0;
       task.downloadedBytes = task.totalBytes > 0 ? task.totalBytes : task.downloadedBytes;
+      _clearSpeed(task);
       try {
         await File(finalPath).delete();
       } catch (_) {}
     } on _Paused {
       task.status = DownloadStatus.paused;
+      _clearSpeed(task);
     } catch (e) {
       task.status = DownloadStatus.error;
       task.error = _shortError(e);
+      _clearSpeed(task);
     }
     _jobs.remove(task.id);
     _notifyAndPersist(persist: true);
@@ -438,6 +500,7 @@ class DownloadManager extends ChangeNotifier {
           downloaded += n;
           task.downloadedBytes = downloaded;
           if (total > 0) task.progress = downloaded / total;
+          _recordBytes(task);
           _throttledNotify(task);
         },
         isCancelled: () => job.cancelled,
@@ -483,6 +546,8 @@ class DownloadManager extends ChangeNotifier {
             task.segmentDone[i] += n;
             task.downloadedBytes = task.segmentDone.fold(0, (s, e) => s + e);
             if (total > 0) task.progress = task.downloadedBytes / total;
+            _recordBytes(task);
+            _throttledNotify(task);
           },
           isCancelled: () => job2.cancelled,
           retries: 3,
@@ -610,6 +675,7 @@ class DownloadManager extends ChangeNotifier {
         task.segmentTotal = totalCount;
         task.downloadedBytes = bytes;
         task.progress = totalCount > 0 ? doneCount / totalCount : 0;
+        _recordBytes(task);
         _throttledNotify(task);
       },
       isCancelled: () => job.cancelled,
@@ -992,7 +1058,7 @@ class DownloadManager extends ChangeNotifier {
       }
       if (url == null) {
         t.status = DownloadStatus.error;
-        t.error = '直链过期了，删掉重新下载';
+        t.error = StreamResolver.lastFailureReason ?? '直链过期了，删掉重新下载';
         _notifyAndPersist(persist: true);
         return;
       }

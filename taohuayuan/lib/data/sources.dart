@@ -21,7 +21,13 @@ class SourceResult {
   final List<VideoItem> items;
   final String? error;
   final int elapsedMs;
-  const SourceResult({required this.sourceId, required this.sourceName, this.items = const [], this.error, this.elapsedMs = 0});
+  /// 去重/过滤前这个源实际返回的条数（第 36 条：总数口径用它，
+  /// “各源返回 X 条，去重后显示 Y 条”，差额写明，别让总数比单源还小）。
+  /// 不填时等于 items.length。
+  final int? rawItemCount;
+  const SourceResult({required this.sourceId, required this.sourceName, this.items = const [], this.error, this.elapsedMs = 0, this.rawItemCount});
+
+  int get returnedCount => rawItemCount ?? items.length;
 }
 
 abstract class Source {
@@ -564,6 +570,20 @@ class HtmlSearchSource implements Source {
   List<VideoItem> parse(String html, String base) =>
       parseHtml(html, base, _id, _linkRe.pattern);
 
+  /// 视频本身的去重 key（第 36 条）：同一视频换个参数、换个 slug
+  /// 还是同一条——pornhub 认 viewkey、xvideos 认 `/video.<id>`、
+  /// xhamster 认 `/videos/<id>`，其他认去掉参数后的路径。
+  /// 供单元测试直接验。
+  static String videoKey(String href) {
+    final viewkey = RegExp(r'[?&]viewkey=([A-Za-z0-9]+)').firstMatch(href)?.group(1);
+    if (viewkey != null) return 'viewkey:$viewkey';
+    final xv = RegExp(r'/video\.([A-Za-z0-9]+)').firstMatch(href)?.group(1);
+    if (xv != null) return 'xvideos:$xv';
+    final xh = RegExp(r'/videos/([A-Za-z0-9]+)').firstMatch(href)?.group(1);
+    if (xh != null) return 'xhamster:$xh';
+    return href.split('?').first.split('#').first;
+  }
+
   static List<VideoItem> parseHtml(String html, String base, String sourceId, String linkPattern) {
     final out = <VideoItem>[];
     final seen = <String>{};
@@ -573,8 +593,13 @@ class HtmlSearchSource implements Source {
       if (out.length >= 100) break;
       final openTag = m.group(1) ?? '';
       final href = m.group(2)!;
-      if (seen.contains(href)) continue;
-      seen.add(href);
+      // 第 36 条：同一视频在同一页出现两次、href 不同（多带了参数），
+      // 按 href 去重去不掉——按视频本身的 key 去重（pornhub 的 viewkey、
+      // xvideos 的 /video.<id>、xhamster 的 /videos/<id>），
+      // 条目 id 也用这个 key，跨页/跨源合并时 dedupeById 才能认出来。
+      final key = videoKey(href);
+      if (seen.contains(key)) continue;
+      seen.add(key);
       final inner = m.group(3) ?? '';
       var title = _decodeEntities(_first(RegExp(r'''title="([^"]+)"'''), openTag) ?? '');
       if (title.isEmpty) {
@@ -618,7 +643,7 @@ class HtmlSearchSource implements Source {
       }
       final res = _first(RegExp(r'\b(2160p|1440p|1080p|720p|4K)\b'), inner) ?? '';
       out.add(VideoItem(
-        id: '$sourceId-$href',
+        id: '$sourceId-$key',
         title: title,
         durationSec: _parseDuration(durText),
         resolution: res,

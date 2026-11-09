@@ -13,8 +13,22 @@ import '../models/video_item.dart';
 /// - niacg 详情页里有 file.xunge.cyou mp4，播时必须带 Referer=详情页；
 /// - lianzu11 详情页里有 mp4，无需 Referer；
 /// - xvideos 详情页里有 setVideoUrlHigh/Low/HLS，优先直链；
-/// - xhamster/pornhub/spankbang 暂无直链解析，返回 null，
-///   播放页会显示官方播放器/官方页备选（有广告的站要如实说，见 sourcePageHasAds）。
+/// - pornhub 详情页里有 mediaDefinitions JSON：4 档 HLS master.m3u8
+///   （1080/720/480/240）+ 一个 get_media 接口地址，调它拿签名 mp4
+///   （2026-11-09 VM 验通：视频页 200、mediaDefinitions 5 条、get_media
+///   返回 480p mp4 直链；签名约 2 小时过期还绑 IP，不进缓存）；
+/// - xhamster 详情页里有直链：<noscript><video src> 是 720p 签名 mp4，
+///   另有 video-nss.xhcdn.com 的 HLS master（_TPL_.h264.mp4.m3u8，
+///   拉下来是含 720p 变体的主列表，媒体列表 302 个 .ts 分片；
+///   2026-11-09 VM 验通：mp4 Range 拉流 206、ffprobe 1208 秒。
+///   注意签名有使用次数限制（limit=3），同一地址反复探会 403——
+///   所以解析现算、不缓存，播/下失败就重新解析拿新地址）；
+/// - spankbang 在 VM 下被 Cloudflare 403，没见过真页：HTTP 解析不到就
+///   返回失败原因，走 WebView 嗅探（不要假装解析到了）；
+/// - 通用兜底：上面都没抓到时，对整页做一次通用 mp4/m3u8 扫描
+///   （排除缩略图预览 .t.mp4 和 thumb 域名），抓到可用的就用；
+/// - 解析不到就返回 null，但要把具体原因写进 lastFailureReason，
+///   下载按钮/播放页按原因显示，不要只给一句“下不了”。
 /// - 通用规则（用户 2026-11-08 定）：所有源都这样——直链优先，
 ///   拿不到直链就走官方播放器/官方页；官方页有广告的要如实说，
 ///   没广告的（niacg、lianzu11）直接嵌官方播。
@@ -52,6 +66,15 @@ class StreamResolver {
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
   static final Map<String, ResolvedStream> _cache = {};
+
+  /// 最近一次解析失败的具体原因（第 29 条：实在下不了要写明原因，
+  /// 不要只给一句“下不了”）。resolve() 开始时清掉，失败时由各分支写；
+  /// 下载按钮读它显示给用户。
+  static String? lastFailureReason;
+
+  /// 签名直链的源（地址约 2 小时过期、还绑 IP/有使用次数限制）：
+  /// 解析现算，不进 _cache（eporner 的老规矩，pornhub/xhamster 同理）。
+  static const _signedSources = {'eporner', 'pornhub', 'xhamster'};
 
   /// 预探时补全的条目（封面/时长）：key 是条目 id。
   static final Map<String, VideoItem> _enriched = {};
@@ -105,19 +128,25 @@ class StreamResolver {
   }
 
   static Future<ResolvedStream?> resolve(VideoItem item) async {
+    lastFailureReason = null;
     final cached = _cache[item.id];
     if (cached != null) return cached;
     var resolved = await _resolveUncached(item);
     if (resolved != null) {
       // 解析出来的地址先过 sanity 检查：垃圾地址（r34 兜底正则的教训）
       // 直接当没解析到，走官方播放器，不拿去给播放器报错。
-      if (!isSaneStreamUrl(resolved.url)) return null;
+      if (!isSaneStreamUrl(resolved.url)) {
+        lastFailureReason = '解析到的地址不正常，没法播，去内置浏览器里嗅探下载';
+        return null;
+      }
       resolved = await _verifyDuration(item, resolved);
-      // eporner 签名地址约 2 小时过期还绑 IP，不进缓存：每次播都现算。
-      if (item.source != 'eporner') {
+      // 签名直链约 2 小时过期还绑 IP，不进缓存：每次播都现算。
+      if (!_signedSources.contains(item.source)) {
         if (_cache.length > 50) _cache.clear();
         _cache[item.id] = resolved;
       }
+    } else {
+      lastFailureReason ??= '这个源站没给直链（页面里找不到视频地址），去内置浏览器里嗅探下载';
     }
     return resolved;
   }
@@ -217,6 +246,125 @@ class StreamResolver {
     } catch (_) {
       return null;
     }
+  }
+
+  /// Pornhub 直链（2026-11-09 VM 验通）：视频页 HTML 里有 mediaDefinitions
+  /// JSON（4 档 HLS master + 1 条 get_media 接口地址）；视频页拿不到时
+  /// 再抓 embed 页（里面有同一份 JSON）。get_media 接口返回 JSON 数组，
+  /// 里面是签名 mp4 直链。签名约 2 小时过期还绑 IP，不进缓存。
+  /// html 是调用方已经抓到的视频页正文（别重复抓一次，1.5MB 的页）。
+  static Future<ResolvedStream?> _resolvePornhub(VideoItem item, String html) async {
+    final page = item.pageUrl;
+    if (page == null || page.isEmpty) {
+      lastFailureReason = '这条没有视频页地址，下不了';
+      return null;
+    }
+    var entries = parsePornhubMediaDefinitions(html);
+    if (entries.isEmpty) {
+      // 视频页没拿到 mediaDefinitions：再抓 embed 页（同一份 JSON）。
+      final viewkey = RegExp(r'viewkey=([A-Za-z0-9]+)').firstMatch(page)?.group(1);
+      if (viewkey != null) {
+        try {
+          final res = await http
+              .get(Uri.parse('https://www.pornhub.com/embed/$viewkey'),
+                  headers: {'User-Agent': _ua})
+              .timeout(const Duration(seconds: 20));
+          if (res.statusCode == 200) {
+            entries = parsePornhubMediaDefinitions(utf8.decode(res.bodyBytes));
+          }
+        } catch (_) {}
+      }
+    }
+    if (entries.isEmpty) {
+      lastFailureReason = 'Pornhub 页里没找到 mediaDefinitions，去内置浏览器里嗅探下载';
+      return null;
+    }
+    final variants = <StreamVariant>[];
+    String? bestMp4;
+    var bestMp4Q = -1;
+    String? bestHls;
+    var bestHlsQ = -1;
+    for (final e in entries) {
+      final q = int.tryParse(e.quality) ?? 0;
+      if (e.format == 'mp4') {
+        if (e.url.contains('/video/get_media')) {
+          // get_media 是接口地址：调一次拿真 mp4。
+          for (final m in await _fetchPornhubGetMedia(e.url)) {
+            final mq = int.tryParse(m.quality) ?? 0;
+            variants.add(StreamVariant('${m.quality}p', m.url));
+            if (mq > bestMp4Q) {
+              bestMp4Q = mq;
+              bestMp4 = m.url;
+            }
+          }
+        } else {
+          variants.add(StreamVariant(e.quality.isEmpty ? 'mp4' : '${e.quality}p', e.url));
+          if (q > bestMp4Q) {
+            bestMp4Q = q;
+            bestMp4 = e.url;
+          }
+        }
+      } else if (e.format == 'hls') {
+        variants.add(StreamVariant(e.quality.isEmpty ? 'HLS 自适应' : '${e.quality}p', e.url));
+        if (q > bestHlsQ) {
+          bestHlsQ = q;
+          bestHls = e.url;
+        }
+      }
+    }
+    if (variants.isNotEmpty) {
+      variants.sort((a, b) => _qualityRank(b.label).compareTo(_qualityRank(a.label)));
+      _variantsCache[item.id] = variants;
+    }
+    final url = bestMp4 ?? bestHls;
+    if (url == null) {
+      lastFailureReason = 'Pornhub 只给了接口地址，没拿到真视频，去内置浏览器里嗅探下载';
+      return null;
+    }
+    return ResolvedStream(url);
+  }
+
+  static Future<List<({String quality, String url})>> _fetchPornhubGetMedia(String apiUrl) async {
+    try {
+      final res = await http
+          .get(Uri.parse(apiUrl), headers: {'User-Agent': _ua})
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode != 200) return [];
+      return parsePornhubGetMedia(utf8.decode(res.bodyBytes));
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// XHamster 直链（2026-11-09 VM 验通）：<noscript><video src> 是 720p
+  /// 签名 mp4（Range 拉流 206、ffprobe 1208 秒），另有 HLS master。
+  /// 签名有使用次数限制（limit=3），同一地址反复探会 403——解析现算、
+  /// 不缓存，播/下失败就重新解析拿新地址。mp4 优先（分段下载快），
+  /// 没有才用 HLS。html 是调用方已经抓到的视频页正文。
+  static Future<ResolvedStream?> _resolveXhamster(VideoItem item, String html) async {
+    final page = item.pageUrl;
+    if (page == null || page.isEmpty) {
+      lastFailureReason = '这条没有视频页地址，下不了';
+      return null;
+    }
+    final links = parseXhamsterDirectLinks(html);
+    final variants = <StreamVariant>[];
+    if (links.mp4 != null) {
+      final q = RegExp(r'(\d+)p\.h264\.mp4').firstMatch(links.mp4!)?.group(1);
+      variants.add(StreamVariant(q == null ? 'mp4' : '${q}p', links.mp4!));
+    }
+    if (links.hls != null) {
+      final q = RegExp(r'multi=\d+x(\d+)').firstMatch(links.hls!)?.group(1);
+      variants.add(StreamVariant(q == null ? 'HLS 自适应' : '${q}p', links.hls!));
+    }
+    if (variants.isNotEmpty) _variantsCache[item.id] = variants;
+    final url = links.mp4 ?? links.hls;
+    if (url == null) {
+      lastFailureReason = 'XHamster 这页是动态加载的，HTML 里没有视频地址，去内置浏览器里嗅探下载';
+      return null;
+    }
+    // 签名 mp4 绑 IP：播/下时带 Referer=视频页。
+    return ResolvedStream(url, {'Referer': page});
   }
 
   /// 画质标签排档位高低用（720p > 480p > 360p > 240p；HLS 自适应放最前）。
@@ -390,6 +538,135 @@ class StreamResolver {
     return out;
   }
 
+  /// 从 HTML 里按 key 抠出一个 JSON 数组（括号计数，跳过字符串里的括号）：
+  /// pornhub 的 mediaDefinitions 就是这么嵌在页里的（1.5MB 的页，正则
+  /// 非贪婪匹配会在第一个 `", "` 处截断，拿不到完整数组——2026-11-09 实测踩坑）。
+  /// 供单元测试直接验。
+  static String? extractJsonArray(String html, String key) {
+    final ki = html.indexOf(key);
+    if (ki < 0) return null;
+    var i = html.indexOf('[', ki);
+    if (i < 0) return null;
+    var depth = 0;
+    var inStr = false;
+    var esc = false;
+    for (var k = i; k < html.length; k++) {
+      final c = html[k];
+      if (inStr) {
+        if (esc) {
+          esc = false;
+        } else if (c == '\\') {
+          esc = true;
+        } else if (c == '"') {
+          inStr = false;
+        }
+      } else {
+        if (c == '"') {
+          inStr = true;
+        } else if (c == '[') {
+          depth++;
+        } else if (c == ']') {
+          depth--;
+          if (depth == 0) return html.substring(i, k + 1);
+        }
+      }
+    }
+    return null;
+  }
+
+  /// pornhub mediaDefinitions JSON 数组 -> 各档位（format/quality/videoUrl）。
+  /// 供单元测试直接验（fixture 是真页上抠下来的数组原文，5 条：
+  /// 1080/720/480/240 四档 HLS master + 1 条 get_media 接口地址）。
+  static List<({String format, String quality, String url})> parsePornhubMediaDefinitions(String html) {
+    final raw = extractJsonArray(html, '"mediaDefinitions"');
+    if (raw == null) return [];
+    try {
+      final arr = jsonDecode(raw) as List;
+      return arr
+          .map((e) {
+            final m = e as Map<String, dynamic>;
+            return (
+              format: (m['format'] ?? '').toString(),
+              quality: (m['quality'] ?? '').toString(),
+              url: (m['videoUrl'] ?? '').toString(),
+            );
+          })
+          .where((e) => e.url.isNotEmpty)
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// pornhub get_media 接口返回的 JSON 数组 -> mp4 直链（带画质）。
+  /// 供单元测试直接验。
+  static List<({String quality, String url})> parsePornhubGetMedia(String body) {
+    try {
+      final arr = jsonDecode(body) as List;
+      return arr
+          .map((e) {
+            final m = e as Map<String, dynamic>;
+            return (
+              quality: (m['quality'] ?? '').toString(),
+              url: (m['videoUrl'] ?? '').toString(),
+            );
+          })
+          .where((e) => e.url.isNotEmpty && e.url.contains('.mp4'))
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// xhamster 详情页 HTML -> 直链（mp4 + HLS master）。
+  /// mp4 在 <noscript><video src> 里（720p 签名 mp4）；HLS 在
+  /// video-nss.xhcdn.com 的 _TPL_.h264.mp4.m3u8。
+  /// videoThumbProps 是相关推荐列表，不是本片，别拿它当本片地址。
+  /// 缩略图预览（thumb-*.xhcdn.com / .t.mp4）一律排除——那是几秒的预览，
+  /// 不是正片。供单元测试直接验。
+  static ({String? mp4, String? hls}) parseXhamsterDirectLinks(String html) {
+    String? mp4;
+    // 先认 <noscript><video src>（最准：就是本片的播放地址）。
+    for (final n in RegExp(r'<noscript>(.*?)</noscript>', dotAll: true).allMatches(html)) {
+      final m = RegExp(r'''<video[^>]+src=["']([^"']+)["']''').firstMatch(n.group(1) ?? '');
+      final u = m?.group(1);
+      if (u != null && u.contains('.xhcdn.com') && u.contains('.mp4')) {
+        mp4 = u;
+        break;
+      }
+    }
+    // 没 noscript 时退回全页找（排除 thumb 预览）。
+    mp4 ??= RegExp(r'''https://video[0-9]*\.xhcdn\.com[^"'\s\\]*\.h264\.mp4''')
+        .allMatches(html)
+        .map((m) => m.group(0)!)
+        .where((u) => !u.contains('thumb') && !u.contains('.t.mp4'))
+        .firstOrNull;
+    final hls = RegExp(r'''https://video-nss\.xhcdn\.com[^"'\s\\]*\.m3u8''')
+        .firstMatch(html)
+        ?.group(0);
+    return (mp4: mp4, hls: hls);
+  }
+
+  /// 通用兜底扫描：整页找 mp4/m3u8 直链（排除缩略图预览与广告域名）。
+  /// 供单元测试直接验；spankbang 这类没专属分支的源靠它捡漏。
+  static String? genericMediaScan(String html) {
+    final re = RegExp(r'''https://[^"'\s\\<>]+\.(?:mp4|m3u8)(?:\?[^"'\s\\<>]*)?''');
+    for (final m in re.allMatches(html)) {
+      var u = m.group(0)!.replaceAll(r'\/', '/');
+      final lower = u.toLowerCase();
+      if (lower.contains('thumb') ||
+          lower.contains('.t.mp4') ||
+          lower.contains('preview') ||
+          lower.contains('googletag') ||
+          lower.contains('doubleclick')) {
+        continue;
+      }
+      if (!isSaneStreamUrl(u)) continue;
+      return u;
+    }
+    return null;
+  }
+
   /// HLS 主播放列表正文 -> 各变体播放列表（带分辨率标签；相对地址按 baseUrl 拼）。
   /// 供单元测试直接验；master 里没有变体（已是媒体播放列表）返回空。
   static List<StreamVariant> parseM3u8VariantList(String body, String baseUrl) {
@@ -419,11 +696,14 @@ class StreamResolver {
   /// - xvideos：详情页 High/Low/HLS 三档；
   /// - rule34videos：HLS 主列表里的变体 + 360p mp4 兜底；
   /// - eporner：xhr 返回的各档（解析直链时已缓存，没缓存就现算一次）；
+  /// - pornhub：mediaDefinitions 各档（mp4 优先，HLS 其次）；
+  /// - xhamster：noscript 的 720p mp4 + HLS master；
   /// - niacg/lianzu11：只有一条 mp4，档位就是“原画”；
   /// - 其他源：没直链解析，返回空（菜单里只显示当前这一档）。
   static Future<List<StreamVariant>> variantsFor(VideoItem item) async {
-    // eporner 的签名地址约 2 小时过期还绑 IP，不读缓存，每次现算。
-    if (item.source != 'eporner') {
+    // 签名源（eporner/pornhub/xhamster）的地址约 2 小时过期还绑 IP，
+    // 不读缓存，每次现算。
+    if (!_signedSources.contains(item.source)) {
       final cached = _variantsCache[item.id];
       if (cached != null) return cached;
     }
@@ -463,7 +743,9 @@ class StreamResolver {
             } catch (_) {}
           }
         }
-      } else if (item.source == 'eporner') {
+      } else if (item.source == 'eporner' ||
+          item.source == 'pornhub' ||
+          item.source == 'xhamster') {
         // 解析直链时已把各档缓存进 _variantsCache；没缓存说明还没解析过，
         // 先 resolve 一次（里面会缓存档位），再读缓存。
         await resolve(item);
@@ -489,14 +771,36 @@ class StreamResolver {
       return ResolvedStream(item.streamUrl!, headers);
     }
     final page = item.pageUrl;
-    if (page == null || page.isEmpty) return null;
+    if (page == null || page.isEmpty) {
+      lastFailureReason = '这条没有视频页地址，下不了';
+      return null;
+    }
     // 2. 已经是直链地址本身。
     if (page.endsWith('.mp4') || page.contains('.m3u8')) {
       return ResolvedStream(page);
     }
-    // 3. 按来源解析详情页。
+    // 3. eporner 先走：它自己抓 embed 页签名，不用下面这份 html。
+    //    （视频页 403 时 embed 页可能还通，别让下面的状态检查把它拦了。）
+    if (item.source == 'eporner') {
+      // Eporner 直链必须走签名流程（裸 gvideo mp4 一律 403，不是直链）：
+      // embed 页里的 EP.video.player.hash（32 位 hex）→ 四组 8 位 hex 各自
+      // 16 进制转整数再转 36 进制拼起来 → 调 xhr/video 接口拿签名 mp4。
+      // 这套是网站版 2026-11-07 逆向并用 curl 验过的，2026-11-09 VM 再验通：
+      // 签名 720p Range 拉流 206、ffprobe 475.96 秒，和 API 的 475 秒一致。
+      // 签名地址约 2 小时过期、还绑解析时的出口 IP——必须在点开播那一刻现算，
+      // 不能跨会话缓存（resolve 里 eporner 不进缓存）；播不起来就自动切
+      // App 内嵌官方播放器，不只给外跳按钮。
+      return await _resolveEporner(item);
+    }
+    // 4. 按来源解析详情页。
     try {
       final res = await http.get(Uri.parse(page), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 20));
+      if (res.statusCode != 200) {
+        // 站方把纯 HTTP 请求拦了：原因按源写明，别让用户对着空白页猜。
+        // 内置浏览器（真浏览器带 JS）能过验证，播放页/搜索页会给入口。
+        lastFailureReason = _httpFailureReason(item.source, res.statusCode);
+        return null;
+      }
       final html = utf8.decode(res.bodyBytes);
       // 预探直链的同时顺带补封面/时长（og:image / og:video:duration），别让用户点开再等。
       _enrichFromDetail(item, html);
@@ -516,17 +820,6 @@ class StreamResolver {
             RegExp(r'''https:\/\/[^"' ]+\.mp4''').firstMatch(html);
         if (m != null) return ResolvedStream(m.group(0)!);
       }
-      if (item.source == 'eporner') {
-        // Eporner 直链必须走签名流程（裸 gvideo mp4 一律 403，不是直链）：
-        // embed 页里的 EP.video.player.hash（32 位 hex）→ 四组 8 位 hex 各自
-        // 16 进制转整数再转 36 进制拼起来 → 调 xhr/video 接口拿签名 mp4。
-        // 这套是网站版 2026-11-07 逆向并用 curl 验过的，2026-11-09 VM 再验通：
-        // 签名 720p Range 拉流 206、ffprobe 475.96 秒，和 API 的 475 秒一致。
-        // 签名地址约 2 小时过期、还绑解析时的出口 IP——必须在点开播那一刻现算，
-        // 不能跨会话缓存（resolve 里 eporner 不进缓存）；播不起来就自动切
-        // App 内嵌官方播放器，不只给外跳按钮。
-        return await _resolveEporner(item);
-      }
       if (item.source == 'hanime1' || item.source == 'hanimeone') {
         // 未验（2026-11-09，VM 实测）：hanime1.me/hanimeone.me 都被 Cloudflare 403，
         // 没见过真实 watch 页。按常见结构找 mp4：<video>/<source src> 或直链。
@@ -541,9 +834,54 @@ class StreamResolver {
         final url = parseXvideosDirectLink(html);
         if (url != null) return ResolvedStream(url);
       }
+      if (item.source == 'pornhub') {
+        // mediaDefinitions JSON（4 档 HLS + get_media 接口拿签名 mp4），
+        // 2026-11-09 VM 验通。拿不到就继续往下走通用兜底扫描。
+        final r = await _resolvePornhub(item, html);
+        if (r != null) return r;
+      }
+      if (item.source == 'xhamster') {
+        // <noscript><video src> 720p 签名 mp4 + HLS master，2026-11-09 VM 验通。
+        // 拿不到就继续往下走通用兜底扫描。
+        final r = await _resolveXhamster(item, html);
+        if (r != null) return r;
+      }
+      // 5. 通用兜底：专属分支都没抓到时，对整页扫一次 mp4/m3u8
+      //    （spankbang 这类没专属分支的源靠它捡漏；缩略图预览不算）。
+      final generic = genericMediaScan(html);
+      if (generic != null) return ResolvedStream(generic);
     } catch (_) {
       // 解析失败就返回 null，播放页走“在源站看”。
+      lastFailureReason ??= _fetchFailureReason(item.source);
     }
     return null;
+  }
+
+  /// 视频页 HTTP 请求被拦/失败的原因（按源写明，别让用户猜）。
+  static String _httpFailureReason(String source, int code) {
+    switch (source) {
+      case 'spankbang':
+        return 'SpankBang 被 Cloudflare 拦住了（HTTP $code），去内置浏览器里嗅探下载';
+      case 'niacg':
+      case 'lianzu11':
+      case 'hanime1':
+      case 'hanimeone':
+        return '站方拦住了 HTTP 请求（HTTP $code），去内置浏览器里看';
+      default:
+        return '视频页请求失败（HTTP $code），去内置浏览器里嗅探下载';
+    }
+  }
+
+  /// 请求视频页抛错（断网/超时）的原因。
+  static String _fetchFailureReason(String source) {
+    switch (source) {
+      case 'niacg':
+      case 'lianzu11':
+      case 'hanime1':
+      case 'hanimeone':
+        return '站方拦住了 HTTP 请求，去内置浏览器里看';
+      default:
+        return '请求视频页失败，去内置浏览器里嗅探下载';
+    }
   }
 }

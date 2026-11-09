@@ -220,4 +220,47 @@ void main() {
     // 不是 hanime 地址，原样返回。
     expect(HanimeSource.mirrorUrl('https://www.niacg.com/'), 'https://www.niacg.com/');
   });
+
+  test('第 36 条：videoKey——同一视频换参数/换 slug 还是同一条', () {
+    // pornhub：viewkey 是唯一标识，参数不同也一样。
+    expect(
+      HtmlSearchSource.videoKey(
+          'https://www.pornhub.com/view_video.php?viewkey=6acf472d64e8e'),
+      HtmlSearchSource.videoKey(
+          'https://www.pornhub.com/view_video.php?viewkey=6acf472d64e8e&foo=bar'),
+    );
+    expect(
+      HtmlSearchSource.videoKey(
+          'https://www.pornhub.com/view_video.php?viewkey=6acf472d64e8e'),
+      isNot(HtmlSearchSource.videoKey(
+          'https://www.pornhub.com/view_video.php?viewkey=aaaaaaaaaaaa')),
+    );
+    // xvideos：/video.<id> 是标识，slug 换了也一样。
+    expect(
+      HtmlSearchSource.videoKey('https://www.xvideos.com/video.omicikt9ece/slug-a'),
+      HtmlSearchSource.videoKey('https://www.xvideos.com/video.omicikt9ece/slug-b'),
+    );
+    // xhamster：/videos/<id> 是标识。
+    expect(
+      HtmlSearchSource.videoKey('https://xhamster.com/videos/xhu72iL'),
+      HtmlSearchSource.videoKey('https://xhamster.com/videos/xhu72iL?foo=1'),
+    );
+  });
+
+  test('第 36 条：parseHtml——pornhub 同一 viewkey 出现两次只收一条', () {
+    const html = '''
+<a href="https://www.pornhub.com/view_video.php?viewkey=6acf472d64e8e" title="Foot Massage Fun">10:00</a>
+<a href="https://www.pornhub.com/view_video.php?viewkey=6acf472d64e8e&extra=1" title="Foot Massage Fun">10:00</a>
+<a href="https://www.pornhub.com/view_video.php?viewkey=aaaaaaaaaaaa" title="Other Video">05:00</a>
+''';
+    final items = HtmlSearchSource.parseHtml(
+      html,
+      'https://www.pornhub.com',
+      'pornhub',
+      r'https://www\.pornhub\.com/view_video\.php\?viewkey=[A-Za-z0-9]+[^"]*',
+    );
+    expect(items.length, 2);
+    expect(items.map((v) => v.id).toSet().length, 2);
+    expect(items.first.id, 'pornhub-viewkey:6acf472d64e8e');
+  });
 }
