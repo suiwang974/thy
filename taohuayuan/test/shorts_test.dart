@@ -69,4 +69,14 @@ void main() {
             tappedIndex: 2, currentIndex: 2, shortsIndex: 1),
         isFalse);
   });
+
+  test('第 64 条：滑回来接着播——只有看过 3 秒以上、且没看到尾才恢复进度', () {
+    expect(resumeSeekSeconds(0, 180), isNull); // 没看过
+    expect(resumeSeekSeconds(2, 180), isNull); // 刚点开 2 秒，从头播
+    expect(resumeSeekSeconds(3, 180), isNull); // 正好 3 秒，也不恢复
+    expect(resumeSeekSeconds(90, 180), 90); // 看了一半，接着播
+    expect(resumeSeekSeconds(175, 180), isNull); // 只剩 5 秒，算看完了，从头播
+    expect(resumeSeekSeconds(178, 180), isNull); // 只剩 2 秒，从头播
+    expect(resumeSeekSeconds(90, 0), isNull); // 不知道总时长，不恢复
+  });
 }

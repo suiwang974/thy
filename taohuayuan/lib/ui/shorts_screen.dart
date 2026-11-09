@@ -117,6 +117,15 @@ class ShortsScreen extends StatefulWidget {
 /// 时长未知的留着（没数据不能直接丢）。
 bool isShortForShorts(VideoItem v) => v.durationSec <= 0 || v.durationSec <= 1800;
 
+/// 第 64 条：滑回来接着播——存过的进度只有同时满足下面两条才恢复：
+/// 看过 3 秒以上（刚点开的不算）、且还没看到尾（剩 5 秒以上）。
+/// 太短或已看到尾都从头播。返回要 seek 到的秒数，不恢复返回 null。
+int? resumeSeekSeconds(int savedSec, int durationSec) {
+  if (savedSec <= 3 || durationSec <= 0) return null;
+  if (savedSec >= durationSec - 5) return null;
+  return savedSec;
+}
+
 /// 第 55 条：搜索流 = 搜索结果里能进短视频的条目（30 分钟内或时长未知），
 /// 按网格顺序、去重；超半小时的长片不进竖滑流（第 16 条的规矩），点它进详情页。
 List<VideoItem> shortsSearchStream(List<VideoItem> items) {
@@ -446,8 +455,10 @@ class _ShortsScreenState extends State<ShortsScreen> {
             // 第 55 条：搜索流不存位置（它不是推荐/最新/最热门任一标签，
             // 退出搜索流再进还是从搜索页点进来，不续播）。
             if (!_searchMode) unawaited(widget.store.setShortsPosition(_tab.name, i));
-            // 滑到第 i 段，预探第 i+1 段的直链。
+            // 第 65 条：滑到第 i 段，预探第 i+1、i+2 段的直链（进缓存，
+            // 滑过去时 _init 直接命中，不用等解析）。
             if (i + 1 < items.length) unawaited(StreamResolver.prefetch(items[i + 1]));
+            if (i + 2 < items.length) unawaited(StreamResolver.prefetch(items[i + 2]));
             // 快滑到底了，提前加载下一批。
             if (i >= items.length - 3) unawaited(_loadMore());
           },
@@ -578,7 +589,8 @@ class _ShortPage extends StatefulWidget {
   State<_ShortPage> createState() => _ShortPageState();
 }
 
-class _ShortPageState extends State<_ShortPage> {
+class _ShortPageState extends State<_ShortPage>
+    with AutomaticKeepAliveClientMixin {
   VideoPlayerController? _controller;
   // 全屏对话框通过这个 notifier 拿当前播放器：切画质会重建播放器，
   // 对话框靠 notifier 跟着换，不会拿着旧的（已释放的）播。
@@ -597,6 +609,17 @@ class _ShortPageState extends State<_ShortPage> {
   bool _authorTried = false;
   bool _resolvingAuthor = false;
   bool _authorFailed = false;
+  // 第 64 条：上一次是不是当前这段——从当前变非当前时把进度存下来。
+  bool _wasCurrent = false;
+
+  // 第 64/65 条：前后各留两段保活——滑走再回来不用重建、直接接着播；
+  // 提前建好的两段已经把直链解析 + 播放器初始化完了，滑过去直接播。
+  // PageView.builder 没有 cacheExtent 参数（这版 Flutter 不认），
+  // 所以用 AutomaticKeepAliveClientMixin 做有界保活：离当前超过两段的
+  // 才放掉，放掉的那段靠 _saveProgress + 恢复进度接住。
+  @override
+  bool get wantKeepAlive =>
+      (widget.currentPage.value - widget.index).abs() <= 2;
 
   bool get _isCurrent => widget.currentPage.value == widget.index;
   bool get _shouldPlay => widget.tabVisible && _isCurrent;
@@ -607,6 +630,7 @@ class _ShortPageState extends State<_ShortPage> {
     _displayItem = widget.item;
     _liked = widget.store.likedIds.contains(widget.item.id);
     _muted = widget.muted.value;
+    _wasCurrent = _isCurrent;
     widget.currentPage.addListener(_onPageChanged);
     widget.muted.addListener(_onMutedChanged);
     _init();
@@ -620,9 +644,28 @@ class _ShortPageState extends State<_ShortPage> {
   }
 
   void _onPageChanged() {
+    // 第 64 条：离当前页的距离变了，重新算保不保活。
+    updateKeepAlive();
+    // 第 64 条：刚滑走（从当前变非当前）时把播到几秒存下来，滑回来接着播。
+    final wasCurrent = _wasCurrent;
+    _wasCurrent = _isCurrent;
+    if (wasCurrent && !_isCurrent) _saveProgress();
     _applyPlayState();
     // 第 47 条：轮到这一段了，没作者就去视频页补一个（只补一次）。
     if (_isCurrent) unawaited(_maybeResolveAuthor());
+  }
+
+  /// 第 64 条：把当前播到几秒存下来（视频 id → 秒数），滑回来接着播。
+  /// 用已有的观看记录（recordWatch）：位置和比例都记，续播和“看完”都受益。
+  /// 控制器还没初始化好、或只看了 3 秒以内，不存。
+  void _saveProgress() {
+    final c = _controller;
+    if (c == null || !c.value.isInitialized) return;
+    final posSec = c.value.position.inSeconds;
+    if (posSec <= 3) return;
+    final durSec = c.value.duration.inSeconds;
+    final item = durSec > 0 ? _displayItem.copyWith(durationSec: durSec) : _displayItem;
+    unawaited(widget.store.recordWatch(item, posSec));
   }
 
   /// 第 47 条：当前这段没作者时，拉视频页补一个（eporner 的作者只能这么拿：
@@ -674,6 +717,8 @@ class _ShortPageState extends State<_ShortPage> {
 
   @override
   void dispose() {
+    // 第 64 条：页面销毁前也存一次进度（滑远了被 PageView 回收时用）。
+    _saveProgress();
     widget.currentPage.removeListener(_onPageChanged);
     widget.muted.removeListener(_onMutedChanged);
     _controllerNotifier.dispose();
@@ -723,6 +768,10 @@ class _ShortPageState extends State<_ShortPage> {
       await c.setLooping(true);
       await c.setVolume(_muted ? 0 : 1);
       await c.setPlaybackSpeed(_speed);
+      // 第 64 条：滑回来接着播——存过进度就跳到上次的位置再播，进度条也在。
+      final resume = resumeSeekSeconds(
+          widget.store.watchPosition(widget.item.id), actualSec);
+      if (resume != null) await c.seekTo(Duration(seconds: resume));
       // 只有轮到这一段、且短视频栏可见才出声播；没轮到它就只准备好、不播。
       if (_shouldPlay) await c.play();
       // 第 47 条：初始就是当前这段的，没作者也补一个（滑过来的走 _onPageChanged）。
@@ -978,6 +1027,7 @@ class _ShortPageState extends State<_ShortPage> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context); // AutomaticKeepAliveClientMixin 要求调 super.build。
     final c = _controller;
     return Container(
       color: Colors.black,
