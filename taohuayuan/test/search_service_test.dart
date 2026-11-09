@@ -8,7 +8,8 @@ class FakeSource implements Source {
   final Duration delay;
   final List<VideoItem> items;
   final bool throwError;
-  const FakeSource(this._id, {this.delay = Duration.zero, this.items = const [], this.throwError = false});
+  final bool webOnly;
+  const FakeSource(this._id, {this.delay = Duration.zero, this.items = const [], this.throwError = false, this.webOnly = false});
 
   @override
   String get id => _id;
@@ -16,7 +17,7 @@ class FakeSource implements Source {
   String get name => _id;
 
   @override
-  bool get webViewOnly => false;
+  bool get webViewOnly => webOnly;
 
   @override
   String webSearchUrl(String query) => '';
@@ -194,6 +195,24 @@ void main() {
     await Future.delayed(const Duration(seconds: 12));
     expect(failed, isNotNull);
     expect(failed!.error, contains('已试 3 次'));
+  }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('webViewOnly 的源不进 HTTP 搜索/热门/翻页（第 12 条：不报误导人的“0 条”）', () async {
+    final svc = SearchService(sources: [
+      FakeSource('http-ok', items: [v('a', title: 'footjob')]),
+      FakeSource('web-only', webOnly: true, items: [v('b', title: 'footjob')]),
+    ]);
+    // 构造函数就过滤掉 webViewOnly 的源。
+    expect(svc.sources.map((s) => s.id), ['http-ok']);
+    final results = await svc.searchAll('foot');
+    expect(results.expand((r) => r.items).map((i) => i.id), ['a']);
+    final feed = await svc.homeFeed();
+    expect(feed.map((i) => i.id), ['a']);
+    // 默认源表里 webViewOnly 的四个源只走 webSources（搜索页给它们放浏览器按钮）。
+    final real = SearchService();
+    expect(real.webSources.map((s) => s.id), ['niacg', 'lianzu11', 'hanime1', 'hanimeone']);
+    expect(real.sources.map((s) => s.id), isNot(contains('niacg')));
+    expect(real.sources.map((s) => s.id), isNot(contains('hanime1')));
   }, timeout: const Timeout(Duration(seconds: 30)));
 }
 

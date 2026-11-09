@@ -122,11 +122,22 @@ class SearchService {
   /// 现在服务层强制生效：推荐、短视频、搜索、追番、作者页全走这一道。
   final Set<String> disabledSources;
 
+  /// HTTP 能查的源（已启用、且不是 webViewOnly）。
+  /// webViewOnly 的源（niacg、lianzu11、hanime1、hanimeone）会被 WAF/
+  /// Cloudflare 按 TLS 指纹拦，纯 HTTP 请求永远拿不到真结果，只会产出
+  /// 误导人的“0 条”——所以 HTTP 搜索/热门根本不查它们（2026-11-09 定），
+  /// 它们只走内置浏览器（见 webSources）。
   SearchService({List<Source>? sources, Set<String> disabledSources = const {}})
       : disabledSources = disabledSources,
         sources = (sources ?? allSources())
-            .where((s) => !disabledSources.contains(s.id))
+            .where((s) => !disabledSources.contains(s.id) && !s.webViewOnly)
             .toList();
+
+  /// 需要走内置浏览器的源（已启用、webViewOnly）：搜索页给它们放按钮，
+  /// 不参与 HTTP 搜索，不在状态条里报“0 条”。
+  List<Source> get webSources => (allSources())
+      .where((s) => !disabledSources.contains(s.id) && s.webViewOnly)
+      .toList();
 
   /// 搜一次：先把中文词映射成英文，再并行查所有源。
   /// 每当某个源返回，就调一次 onResult（带着目前为止的全部结果，先回来的先显示）。

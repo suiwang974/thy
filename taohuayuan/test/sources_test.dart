@@ -196,7 +196,28 @@ void main() {
     final ids = allSources().map((s) => s.id).toList();
     expect(ids.length, 10);
     expect(ids, containsAll(['hanime1', 'hanimeone']));
+    // webViewOnly 的是 niacg、lianzu11、hanime1、hanimeone 四个
+    // （niacg/lianzu11 2026-11-09 也标了 webViewOnly：WAF/Cloudflare 拦 Dart 请求）。
     expect(allSources().where((s) => s.webViewOnly).map((s) => s.id),
-        ['hanime1', 'hanimeone']);
+        ['niacg', 'lianzu11', 'hanime1', 'hanimeone']);
+  });
+
+  test('Hanime 镜像：两个域名是同一站（第 20 条），一个打不开切另一个', () {
+    // 能进的那个优先：hanimeone.me 可以，hanime1.me 常被验证拦住。
+    expect(HanimeSource.preferredHost, 'hanimeone.me');
+    expect(HanimeSource.isHanimeHost('hanime1.me'), isTrue);
+    expect(HanimeSource.isHanimeHost('hanimeone.me'), isTrue);
+    expect(HanimeSource.isHanimeHost('www.niacg.com'), isFalse);
+    // 换镜像：路径/query 不变，只换域名。
+    expect(
+      HanimeSource.mirrorUrl('https://hanime1.me/search?query=foot&page=1&genre=%E8%A3%8F%E7%95%AA'),
+      'https://hanimeone.me/search?query=foot&page=1&genre=%E8%A3%8F%E7%95%AA',
+    );
+    expect(
+      HanimeSource.mirrorUrl('https://hanimeone.me/watch?v=123'),
+      'https://hanime1.me/watch?v=123',
+    );
+    // 不是 hanime 地址，原样返回。
+    expect(HanimeSource.mirrorUrl('https://www.niacg.com/'), 'https://www.niacg.com/');
   });
 }

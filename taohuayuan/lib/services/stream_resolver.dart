@@ -37,6 +37,16 @@ class ResolvedStream {
   const ResolvedStream(this.url, [this.headers = const {}, this.durationSec, this.isPreview = false]);
 }
 
+/// 一个画质档位（全屏播放器的分辨率菜单用）：标签是真实分辨率
+/// （能从地址里抠出来的就抠，比如 xvideos 的 video_360p.mp4 就是 360p，
+/// 不要把 360p 写成“高清”骗人；抠不出来的才用站方叫法）。
+class StreamVariant {
+  final String label;
+  final String url;
+  final Map<String, String> headers;
+  const StreamVariant(this.label, this.url, [this.headers = const {}]);
+}
+
 class StreamResolver {
   static const _ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -192,12 +202,30 @@ class StreamResolver {
       if (xhrRes.statusCode != 200) return null;
       final parsed = parseEpornerXhr(utf8.decode(xhrRes.bodyBytes));
       if (parsed == null) return null;
+      // 各画质档位也缓存起来（全屏分辨率菜单用），key 是 720p/480p 这类标签。
+      final all = parseEpornerXhrAll(utf8.decode(xhrRes.bodyBytes));
+      if (all.isNotEmpty) {
+        final variants = all.entries
+            .map((e) => StreamVariant(e.key, e.value))
+            .toList()
+          ..sort((a, b) => _qualityRank(b.label).compareTo(_qualityRank(a.label)));
+        _variantsCache[item.id] = variants;
+      }
       // xhr 自带真实时长：不到列表一半就是预览，不标成“能直接播”。
       final preview = isPreviewDuration(listedSec: item.durationSec, actualSec: parsed.durationSec);
       return ResolvedStream(parsed.url, {}, parsed.durationSec, preview);
     } catch (_) {
       return null;
     }
+  }
+
+  /// 画质标签排档位高低用（720p > 480p > 360p > 240p；HLS 自适应放最前）。
+  static int _qualityRank(String label) {
+    final m = RegExp(r'(\d+)p').firstMatch(label);
+    if (m != null) return int.parse(m.group(1)!);
+    if (label.contains('HLS') || label.contains('自适应')) return 10000;
+    if (label.contains('原画')) return 5000;
+    return 0;
   }
 
   /// 直链时长核对：m3u8 在解析时就算播放列表总时长，和列表时长对不上就标预览。
@@ -315,6 +343,140 @@ class StreamResolver {
     final low = RegExp(r"""setVideoUrlLow\(['"]([^'"]+)['"]\)""").firstMatch(html)?.group(1);
     if (low != null && low.isNotEmpty) return low;
     return null;
+  }
+
+  /// xvideos 详情页 HTML -> 全部画质档位（全屏分辨率菜单用）。
+  /// 标签从地址里抠真实分辨率（video_360p.mp4 -> 360p）；抠不出来才用站方叫法。
+  static List<StreamVariant> parseXvideosVariants(String html) {
+    final out = <StreamVariant>[];
+    String label(String url, String fallback) {
+      final m = RegExp(r'video_(\d+)p').firstMatch(url);
+      return m != null ? '${m.group(1)}p' : fallback;
+    }
+
+    final high = RegExp(r"""setVideoUrlHigh\(['"]([^'"]+)['"]\)""").firstMatch(html)?.group(1);
+    if (high != null && high.isNotEmpty) out.add(StreamVariant(label(high, '高清'), high));
+    final hls = RegExp(r"""setVideoHLS\(['"]([^'"]+)['"]\)""").firstMatch(html)?.group(1);
+    if (hls != null && hls.isNotEmpty) out.add(StreamVariant('HLS 自适应', hls));
+    final low = RegExp(r"""setVideoUrlLow\(['"]([^'"]+)['"]\)""").firstMatch(html)?.group(1);
+    if (low != null && low.isNotEmpty) out.add(StreamVariant(label(low, '标清'), low));
+    return out;
+  }
+
+  /// r34 详情页 HTML -> JSON-LD 的 360p mp4（只有 360p 是真文件，
+  /// 720p/480p mp4 直拼是 404，见 parseR34DirectLink 的注释）。
+  static String? parseR34Mp4(String html) {
+    return RegExp(r'https:\/\/r34content\.b-cdn\.net\/videos\/\d+\/\d+p\.mp4')
+        .firstMatch(html)
+        ?.group(0);
+  }
+
+  /// eporner xhr/video 的 JSON -> 全部画质档位（key 是 720/480/360 这类数字或带 p）。
+  /// 供单元测试直接验；_resolveEporner 里解析完会把档位缓存起来，全屏菜单直接用。
+  static Map<String, String> parseEpornerXhrAll(String body) {
+    final out = <String, String>{};
+    try {
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final mp4 = (json['sources'] as Map?)?['mp4'] as Map?;
+      if (mp4 == null) return out;
+      for (final e in mp4.entries) {
+        final v = e.value as Map?;
+        final src = v?['src']?.toString() ?? '';
+        if (src.isEmpty) continue;
+        final key = (e.key as String).trim();
+        out.addAll({key.contains('p') ? key : '${key}p': src});
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  /// HLS 主播放列表正文 -> 各变体播放列表（带分辨率标签；相对地址按 baseUrl 拼）。
+  /// 供单元测试直接验；master 里没有变体（已是媒体播放列表）返回空。
+  static List<StreamVariant> parseM3u8VariantList(String body, String baseUrl) {
+    final out = <StreamVariant>[];
+    final lines = body.split('\n').map((e) => e.trim()).toList();
+    for (var i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+      final res = RegExp(r'RESOLUTION=(\d+)x(\d+)').firstMatch(lines[i]);
+      final bw = RegExp(r'BANDWIDTH=(\d+)').firstMatch(lines[i])?.group(1);
+      for (var j = i + 1; j < lines.length; j++) {
+        final u = lines[j];
+        if (u.isEmpty || u.startsWith('#')) continue;
+        final url = u.startsWith('http') ? u : Uri.parse(baseUrl).resolve(u).toString();
+        final label = res != null
+            ? '${res.group(2)}p'
+            : (bw != null ? '${int.parse(bw) ~/ 1000}kbps' : '自适应');
+        out.add(StreamVariant(label, url));
+        break;
+      }
+    }
+    return out;
+  }
+
+  static final Map<String, List<StreamVariant>> _variantsCache = {};
+
+  /// 当前条目的全部画质档位（全屏分辨率菜单用）。
+  /// - xvideos：详情页 High/Low/HLS 三档；
+  /// - rule34videos：HLS 主列表里的变体 + 360p mp4 兜底；
+  /// - eporner：xhr 返回的各档（解析直链时已缓存，没缓存就现算一次）；
+  /// - niacg/lianzu11：只有一条 mp4，档位就是“原画”；
+  /// - 其他源：没直链解析，返回空（菜单里只显示当前这一档）。
+  static Future<List<StreamVariant>> variantsFor(VideoItem item) async {
+    // eporner 的签名地址约 2 小时过期还绑 IP，不读缓存，每次现算。
+    if (item.source != 'eporner') {
+      final cached = _variantsCache[item.id];
+      if (cached != null) return cached;
+    }
+    final out = <StreamVariant>[];
+    try {
+      if (item.source == 'xvideos') {
+        final page = item.pageUrl;
+        if (page != null && page.isNotEmpty) {
+          final res = await http
+              .get(Uri.parse(page), headers: {'User-Agent': _ua})
+              .timeout(const Duration(seconds: 15));
+          out.addAll(parseXvideosVariants(utf8.decode(res.bodyBytes)));
+        }
+      } else if (item.source == 'rule34videos') {
+        final resolved = await resolve(item);
+        if (resolved != null && resolved.url.contains('.m3u8')) {
+          try {
+            final res = await http
+                .get(Uri.parse(resolved.url), headers: {'User-Agent': _ua})
+                .timeout(const Duration(seconds: 8));
+            out.addAll(parseM3u8VariantList(utf8.decode(res.bodyBytes), resolved.url));
+          } catch (_) {}
+          out.add(StreamVariant('HLS 自适应', resolved.url));
+        }
+        if (resolved != null) {
+          // 360p mp4 兜底：详情页里 JSON-LD 的 contentUrl。
+          final page = item.pageUrl;
+          if (page != null && page.isNotEmpty) {
+            try {
+              final res = await http
+                  .get(Uri.parse(page), headers: {'User-Agent': _ua})
+                  .timeout(const Duration(seconds: 15));
+              final mp4 = parseR34Mp4(utf8.decode(res.bodyBytes));
+              if (mp4 != null && mp4 != resolved.url) {
+                out.add(StreamVariant('360p', mp4));
+              }
+            } catch (_) {}
+          }
+        }
+      } else if (item.source == 'eporner') {
+        // 解析直链时已把各档缓存进 _variantsCache；没缓存说明还没解析过，
+        // 先 resolve 一次（里面会缓存档位），再读缓存。
+        await resolve(item);
+        return _variantsCache[item.id] ?? const [];
+      } else if (item.source == 'niacg' || item.source == 'lianzu11') {
+        final resolved = await resolve(item);
+        if (resolved != null) {
+          out.add(StreamVariant('原画', resolved.url, resolved.headers));
+        }
+      }
+    } catch (_) {}
+    if (out.isNotEmpty) _variantsCache[item.id] = out;
+    return out;
   }
 
   static Future<ResolvedStream?> _resolveUncached(VideoItem item) async {

@@ -198,4 +198,64 @@ high.m3u8
     expect(StreamResolver.parseEpornerXhr('{"duration":100,"sources":{}}'), isNull);
     expect(StreamResolver.parseEpornerXhr('not json'), isNull);
   });
+
+  test('全屏画质档位：xvideos 三档标签抠真实分辨率（第 14 条）', () {
+    const html = '''
+setVideoUrlHigh('https://xh2-cdn.example.com/video_1080p.mp4')
+setVideoHLS('https://xh2-cdn.example.com/hls.m3u8')
+setVideoUrlLow('https://xh2-cdn.example.com/video_360p.mp4')
+''';
+    final vs = StreamResolver.parseXvideosVariants(html);
+    expect(vs.map((v) => v.label).toList(), ['1080p', 'HLS 自适应', '360p']);
+    expect(vs.map((v) => v.url).toList(), [
+      'https://xh2-cdn.example.com/video_1080p.mp4',
+      'https://xh2-cdn.example.com/hls.m3u8',
+      'https://xh2-cdn.example.com/video_360p.mp4',
+    ]);
+    // 只有低清时只有一档；什么都没有返回空。
+    const lowOnly = "setVideoUrlLow('https://xh2-cdn.example.com/video_360p.mp4')";
+    expect(StreamResolver.parseXvideosVariants(lowOnly).map((v) => v.label).toList(), ['360p']);
+    expect(StreamResolver.parseXvideosVariants(''), isEmpty);
+  });
+
+  test('全屏画质档位：r34 只有 360p mp4 是真文件（第 14 条）', () {
+    const html = '''
+<script type="application/ld+json">
+{"@type":"VideoObject","contentUrl":"https://r34content.b-cdn.net/videos/91018/360p.mp4"}
+</script>
+''';
+    expect(StreamResolver.parseR34Mp4(html),
+        'https://r34content.b-cdn.net/videos/91018/360p.mp4');
+    expect(StreamResolver.parseR34Mp4('<html></html>'), isNull);
+  });
+
+  test('全屏画质档位：eporner xhr 全部档位都拿出来（第 14 条）', () {
+    const body = '''
+{"duration":475,"sources":{"mp4":{
+   "720":{"src":"https://cdn.example.com/a-720.mp4"},
+   "480p":{"src":"https://cdn.example.com/a-480.mp4"},
+   "360":{"src":"https://cdn.example.com/a-360.mp4"}}}}''';
+    final all = StreamResolver.parseEpornerXhrAll(body);
+    expect(all.keys.toSet(), {'720p', '480p', '360p'});
+    expect(all['720p'], 'https://cdn.example.com/a-720.mp4');
+    expect(StreamResolver.parseEpornerXhrAll('{"sources":{}}'), isEmpty);
+    expect(StreamResolver.parseEpornerXhrAll('not json'), isEmpty);
+  });
+
+  test('全屏画质档位：HLS 主播放列表的变体带分辨率标签（第 14 条）', () {
+    const master = '''
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+720p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480
+480p.m3u8
+''';
+    final vs = StreamResolver.parseM3u8VariantList(
+        master, 'https://rule34-videos.com/media/videos/91016/master.m3u8');
+    expect(vs.map((v) => v.label).toList(), ['720p', '480p']);
+    expect(vs[0].url, 'https://rule34-videos.com/media/videos/91016/720p.m3u8');
+    // 已经是媒体播放列表（没有 STREAM-INF）返回空。
+    const media = '#EXTM3U\n#EXTINF:10.0,\nseg0.ts\n#EXTINF:10.0,\nseg1.ts\n';
+    expect(StreamResolver.parseM3u8VariantList(media, 'https://example.com/master.m3u8'), isEmpty);
+  });
 }

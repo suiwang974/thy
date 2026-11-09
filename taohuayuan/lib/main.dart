@@ -2,16 +2,17 @@ import 'package:flutter/material.dart';
 
 import 'services/store.dart';
 import 'ui/author_screen.dart';
-import 'ui/following_screen.dart';
+import 'ui/browser_sources_screen.dart';
 import 'ui/home_screen.dart';
 import 'ui/profile_screen.dart';
-import 'ui/schedule_screen.dart';
 import 'ui/shorts_screen.dart';
 
 /// 桃花源：从零重写的视频 App，不套 SkyStream。
-/// 数据走 8 个在线源实时搜，没有本地目录。
-/// 底部五栏：推荐 / 短视频 / 时间表 / 追番 / 我的
-/// （第三栏是“时间表”，不是“搜索”；搜索放推荐页顶部）。
+/// 数据走 10 个在线源实时搜，没有本地目录。
+/// 底部四栏：推荐 / 短视频 / 浏览器 / 我的
+/// （2026-11-09 用户定：第 19 条时间表栏去掉换成浏览器栏；
+///  第 21 条追番栏也去掉并进「我的」，所以最后剩四栏。
+///  搜索放推荐页顶部，不占一栏）。
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final store = await Store.load();
@@ -58,10 +59,10 @@ class _HomeShellState extends State<HomeShell> {
   Widget build(BuildContext context) {
     final pages = <Widget>[
       HomeScreen(store: widget.store, onAuthorTap: _openAuthor),
-      ShortsScreen(store: widget.store),
-      ScheduleScreen(store: widget.store, onAuthorTap: _openAuthor),
-      FollowingScreen(store: widget.store, onAuthorTap: _openAuthor),
-      ProfileScreen(store: widget.store),
+      // 短视频栏不可见时（用户在推荐页），短视频不许自动播出声（第 15 条）。
+      ShortsScreen(store: widget.store, visible: _index == 1),
+      BrowserSourcesScreen(store: widget.store),
+      ProfileScreen(store: widget.store, onAuthorTap: _openAuthor),
     ];
     return Scaffold(
       body: IndexedStack(index: _index, children: pages),
@@ -77,8 +78,7 @@ class _HomeShellState extends State<HomeShell> {
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.home), label: '推荐'),
           BottomNavigationBarItem(icon: Icon(Icons.play_circle), label: '短视频'),
-          BottomNavigationBarItem(icon: Icon(Icons.calendar_month), label: '时间表'),
-          BottomNavigationBarItem(icon: Icon(Icons.bookmark), label: '追番'),
+          BottomNavigationBarItem(icon: Icon(Icons.public), label: '浏览器'),
           BottomNavigationBarItem(icon: Icon(Icons.person), label: '我的'),
         ],
       ),

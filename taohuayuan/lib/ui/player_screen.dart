@@ -43,6 +43,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // 点了图标不亮、再点也不会恢复，用户以为按钮坏了。
   bool _disliked = false;
   WebViewController? _webController;
+  // 画质档位（全屏分辨率菜单用）：当前在播的是哪一档。
+  List<StreamVariant> _variants = [];
+  String? _variantLabel;
+  // 无画面看门狗：原生播放器播出声音但画面纹理一直没出帧时自动切官方播放器。
+  Timer? _watchdog;
 
   @override
   void initState() {
@@ -81,6 +86,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _current = item;
       _liked = widget.store.likedIds.contains(item.id);
       _disliked = widget.store.isDisliked(item);
+      _variants = [];
+      _variantLabel = null;
     });
     await _controller?.dispose();
     _controller = null;
@@ -88,6 +95,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _prefetchNeighbors();
     final stream = await StreamResolver.resolve(item);
     if (!mounted) return;
+    _currentStreamUrl = stream?.url;
     if (stream == null) {
       // 没直链：自动切 App 内嵌官方播放器（WebView），不只给外跳按钮当唯一出路。
       // 用户 2026-11-09 原话：能在本站看就在本站看，不要跑来跑去。
@@ -133,9 +141,76 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
       await c.setPlaybackSpeed(_speed);
       await c.play();
+      // 无画面看门狗 + 画质档位：播起来之后 3 秒再看一眼——
+      // 声音在放、但视频轨道一直没给尺寸（宽/高为 0），说明画面纹理没出帧
+      // （用户 2026-11-09 截图：灰框只有声音没画面），别让用户对着灰框干等，
+      // 自动切 App 内嵌官方播放器；控制条里也常驻“官方播放器”按钮，一点就切。
+      _startWatchdog(c);
+      unawaited(_loadVariants());
     } catch (e) {
       if (!mounted) return;
       _embedOfficial('直链播不起来：${_shortReason(e)}');
+    }
+  }
+
+  /// 无画面看门狗：播起来 3 秒后检查一次——视频轨道没尺寸（宽/高为 0）
+  /// 或报了错，说明画面出不来，自动切官方播放器。
+  /// 正常视频 initialize 完就有尺寸，不会误判。
+  void _startWatchdog(VideoPlayerController c) {
+    _watchdog?.cancel();
+    _watchdog = Timer(const Duration(seconds: 3), () {
+      if (!mounted || _controller != c || _webController != null) return;
+      final v = c.value;
+      if (v.hasError || v.size.width <= 0 || v.size.height <= 0) {
+        _embedOfficial('原生播放器出不来画面（只有声音），已切官方播放器');
+      }
+    });
+  }
+
+  /// 当前条目的画质档位（全屏分辨率菜单用）；当前在播的那一档标出来。
+  Future<void> _loadVariants() async {
+    final vs = await StreamResolver.variantsFor(_current);
+    if (!mounted) return;
+    String? current;
+    for (final v in vs) {
+      if (v.url == _currentStreamUrl) current = v.label;
+    }
+    setState(() {
+      _variants = vs;
+      _variantLabel = current;
+    });
+  }
+
+  // 当前在播的直链地址（切档位时用来标出当前档；resolve 时记下来）。
+  String? _currentStreamUrl;
+
+  /// 切画质档位：不断流重进——记下当前位置/倍速，换新地址重建播放器，
+  /// 回到原位置继续播。同一档不重复切。
+  Future<void> _switchVariant(StreamVariant v) async {
+    final old = _controller;
+    if (old == null || v.url == _currentStreamUrl) return;
+    final pos = old.value.position;
+    final wasPlaying = old.value.isPlaying;
+    _watchdog?.cancel();
+    await old.dispose();
+    if (!mounted) return;
+    try {
+      final c = VideoPlayerController.networkUrl(Uri.parse(v.url), httpHeaders: v.headers);
+      await c.initialize();
+      if (!mounted) return;
+      setState(() {
+        _controller = c;
+        _currentStreamUrl = v.url;
+        _variantLabel = v.label;
+        _loading = false;
+      });
+      await c.seekTo(pos);
+      await c.setPlaybackSpeed(_speed);
+      if (wasPlaying) await c.play();
+      _startWatchdog(c);
+    } catch (e) {
+      if (!mounted) return;
+      _embedOfficial('切画质失败：${_shortReason(e)}');
     }
   }
 
@@ -245,6 +320,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    _watchdog?.cancel();
     _recordProgress();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -406,9 +482,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return const Center(child: Text('播放器还没准备好', style: TextStyle(color: Colors.white54)));
     }
     return Stack(
+      fit: StackFit.expand,
       alignment: Alignment.center,
       children: [
-        AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c)),
+        // 画面：按视频比例居中适配（contain），不撑大外框。
+        // 之前内层 AspectRatio 直接当 Stack 的尺寸锚：竖屏/4:3 视频会把
+        // Stack 撑出 16:9 的框，底部控制条被 Clip.hardEdge 裁到框外——
+        // 用户截图就是灰框 + 一个控制键都没有。现在控制条是 Stack 的直接子项，
+        // 钉在 16:9 框的底部，跟视频比例无关，裁不掉。
+        Center(
+          child: AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c)),
+        ),
         GestureDetector(
           onTap: () => setState(() => c.value.isPlaying ? c.pause() : c.play()),
           child: Container(color: Colors.transparent),
@@ -438,6 +522,17 @@ class _PlayerScreenState extends State<PlayerScreen> {
                       style: const TextStyle(color: Colors.white, fontSize: 12),
                     ),
                     const Spacer(),
+                    // 画质：多档才显示，当前档标 ✓。切档不断流重进（记位置、倍速）。
+                    if (_variants.length > 1) _qualityButton(),
+                    // 画面出不来时一键切官方播放器（灰框自救，不用退出重进）。
+                    TextButton(
+                      onPressed: () => _embedOfficial('已切换到源站官方播放器'),
+                      style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                      child: const Text('官方播', style: TextStyle(color: Colors.white, fontSize: 12)),
+                    ),
                     _speedButton(),
                     IconButton(
                       icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
@@ -450,6 +545,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
         ),
       ],
+    );
+  }
+
+  /// 画质菜单：当前档标 ✓，点别的档不断流重进。
+  Widget _qualityButton() {
+    final label = _variantLabel ?? '画质';
+    return PopupMenuButton<StreamVariant>(
+      tooltip: '分辨率',
+      onSelected: _switchVariant,
+      itemBuilder: (_) => _variants
+          .map((v) => PopupMenuItem<StreamVariant>(
+              value: v,
+              child: Text('${v.label}${v.label == _variantLabel ? ' ✓' : ''}')))
+          .toList(),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 12)),
+      ),
     );
   }
 

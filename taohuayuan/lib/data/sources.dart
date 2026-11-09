@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
@@ -32,7 +33,8 @@ abstract class Source {
   /// 目前只有 Hanime1 / HanimeOne。
   bool get webViewOnly => false;
 
-  /// 内置浏览器用的搜索地址 / 首页地址（只有 webViewOnly 的源有，其他源返回 ''）。
+  /// 内置浏览器用的搜索地址 / 首页地址（webViewOnly 的源必须有；
+  /// 其他源也提供：搜不到/握手失败时点状态条就能去内置浏览器里看，不卡死）。
   String webSearchUrl(String query) => '';
   String get webHomeUrl => '';
 
@@ -162,10 +164,11 @@ class EpornerSource implements Source {
   bool get webViewOnly => false;
 
   @override
-  String webSearchUrl(String query) => '';
+  String webSearchUrl(String query) =>
+      'https://www.eporner.com/search/${Uri.encodeComponent(query)}/';
 
   @override
-  String get webHomeUrl => '';
+  String get webHomeUrl => 'https://www.eporner.com/';
 
   /// 供单元测试直接验：把 Eporner API 返回的 videos 数组转成条目。
   static List<VideoItem> parseVideos(List vids) {
@@ -202,6 +205,9 @@ class EpornerSource implements Source {
     final uri = Uri.parse('https://www.eporner.com/api/v2/video/search/'
         '?query=${Uri.encodeComponent(query)}&per_page=$perPage&page=$page&format=json');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 20));
+    if (res.statusCode != 200) {
+      throw HttpException('HTTP ${res.statusCode}');
+    }
     final json = jsonDecode(_decodeBody(res)) as Map<String, dynamic>;
     final vids = (json['videos'] ?? []) as List;
     return SourceResult(sourceId: id, sourceName: name, items: parseVideos(vids));
@@ -209,15 +215,16 @@ class EpornerSource implements Source {
 
   @override
   Future<SourceResult> search(String query) async {
+    // 之前是 5 页串行取：每页 1–3 秒，5 页经常超过搜索服务的 8 秒总超时，
+    // 第一轮永远报“超时（8秒）”，只能靠后台重试——用户截图 2 就是这么来的。
+    // 现在 5 页并行取，总耗时约等于最慢的一页；个别页失败不拖累其他页。
     try {
       const perPage = 100;
       const maxPages = 5;
-      final out = <VideoItem>[];
-      for (var p = 1; p <= maxPages; p++) {
-        final r = await _fetchPage(query, p, perPage: perPage);
-        out.addAll(r.items);
-        if (r.items.length < perPage) break;
-      }
+      final pages = await Future.wait(
+        List.generate(maxPages, (i) => _fetchPage(query, i + 1, perPage: perPage).then((r) => r.items).catchError((_) => <VideoItem>[])),
+      );
+      final out = pages.expand((e) => e).toList();
       return SourceResult(sourceId: id, sourceName: name, items: out);
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
@@ -261,10 +268,11 @@ class Rule34VideosSource implements Source {
   bool get webViewOnly => false;
 
   @override
-  String webSearchUrl(String query) => '';
+  String webSearchUrl(String query) =>
+      'https://rule34-videos.com/search/?q=${Uri.encodeComponent(query)}';
 
   @override
-  String get webHomeUrl => '';
+  String get webHomeUrl => 'https://rule34-videos.com/';
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   static List<VideoItem> parseSearchHtml(String html) {
@@ -304,6 +312,9 @@ class Rule34VideosSource implements Source {
     try {
       final uri = Uri.parse('$_base/search/?q=${Uri.encodeComponent(query)}');
       final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
+      if (res.statusCode != 200) {
+        throw HttpException('被拦了（HTTP ${res.statusCode}），去内置浏览器看');
+      }
       return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
@@ -315,6 +326,9 @@ class Rule34VideosSource implements Source {
     try {
       final uri = Uri.parse('$_base/search/?q=${Uri.encodeComponent(query)}&page=$page');
       final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
+      if (res.statusCode != 200) {
+        throw HttpException('被拦了（HTTP ${res.statusCode}），去内置浏览器看');
+      }
       return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
@@ -325,6 +339,9 @@ class Rule34VideosSource implements Source {
   Future<SourceResult> home() async {
     try {
       final res = await http.get(Uri.parse('$_base/'), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
+      if (res.statusCode != 200) {
+        throw HttpException('被拦了（HTTP ${res.statusCode}），去内置浏览器看');
+      }
       return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
     } catch (e) {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
@@ -333,8 +350,14 @@ class Rule34VideosSource implements Source {
 }
 
 /// ---------- 3. Niacg：搜索页解析；详情页有 xunge mp4，必须带 Referer ----------
-/// 注意（2026-11-08 实测）：VM 下搜 niacg 返回 302/断连、0 条，是 VM 网络问题，
-/// 不是解析问题，手机上待复验，不要把“搜不到”写成“直链抓不到”。
+/// 注意（2026-11-09 Dart 实测，根因已钉死）：niacg 的 WAF 按 TLS 指纹拦请求——
+/// 同一台 VM 上 curl（OpenSSL）能拿到 302→200、结果页 12 条，Dart 的
+/// package:http（BoringSSL）直接 403、甚至连接被掐断；手机上同样是 Dart，
+/// 所以手机搜也是 0 条——不是 VM 网络问题，也不是解析问题。
+/// 更坑的是旧代码不判状态码：403 的拦截页解析出 0 条、error 还是 null，
+/// 界面就显示成“0 条”，看起来像“确实没这个片”。
+/// 修法：标 webViewOnly（系统 WebView 是 Chrome 指纹，能过验证），搜索走内置浏览器；
+/// HTTP 入口保留但先判状态码，非 200 直接报“被拦了”，不静默 0 条。
 /// 详情页 xunge mp4 是 2026-11-07 ffprobe 实测过的（20 条里 16 条真 1080p，
 /// 带 Referer 返回 200/206），直链本身能抓到。
 /// niacg 官方站本身没广告，拿不到直链时嵌官方播放器当备选。
@@ -346,13 +369,14 @@ class NiacgSource implements Source {
   String get name => 'Niacg';
 
   @override
-  bool get webViewOnly => false;
+  bool get webViewOnly => true;
 
   @override
-  String webSearchUrl(String query) => '';
+  String webSearchUrl(String query) =>
+      'https://www.niacg.com/e/search/?searchget=1&keyboard=${Uri.encodeComponent(query)}&show=title&classid=21';
 
   @override
-  String get webHomeUrl => '';
+  String get webHomeUrl => 'https://www.niacg.com/';
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   static List<VideoItem> parseSearchHtml(String html) {
@@ -375,6 +399,10 @@ class NiacgSource implements Source {
   Future<SourceResult> _fetchSearchPage(String query, int page) async {
     final uri = Uri.parse('https://www.niacg.com/e/search/?searchget=1&keyboard=${Uri.encodeComponent(query)}&show=title&classid=21&page=$page');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
+    if (res.statusCode != 200) {
+      // WAF 拦截页别当成“没结果”：非 200 直接报错，界面会给内置浏览器入口。
+      throw HttpException('被拦了（HTTP ${res.statusCode}），去内置浏览器看');
+    }
     return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
   }
 
@@ -407,6 +435,11 @@ class NiacgSource implements Source {
 }
 
 /// ---------- 4. Lianzu11：WordPress 站，?s= 搜索，详情页有直链 mp4 ----------
+/// 注意（2026-11-09 Dart/curl 实测，根因已钉死）：lianzu11.com 现在挂了
+/// Cloudflare“Just a moment”验证，纯 HTTP 请求一律 403——手机上同样 0 条，
+/// 不是 VM 网络问题，也不是解析问题（2026-11-07 探针还通，是站方后来加的验证）。
+/// 修法：标 webViewOnly，搜索走内置浏览器（Chrome 指纹能过验证）；
+/// HTTP 入口保留但先判状态码，非 200 直接报错，不静默 0 条。
 
 class Lianzu11Source implements Source {
   @override
@@ -415,13 +448,14 @@ class Lianzu11Source implements Source {
   String get name => 'Lianzu11';
 
   @override
-  bool get webViewOnly => false;
+  bool get webViewOnly => true;
 
   @override
-  String webSearchUrl(String query) => '';
+  String webSearchUrl(String query) =>
+      'https://lianzu11.com/?s=${Uri.encodeComponent(query)}';
 
   @override
-  String get webHomeUrl => '';
+  String get webHomeUrl => 'https://lianzu11.com/';
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   static List<VideoItem> parseSearchHtml(String html) {
@@ -452,6 +486,9 @@ class Lianzu11Source implements Source {
   Future<SourceResult> _fetchSearchPage(String query, int page) async {
     final uri = Uri.parse('https://lianzu11.com/${page > 1 ? 'page/$page/' : ''}?s=${Uri.encodeComponent(query)}');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
+    if (res.statusCode != 200) {
+      throw HttpException('被拦了（HTTP ${res.statusCode}），去内置浏览器看');
+    }
     return SourceResult(sourceId: id, sourceName: name, items: parseSearchHtml(_decodeBody(res)));
   }
 
@@ -513,10 +550,10 @@ class HtmlSearchSource implements Source {
   bool get webViewOnly => false;
 
   @override
-  String webSearchUrl(String query) => '';
+  String webSearchUrl(String query) => _url(query, 1);
 
   @override
-  String get webHomeUrl => '';
+  String get webHomeUrl => _baseOf(_url('', 1));
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
   /// 标题优先级：<a> 的 title 属性（pornhub）> img alt > aria-label（xhamster）
@@ -596,6 +633,9 @@ class HtmlSearchSource implements Source {
   Future<SourceResult> _fetchPage(String query, int page) async {
     final url = _url(query, page);
     final res = await http.get(Uri.parse(url), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
+    if (res.statusCode != 200) {
+      throw HttpException('被拦了（HTTP ${res.statusCode}），去内置浏览器看');
+    }
     return SourceResult(sourceId: id, sourceName: name, items: parse(_decodeBody(res), _baseOf(url)));
   }
 
@@ -646,10 +686,11 @@ class XhamsterSource implements Source {
   bool get webViewOnly => false;
 
   @override
-  String webSearchUrl(String query) => '';
+  String webSearchUrl(String query) =>
+      'https://xhamster.com/search/${Uri.encodeComponent(query)}';
 
   @override
-  String get webHomeUrl => '';
+  String get webHomeUrl => 'https://xhamster.com/';
 
   /// 供单元测试直接验：搜索页 HTML 里的 videoThumbProps JSON -> 条目。
   static List<VideoItem> parseJson(String html) {
@@ -681,6 +722,9 @@ class XhamsterSource implements Source {
   Future<SourceResult> _fetchPage(String query, int page) async {
     final uri = Uri.parse('https://xhamster.com/search/${Uri.encodeComponent(query)}?pagenumber=$page');
     final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
+    if (res.statusCode != 200) {
+      throw HttpException('被拦了（HTTP ${res.statusCode}），去内置浏览器看');
+    }
     var items = parseJson(_decodeBody(res));
     if (items.isEmpty) {
       // JSON 拿不到时退回通用锚点解析（只有前十来张是真的，标题可能是 *** 占位符）。
@@ -727,9 +771,30 @@ class XhamsterSource implements Source {
 /// 没见过真实搜索页 HTML，上面这套解析是按 Kazumi 规则写的，没跑通过真页。
 /// 所以这两个源标 webViewOnly：App 里 HTTP 搜不到就走内置浏览器（WebView），
 /// 在视频页里嗅到 <video> 直链再切原生播放器；不要把没验过的写成已验。
+/// 镜像说明（2026-11-09 用户反馈，第 20 条）：hanime1.me 和 hanimeone.me
+/// 是同一个站的两个镜像域名，内容一样，不是两个站；hanime1.me 常被
+/// Cloudflare 验证拦住，hanimeone.me 能进。App 里只当成一个站显示，
+/// 一个打不开就自动切另一个（见 mirrorUrl / preferredHost）。
 class HanimeSource implements Source {
   final String _host; // 'hanime1.me' 或 'hanimeone.me'
   HanimeSource(this._host);
+
+  /// 两个镜像域名（同一站，内容一样）。
+  static const hosts = ['hanime1.me', 'hanimeone.me'];
+
+  /// 能进的那个镜像优先（2026-11-09 用户实测：hanimeone.me 可以，hanime1.me 不行）。
+  static const preferredHost = 'hanimeone.me';
+
+  static bool isHanimeHost(String host) => hosts.contains(host);
+
+  /// 给定一个 hanime 地址，换成另一个镜像的同地址（路径/query 不变）；
+  /// 不是 hanime 地址就原样返回。
+  static String mirrorUrl(String url) {
+    final u = Uri.tryParse(url);
+    if (u == null || !isHanimeHost(u.host)) return url;
+    final other = u.host == 'hanime1.me' ? 'hanimeone.me' : 'hanime1.me';
+    return url.replaceFirst(u.host, other);
+  }
 
   @override
   String get id => _host == 'hanime1.me' ? 'hanime1' : 'hanimeone';

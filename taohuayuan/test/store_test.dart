@@ -55,4 +55,17 @@ void main() {
     await store.toggleDislike(b);
     expect(store.dislikedTags, isEmpty);
   });
+
+  test('短视频默认静音（第 15 条）：没存过就是 true，改了持久保存', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    expect(store.shortsMuted, isTrue);
+    await store.setShortsMuted(false);
+    expect(store.shortsMuted, isFalse);
+    // 重新加载还记得。
+    final store2 = await Store.load();
+    expect(store2.shortsMuted, isFalse);
+    await store2.setShortsMuted(true);
+    expect(store.shortsMuted, isTrue);
+  });
 }

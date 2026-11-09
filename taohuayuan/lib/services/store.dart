@@ -11,6 +11,7 @@ class Store {
   static const _followsKey = 'taohuayuan_follows';
   static const _historyKey = 'taohuayuan_history';
   static const _disabledSourcesKey = 'taohuayuan_disabled_sources';
+  static const _shortsMutedKey = 'taohuayuan_shorts_muted';
   static const _searchTermsKey = 'taohuayuan_search_terms';
   static const _dislikedTagsKey = 'taohuayuan_disliked_tags';
   static const _feedCacheKey = 'taohuayuan_feed_cache';
@@ -231,6 +232,14 @@ class Store {
       s.add(sourceId);
     }
     await _prefs.setStringList(_disabledSourcesKey, s.toList());
+  }
+
+  // ---- 短视频默认静音（2026-11-09 用户定：打开 App 不许自动出声）----
+  // 默认 true：短视频加载完自动播，但不出声；点喇叭图标才出声，选择持久保存。
+  bool get shortsMuted => _prefs.getBool(_shortsMutedKey) ?? true;
+
+  Future<void> setShortsMuted(bool muted) async {
+    await _prefs.setBool(_shortsMutedKey, muted);
   }
 
   // ---- 清除口味数据（喜欢/关注/记录/搜过的词/不喜欢），源开关不动 ----
