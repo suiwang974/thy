@@ -23,6 +23,13 @@ void main() {
         _serveFile(req, fileBytes, supportRange: true);
       } else if (p == '/file-norange.mp4') {
         _serveFile(req, fileBytes, supportRange: false);
+      } else if (p == '/file-probe206.mp4') {
+        // 第 57 条(a)：探测（bytes=0-0）给 206，分段请求一律回 200。
+        if (req.headers.value('range') == 'bytes=0-0') {
+          _serveFile(req, fileBytes, supportRange: true);
+        } else {
+          _serveFile(req, fileBytes, supportRange: false);
+        }
       } else if (p == '/master.m3u8') {
         _serveText(req, '#EXTM3U\n'
             '#EXT-X-STREAM-INF:BANDWIDTH=500000\n'
@@ -124,23 +131,72 @@ void main() {
       expect(await File(outPath).readAsBytes(), fileBytes);
     });
 
-    test('downloadRange：一段 Range 字节正确', () async {
-      final outPath = '${tmp.path}/range.mp4';
-      final f = await File(outPath).open(mode: FileMode.write);
-      await f.truncate(1000);
-      await f.close();
+    test('downloadRange：一段 Range 写进 part 文件，字节正确', () async {
+      // 第 57 条新语义：targetPath 是这段专属的 part 文件（不是多段共用的
+      // 目标文件），writeOffset = part 文件里已有的字节数（全新下为 0）。
+      final partPath = '${tmp.path}/range.part0';
       await DownloadManager.downloadRange(
         url: '$base/file.mp4',
         headers: const {},
         start: 100,
         end: 199,
-        targetPath: outPath,
-        writeOffset: 100,
+        targetPath: partPath,
+        writeOffset: 0,
         onBytes: (_) {},
         isCancelled: () => false,
       );
-      final bytes = await File(outPath).readAsBytes();
-      expect(bytes.sublist(100, 200), fileBytes.sublist(100, 200));
+      expect(await File(partPath).readAsBytes(),
+          fileBytes.sublist(100, 200));
+    });
+
+    test('downloadRange：断点续传——part 文件已有前 50 字节，接着下完', () async {
+      final partPath = '${tmp.path}/resume.part0';
+      await File(partPath).writeAsBytes(fileBytes.sublist(100, 150));
+      await DownloadManager.downloadRange(
+        url: '$base/file.mp4',
+        headers: const {},
+        start: 100,
+        end: 199,
+        targetPath: partPath,
+        writeOffset: 50,
+        onBytes: (_) {},
+        isCancelled: () => false,
+      );
+      expect(await File(partPath).readAsBytes(),
+          fileBytes.sublist(100, 200));
+    });
+
+    test('downloadRange：续传文件长度对不上记账时报错，不许静默拼坏', () async {
+      final partPath = '${tmp.path}/resume-bad.part0';
+      await File(partPath).writeAsBytes(fileBytes.sublist(100, 140));
+      expect(
+        () => DownloadManager.downloadRange(
+          url: '$base/file.mp4',
+          headers: const {},
+          start: 100,
+          end: 199,
+          targetPath: partPath,
+          writeOffset: 50, // 记账说已有 50 字节，文件实际只有 40 字节
+          onBytes: (_) {},
+          isCancelled: () => false,
+        ),
+        throwsStateError,
+      );
+    });
+
+    test('第 57 条(a)：分段中途拿不到 206 就回落单连接，内容仍对', () async {
+      final outPath = '${tmp.path}/midway200.mp4';
+      final used = await DownloadManager.downloadSegmented(
+        url: '$base/file-probe206.mp4',
+        headers: const {},
+        targetPath: outPath,
+        parts: 8,
+        onProgress: (_, _) {},
+      );
+      expect(used, 1);
+      expect(await File(outPath).readAsBytes(), fileBytes);
+      // 回落时 part 残留必须清掉，别留在磁盘上。
+      expect(await File('$outPath.part0').exists(), isFalse);
     });
   });
 

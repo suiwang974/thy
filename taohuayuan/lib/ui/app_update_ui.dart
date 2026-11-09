@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../services/apk_verify.dart';
 import '../services/app_update.dart';
 import '../services/store.dart';
 
@@ -132,14 +133,27 @@ class _UpdateDownloadSheetState extends State<_UpdateDownloadSheet> {
     _prepare();
   }
 
-  /// 已下好的包直接复用，不重复下；权限没开先提示去设置。
+  /// 已下好的包先验 ZIP 再复用，不重复下；权限没开先提示去设置。
+  /// 第 57 条：只看大小会把坏包当好包一直复用（用户缓存里的坏 v11
+  /// 就是这么来的），验不过的清掉记录，重新下载。
   Future<void> _prepare() async {
     final storedPath = widget.store.updateApkPath;
     final storedTag = widget.store.updateApkTag;
     if (storedPath != null &&
         storedTag == widget.info.tag &&
         await File(storedPath).exists()) {
-      _apkPath = storedPath;
+      final bad = await verifyApkFile(storedPath,
+          expectedSize:
+              widget.info.sizeBytes > 0 ? widget.info.sizeBytes : null);
+      if (bad == null) {
+        _apkPath = storedPath;
+      } else {
+        // 缓存里的包坏了：清掉记录和文件，别再拿它去安装。
+        await widget.store.clearUpdateApk();
+        try {
+          await File(storedPath).delete();
+        } catch (_) {}
+      }
     }
     final ok = await _svc.canInstall();
     if (!mounted) return;
@@ -295,6 +309,11 @@ class _UpdateDownloadSheetState extends State<_UpdateDownloadSheet> {
               ),
             ),
           ] else if (_apkPath != null) ...[
+            // 第 57 条：走到这里的包一定是验过 ZIP 的（复用前验过，
+            // 新下的下完也验过），直接装，不怕再报「安装包已损坏」。
+            const Text('安装包已验证 ✓，可直接安装',
+                style: TextStyle(color: Colors.greenAccent, fontSize: 13)),
+            const SizedBox(height: 12),
             if (_doneText != null) ...[
               Text(_doneText!, style: const TextStyle(color: Colors.white70, fontSize: 13)),
               const SizedBox(height: 12),
@@ -374,8 +393,16 @@ class _AppUpdateCardState extends State<AppUpdateCard> {
     if (storedPath != null && storedTag != null) {
       final code = AppUpdateService.parseReleaseCode(storedTag);
       if (code != null && await File(storedPath).exists()) {
-        apkPath = storedPath;
-        apkCode = code;
+        // 第 57 条：存着的包先验 ZIP 再认，坏的清掉，别显示成“已下载”。
+        if (await verifyApkFile(storedPath) == null) {
+          apkPath = storedPath;
+          apkCode = code;
+        } else {
+          await widget.store.clearUpdateApk();
+          try {
+            await File(storedPath).delete();
+          } catch (_) {}
+        }
       }
     }
     if (!mounted) return;
@@ -485,6 +512,14 @@ class _AppUpdateCardState extends State<AppUpdateCard> {
                     ? '${latest.notes.trim().substring(0, 120)}…'
                     : latest.notes.trim(),
                 style: const TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+            ],
+            // 第 57 条：走到这里的已下载包是验过 ZIP 的，直接装。
+            if (_apkPath != null && downloadedCode != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                '安装包 v$downloadedCode 已下载并验证 ✓，可直接安装',
+                style: const TextStyle(color: Colors.greenAccent, fontSize: 13),
               ),
             ],
             const SizedBox(height: 12),

@@ -1,10 +1,13 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:taohuayuan/services/app_update.dart';
+
+import 'zip_fixture.dart';
 
 void main() {
   test('第 50 条：tag 里解析发布号，只有 taohuayuan-v<数字> 才认', () {
@@ -188,25 +191,70 @@ void main() {
     expect(info?.downloadUrl, 'https://example.com/v10.apk');
   });
 
-  test('第 50 条：同版 APK 已下完直接复用，不重复下载（不走网络）', () async {
+  test('第 50 条：同版 APK 已下完且验过 ZIP 直接复用，不重复下载（不走网络）', () async {
     final dir = await Directory.systemTemp.createTemp('app_update_test_');
     try {
+      // 第 57 条：复用前先验 ZIP——100 字节 0 文件不再是“已下完”，
+      // 必须是真 ZIP 才复用。
+      final zip = buildTestZip(
+        storedName: 'a.txt',
+        storedData: Uint8List.fromList('ok'.codeUnits),
+        deflatedName: 'b.txt',
+        deflatedData: Uint8List.fromList(List<int>.generate(200, (i) => i)),
+      );
       final info = AppUpdateInfo(
         remoteCode: 11,
         tag: 'taohuayuan-v11',
         name: '桃花源 v11',
         downloadUrl: 'https://example.com/a.apk',
-        sizeBytes: 100,
+        sizeBytes: zip.length,
         notes: '',
       );
       final target = File('${dir.path}/taohuayuan-v11.apk');
-      await target.writeAsBytes(List.filled(100, 0));
+      await target.writeAsBytes(zip);
       final path = await AppUpdateService.instance.downloadApk(
         info,
         downloadDir: dir,
         isCancelled: () => false,
       );
       expect(path, target.path);
+    } finally {
+      await dir.delete(recursive: true);
+    }
+  });
+
+  test('第 57 条：缓存里大小对但内容坏的包不复用——downloadApk 会重下，'
+      '下不到就报错，不许把坏包当好包返回', () async {
+    final dir = await Directory.systemTemp.createTemp('app_update_test_');
+    try {
+      final zip = buildTestZip(
+        storedName: 'a.txt',
+        storedData: Uint8List.fromList('ok'.codeUnits),
+        deflatedName: 'b.txt',
+        deflatedData: Uint8List.fromList(List<int>.generate(200, (i) => i)),
+      );
+      final info = AppUpdateInfo(
+        remoteCode: 11,
+        tag: 'taohuayuan-v11',
+        name: '桃花源 v11',
+        // 指向不存在的地址：坏缓存必须触发重下，重下失败要报错，
+        // 绝不能悄悄返回坏包。
+        downloadUrl: 'https://127.0.0.1:1/a.apk',
+        sizeBytes: zip.length,
+        notes: '',
+      );
+      final target = File('${dir.path}/taohuayuan-v11.apk');
+      final bad = Uint8List.fromList(zip);
+      bad.fillRange(35, 41, 0); // 大小对、CRC 对不上（v11 真机坏包的样子）
+      await target.writeAsBytes(bad);
+      await expectLater(
+        () => AppUpdateService.instance.downloadApk(
+          info,
+          downloadDir: dir,
+          isCancelled: () => false,
+        ),
+        throwsA(anything),
+      );
     } finally {
       await dir.delete(recursive: true);
     }

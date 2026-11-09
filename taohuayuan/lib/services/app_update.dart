@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import 'apk_verify.dart';
 import 'downloader.dart';
 
 /// 应用内更新（第 50 条）：侧载包没有 Play 商店，in-app update API 用不了，
@@ -173,11 +174,14 @@ class AppUpdateService {
     }
   }
 
-  /// 下 APK（复用 Downloader 的多段 Range 引擎：1 字节探测 + 分段并行 + 单连接回退）。
-  /// 下在 App 缓存目录 update/ 里（FileProvider 只开放这个目录给系统安装器）；
-  /// 同一版已下完的直接用，不重复下；没下完的删了重下（21MB，5G 下就几秒，
-  /// 不做跨会话断点续传——视频下载才有分段记账，APK 不值得再做一套）。
-  /// 下完验大小，对不上就报错，别拿坏包去安装。
+  /// 下 APK（复用 Downloader 的多段 Range 引擎：1 字节探测 + 分段并行 +
+  /// 单连接回退，拿不到 206 自动回落单连接）。
+  /// 下在 App 缓存目录 update/ 里（FileProvider 只开放这个目录给系统安装器）。
+  /// 同一版已下完的先验 ZIP 再复用——只看大小会把坏包当好包一直复用
+  /// （用户现在缓存里的坏 v11 就是这么来的）；没下完或验不过的删了重下
+  /// （21MB，5G 下就几秒，不做跨会话断点续传）。
+  /// 第 57 条：分段走 part 文件 + 下完验 ZIP（大小 + 结构 + 每条 CRC），
+  /// 验不过删包自动重下一次，再坏才报错——绝不把坏包交给系统安装器。
   Future<String> downloadApk(
     AppUpdateInfo info, {
     void Function(int downloaded, int total, double speedBps)? onProgress,
@@ -189,68 +193,71 @@ class AppUpdateService {
         Directory('${(await getTemporaryDirectory()).path}/update');
     if (!await dir.exists()) await dir.create(recursive: true);
     final target = File('${dir.path}/taohuayuan-v${info.remoteCode}.apk');
+    // 复用缓存包之前先验 ZIP：大小对不代表内容对。
     if (info.sizeBytes > 0 &&
         await target.exists() &&
-        await target.length() == info.sizeBytes) {
+        await target.length() == info.sizeBytes &&
+        await verifyApkFile(target.path, expectedSize: info.sizeBytes) ==
+            null) {
       onProgress?.call(info.sizeBytes, info.sizeBytes, 0);
       return target.path;
     }
     if (await target.exists()) await target.delete();
-    final speed = _SpeedMeter();
+    // 下一次。验不过再重下一次（最多两遍），再坏才报错。
+    Object? lastError;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        await _downloadApkOnce(info, target, onProgress, isCancelled);
+      } on Object catch (e) {
+        if (isCancelled()) throw const UpdateCancelled();
+        lastError = e;
+        continue;
+      }
+      final bad = await verifyApkFile(
+          target.path,
+          expectedSize: info.sizeBytes > 0 ? info.sizeBytes : null);
+      if (bad == null) return target.path;
+      lastError = StateError('下载的安装包校验失败：$bad');
+      await target.delete();
+    }
+    throw lastError ?? StateError('安装包下载失败，请重试');
+  }
+
+  /// 下一遍 APK：分段并行（拿不到 206 自动回落单连接），
+  /// onProgress 报的是累计字节数（分段失败回落单连接时会从 0 重新开始）。
+  Future<void> _downloadApkOnce(
+    AppUpdateInfo info,
+    File target,
+    void Function(int downloaded, int total, double speedBps)? onProgress,
+    bool Function() isCancelled,
+  ) async {
+    var speed = _SpeedMeter();
     var downloaded = 0;
     var total = info.sizeBytes;
-    void report(int n) {
-      downloaded += n;
-      speed.add(n);
-      onProgress?.call(downloaded, total, speed.bytesPerSecond);
-    }
     try {
-      final probe = await DownloadManager.probeRange(info.downloadUrl, const {});
-      if (probe.totalBytes > 0) total = probe.totalBytes;
-      if (probe.supported && total > 0) {
-        final parts = computeParts(total);
-        final raf = await target.open(mode: FileMode.write);
-        await raf.truncate(total); // 预分配满大小（学 1DM：边下边扩容易掉速）
-        await raf.close();
-        final bounds = <(int, int)>[];
-        for (var i = 0; i < parts; i++) {
-          final a = i * total ~/ parts;
-          final b = (i + 1) * total ~/ parts - 1;
-          bounds.add((a, i == parts - 1 ? total - 1 : b));
-        }
-        await Future.wait(List.generate(parts, (i) async {
-          final (a, b) = bounds[i];
-          await DownloadManager.downloadRange(
-            url: info.downloadUrl,
-            headers: const {},
-            start: a,
-            end: b,
-            targetPath: target.path,
-            writeOffset: a,
-            onBytes: report,
-            isCancelled: isCancelled,
-            retries: 3,
-          );
-        }));
-      } else {
-        // 服务器不支持 Range：单连接从头下。
-        await DownloadManager.downloadSingle(
-          url: info.downloadUrl,
-          headers: const {},
-          targetPath: target.path,
-          onBytes: report,
-          isCancelled: isCancelled,
-        );
-      }
+      await DownloadManager.downloadSegmented(
+        url: info.downloadUrl,
+        headers: const {},
+        targetPath: target.path,
+        parts: DownloadManager.defaultParts,
+        onProgress: (n, t) {
+          if (t > 0) total = t;
+          if (n < downloaded) {
+            // 回落单连接，从 0 重新开始：速度表清零重算。
+            downloaded = n;
+            speed = _SpeedMeter();
+          } else {
+            speed.add(n - downloaded);
+            downloaded = n;
+          }
+          onProgress?.call(downloaded, total, speed.bytesPerSecond);
+        },
+        isCancelled: isCancelled,
+      );
     } on Object catch (_) {
       if (isCancelled()) throw const UpdateCancelled();
       rethrow;
     }
-    final size = await target.length();
-    if (total > 0 && size != total) {
-      throw StateError('下载后大小不符 $size != $total，请重试');
-    }
-    return target.path;
   }
 
   /// 系统允不允许装未知来源应用（Android 8+ 的开关）。

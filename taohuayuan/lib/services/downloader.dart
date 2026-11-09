@@ -481,31 +481,16 @@ class DownloadManager extends ChangeNotifier {
 
   /// mp4：Range 分段并行（默认 8 段）或单连接回退。
   /// 断点续传：task.segmentDone 记每段已下字节数，暂停/被杀后只下未完成的分段。
+  /// 第 57 条：每段写自己的 part 文件（`${tmpPath}.part$i`），下完再按序拼成
+  /// tmpPath——绝不能多段同时往同一个文件里写（FileMode.write 打开就截断，
+  /// 后开的段会把先开的段已写好的数据清掉，拼出来大小对、内容是 0 洞）。
+  /// 分段失败（比如中途某段拿不到 206）：删掉分段残留，单连接重下一次。
   Future<String> _downloadMp4(_DownloadJob job, String tmpPath, DownloadTask task) async {
     final probe = await probeRange(job.url, job.headers);
     final total = probe.totalBytes;
     task.totalBytes = total;
     if (!probe.supported) {
-      // 服务器不支持 Range：单连接从头下（续传不了——Range 都不支持，
-      // 暂停后只能重下；记账清零，别拿旧数字骗进度条）。
-      task.segmentDone = [0];
-      task.downloadedBytes = 0;
-      task.progress = 0;
-      var downloaded = 0;
-      await downloadSingle(
-        url: job.url,
-        headers: job.headers,
-        targetPath: tmpPath,
-        onBytes: (n) {
-          downloaded += n;
-          task.downloadedBytes = downloaded;
-          if (total > 0) task.progress = downloaded / total;
-          _recordBytes(task);
-          _throttledNotify(task);
-        },
-        isCancelled: () => job.cancelled,
-      );
-      return tmpPath;
+      return _downloadSingleMp4(job, tmpPath, task, total);
     }
     final useSegments = total >= minSegmentedSize;
     final parts = useSegments
@@ -514,12 +499,6 @@ class DownloadManager extends ChangeNotifier {
     if (task.segmentDone.length != parts) {
       task.segmentDone = List<int>.filled(parts, 0);
     }
-    if (total > 0) {
-      // 预分配满大小（学 1DM「Create empty file」：边下边扩容易掉速）。
-      final raf = await File(tmpPath).open(mode: FileMode.write);
-      await raf.truncate(total);
-      await raf.close();
-    }
     final bounds = <(int, int)>[];
     for (var i = 0; i < parts; i++) {
       final a = i * total ~/ parts;
@@ -527,37 +506,79 @@ class DownloadManager extends ChangeNotifier {
       bounds.add((a, i == parts - 1 ? total - 1 : b));
     }
     final job2 = job;
-    await _runSegments(
-      parts: parts,
-      task: task,
-      work: (i) async {
-        final (a, b) = bounds[i];
-        final done = task.segmentDone[i];
-        if (done >= b - a + 1) return; // 这段已下完，跳过（续传）
-        final start = a + done;
-        await _downloadRange(
-          url: job2.url,
-          headers: job2.headers,
-          start: start,
-          end: b,
-          targetPath: tmpPath,
-          writeOffset: start,
-          onBytes: (n) {
-            task.segmentDone[i] += n;
-            task.downloadedBytes = task.segmentDone.fold(0, (s, e) => s + e);
-            if (total > 0) task.progress = task.downloadedBytes / total;
-            _recordBytes(task);
-            _throttledNotify(task);
-          },
-          isCancelled: () => job2.cancelled,
-          retries: 3,
-        );
-      },
-    );
+    try {
+      await _runSegments(
+        parts: parts,
+        task: task,
+        work: (i) async {
+          final (a, b) = bounds[i];
+          final done = task.segmentDone[i];
+          if (done >= b - a + 1) return; // 这段已下完，跳过（续传）
+          final partPath = '$tmpPath.part$i';
+          // 续传文件丢了或长度对不上记账：这段重下，别拿旧数字骗进度。
+          if (done > 0) {
+            final part = File(partPath);
+            if (!await part.exists() || await part.length() != done) {
+              task.segmentDone[i] = 0;
+              try {
+                await part.delete();
+              } catch (_) {}
+            }
+          }
+          await _downloadRange(
+            url: job2.url,
+            headers: job2.headers,
+            start: a,
+            end: b,
+            targetPath: partPath,
+            writeOffset: task.segmentDone[i],
+            onBytes: (n) {
+              task.segmentDone[i] += n;
+              task.downloadedBytes = task.segmentDone.fold(0, (s, e) => s + e);
+              if (total > 0) task.progress = task.downloadedBytes / total;
+              _recordBytes(task);
+              _throttledNotify(task);
+            },
+            isCancelled: () => job2.cancelled,
+            retries: 3,
+          );
+        },
+      );
+    } catch (e) {
+      if (e is _Paused) rethrow;
+      // 分段失败：删掉分段残留，单连接重下一次。
+      await deleteParts(tmpPath, parts);
+      return _downloadSingleMp4(job, tmpPath, task, total);
+    }
+    await mergeParts(tmpPath, parts);
     final size = await File(tmpPath).length();
     if (total > 0 && size != total) {
       throw StateError('合并后大小不符 $size != $total');
     }
+    return tmpPath;
+  }
+
+  /// mp4 单连接从头下（服务器不支持 Range，或分段失败后的回退）。
+  /// 续传不了——Range 都不支持，暂停后只能重下；记账清零，别拿旧数字骗进度条。
+  Future<String> _downloadSingleMp4(
+      _DownloadJob job, String tmpPath, DownloadTask task, int total) async {
+    task.segmentDone = [0];
+    task.downloadedBytes = 0;
+    task.progress = 0;
+    var downloaded = 0;
+    await downloadSingle(
+      url: job.url,
+      headers: job.headers,
+      targetPath: tmpPath,
+      onBytes: (n) {
+        downloaded += n;
+        task.downloadedBytes = downloaded;
+        if (total > 0) task.progress = downloaded / total;
+        _recordBytes(task);
+        _throttledNotify(task);
+      },
+      isCancelled: () => job.cancelled,
+    );
     return tmpPath;
   }
 
@@ -746,7 +767,15 @@ class DownloadManager extends ChangeNotifier {
     await Future.wait(List.generate(parts, (_) => worker()));
   }
 
-  /// 一段 Range 下载（带 3 次重试）；写到 targetPath 的 writeOffset 处。
+  /// 一段 Range 下载（带 3 次重试）。
+  /// 第 57 条：targetPath 必须是这段专属的 part 文件，绝不能是多段共用的
+  /// 目标文件——`FileMode.write` 打开就截断，多段同时往一个文件里写时，
+  /// 后开的段会把先开的段已写好的数据清掉，拼出来大小对、内容是 0 洞
+  /// （v11 的 App 内更新就是这么坏的；复现见 test/update_download_test.dart）。
+  /// writeOffset = part 文件里已有的字节数（断点续传；全新下为 0）：
+  /// 为 0 时截断重建；>0 时先验长度对不对得上，再以追加模式接着写。
+  /// 同一次调用内重试共用一个文件句柄，不重复打开、不重复截断；
+  /// 写操作全程顺序追加，不用 setPosition，不存在段间互相覆盖。
   /// 供单元测试 + benchmark 直接用。
   static Future<void> downloadRange({
     required String url,
@@ -784,51 +813,88 @@ class DownloadManager extends ChangeNotifier {
     int retries = 3,
   }) async {
     Object? lastError;
-    var written = 0; // 本次调用已写入的字节数（重试时从这里接着要，不重复计进度）
-    for (var attempt = 0; attempt < retries; attempt++) {
-      if (isCancelled()) throw _Paused();
-      try {
-        final client = HttpClient();
+    var written = 0; // 本次调用新写入的字节数
+    final expected = end - start + 1 - writeOffset; // 本次调用要下的字节数
+    if (expected <= 0) return; // 这段已经下完了（续传时）
+    if (writeOffset > 0) {
+      // 续传：part 文件必须正好是 writeOffset 字节，否则删了重下。
+      final part = File(targetPath);
+      if (!await part.exists() || await part.length() != writeOffset) {
+        throw StateError('分段续传文件不对（缺失或长度不符），删了重下');
+      }
+    }
+    RandomAccessFile? raf;
+    try {
+      // 打开一次、用到底：重试不重复打开（重复打开会再截断一次）。
+      // 全新下截断重建；续传用追加模式（O_APPEND，只往文件尾写，
+      // 本调用只顺序追加，所以位置一定对）。
+      raf = await File(targetPath).open(
+          mode: writeOffset == 0 ? FileMode.write : FileMode.append);
+      for (var attempt = 0; attempt < retries; attempt++) {
+        if (isCancelled()) throw _Paused();
         try {
-          final req = await client.getUrl(Uri.parse(url));
-          req.headers.set('User-Agent', _ua);
-          headers.forEach((k, v) => req.headers.set(k, v));
-          req.headers.set('Range', 'bytes=${start + written}-$end');
-          final res = await req.close().timeout(const Duration(seconds: 60));
-          if (res.statusCode != 206) {
-            throw StateError('分段响应码 ${res.statusCode}（服务器不支持 Range）');
-          }
-          final raf = await File(targetPath).open(mode: FileMode.write);
+          final client = HttpClient();
           try {
-            var offset = writeOffset + written;
+            final req = await client.getUrl(Uri.parse(url));
+            req.headers.set('User-Agent', _ua);
+            headers.forEach((k, v) => req.headers.set(k, v));
+            req.headers
+                .set('Range', 'bytes=${start + writeOffset + written}-$end');
+            final res = await req.close().timeout(const Duration(seconds: 60));
+            if (res.statusCode != 206) {
+              throw StateError('分段响应码 ${res.statusCode}（服务器不支持 Range）');
+            }
             await for (final chunk in res.timeout(const Duration(seconds: 60))) {
               if (isCancelled()) throw _Paused();
-              await raf.setPosition(offset);
               await raf.writeFrom(chunk);
-              offset += chunk.length;
               written += chunk.length;
               onBytes(chunk.length);
             }
           } finally {
-            await raf.close();
+            client.close(force: true);
           }
-        } finally {
-          client.close(force: true);
-        }
-        // 每段完整性校验（抄 SniffDL：got[i] 必须等于 want，否则这段不算完）。
-        if (written != end - start + 1) {
-          throw StateError('分段不完整 $written/${end - start + 1}');
-        }
-        return;
-      } catch (e) {
-        if (e is _Paused) rethrow;
-        lastError = e;
-        if (attempt < retries - 1) {
-          await Future.delayed(Duration(seconds: 1 << attempt));
+          // 每段完整性校验（抄 SniffDL：got 必须等于 want，否则这段不算完）。
+          if (written != expected) {
+            throw StateError('分段不完整 $written/$expected');
+          }
+          return;
+        } catch (e) {
+          if (e is _Paused) rethrow;
+          lastError = e;
+          if (attempt < retries - 1) {
+            await Future.delayed(Duration(seconds: 1 << attempt));
+          }
         }
       }
+    } finally {
+      await raf?.close();
     }
     throw lastError ?? StateError('分段下载失败');
+  }
+
+  /// 分段 part 文件按序拼成目标文件（第 57 条）。
+  /// 每个 part 只被自己的段写过，拼的时候单句柄顺序写，没有并发截断。
+  /// 拼完删 part 文件。
+  static Future<void> mergeParts(String targetPath, int parts) async {
+    final out = await File(targetPath).open(mode: FileMode.write);
+    try {
+      for (var i = 0; i < parts; i++) {
+        final part = File('$targetPath.part$i');
+        await out.writeFrom(await part.readAsBytes());
+        await part.delete();
+      }
+    } finally {
+      await out.close();
+    }
+  }
+
+  /// 删掉分段残留（失败回退/重下前调用，别把旧 part 当新数据拼进去）。
+  static Future<void> deleteParts(String targetPath, int parts) async {
+    for (var i = 0; i < parts; i++) {
+      try {
+        await File('$targetPath.part$i').delete();
+      } catch (_) {}
+    }
   }
 
   /// 1 字节 Range 探测（供单元测试 + benchmark 直接用）。
@@ -938,12 +1004,28 @@ class DownloadManager extends ChangeNotifier {
     final cancelled = isCancelled ?? () => false;
     final probe = await probeRange(url, headers);
     final total = probe.totalBytes;
+
+    Future<int> single() async {
+      var downloaded = 0;
+      await downloadSingle(
+        url: url,
+        headers: headers,
+        targetPath: targetPath,
+        onBytes: (n) {
+          downloaded += n;
+          onProgress(downloaded, total);
+        },
+        isCancelled: cancelled,
+      );
+      return 1;
+    }
+
     var usedParts = 1;
     if (probe.supported && total >= minSegmentedSize) {
+      // 第 57 条：每段写自己的 part 文件，下完再按序拼——绝不能多段
+      // 同时往同一个目标文件里写（FileMode.write 打开就截断，拼出来
+      // 大小对、内容是 0 洞）。
       usedParts = (total ~/ minSegmentSize).clamp(2, parts);
-      final raf = await File(targetPath).open(mode: FileMode.write);
-      await raf.truncate(total);
-      await raf.close();
       final done = List<int>.filled(usedParts, 0);
       var next = 0;
       Future<void> worker() async {
@@ -958,8 +1040,8 @@ class DownloadManager extends ChangeNotifier {
             headers: headers,
             start: a,
             end: end,
-            targetPath: targetPath,
-            writeOffset: a,
+            targetPath: '$targetPath.part$i',
+            writeOffset: 0,
             onBytes: (n) {
               done[i] += n;
               onProgress(done.fold(0, (s, e) => s + e), total);
@@ -969,23 +1051,20 @@ class DownloadManager extends ChangeNotifier {
         }
       }
 
-      await Future.wait(List.generate(usedParts, (_) => worker()));
+      try {
+        await Future.wait(List.generate(usedParts, (_) => worker()));
+      } catch (e) {
+        if (e is _Paused) rethrow;
+        // 分段失败（比如中途某段拿不到 206）：删掉残留，单连接重下一次。
+        await deleteParts(targetPath, usedParts);
+        return single();
+      }
+      await mergeParts(targetPath, usedParts);
       final size = await File(targetPath).length();
       if (size != total) throw StateError('合并后大小不符 $size != $total');
       return usedParts;
     }
-    var downloaded = 0;
-    await downloadSingle(
-      url: url,
-      headers: headers,
-      targetPath: targetPath,
-      onBytes: (n) {
-        downloaded += n;
-        onProgress(downloaded, total);
-      },
-      isCancelled: cancelled,
-    );
-    return usedParts;
+    return single();
   }
 
   String _fileName(DownloadTask task, String ext) {
