@@ -5,6 +5,7 @@ import '../data/search_map.dart';
 import '../data/sources.dart';
 import '../models/video_item.dart';
 import '../services/search_service.dart';
+import '../services/search_status.dart';
 import '../services/store.dart';
 import '../services/web_search.dart';
 import 'player_screen.dart';
@@ -80,6 +81,7 @@ class _SearchScreenState extends State<SearchScreen> {
       _service.sources.where((s) => !widget.store.disabledSources.contains(s.id)).toList();
 
   /// 逐源状态汇总（一行）：共 X 个源：Y 个有结果 · Z 个还在搜 · W 个失败 · V 个没结果。
+  /// 第 45 条：只有真有条目的状态才算“有结果”（"0 条" 不算，见 search_status.dart）。
   String _statusSummary() {
     if (_queriedNames.isEmpty) return '';
     var ok = 0, searching = 0, failed = 0, empty = 0;
@@ -91,7 +93,7 @@ class _SearchScreenState extends State<SearchScreen> {
         searching++;
       } else if (s == '没结果') {
         empty++;
-      } else if (s.contains('条')) {
+      } else if (statusHasResults(s)) {
         ok++;
       } else {
         searching++;
@@ -167,8 +169,8 @@ class _SearchScreenState extends State<SearchScreen> {
           final merged = SearchService.dedupeById(partial.expand((r) => r.items).toList());
           final status = Map<String, String>.from(_sourceStatus);
           for (final r in partial) {
-            status[r.sourceName] =
-                r.error != null ? '${r.error}，后台再试…' : '${r.items.length} 条';
+            // 第 45 条：0 条就是“没结果”，别写“0 条”——写了就会被汇总当成“有结果”。
+            status[r.sourceName] = statusTextForResult(r);
           }
           setState(() {
             _items = merged;
@@ -704,15 +706,20 @@ class _SearchScreenState extends State<SearchScreen> {
     if (s.contains('超时') || s.contains('还在搜') || s.contains('再试')) {
       return Colors.orange;
     }
-    if (s.contains('条')) return Colors.greenAccent;
+    // 第 45 条："0 条" 不是有结果，按没结果算（灰色）。
+    if (statusHasResults(s)) return Colors.greenAccent;
     return Colors.white54; // 没结果
   }
 
   /// 空结果时写明原因：是源超时/失败了，还是源回来了但确实没结果，
   /// 还是搜到了但被筛选条件滤掉了。不要只剩空白页。
+  /// 第 45 条：只有真有条目的状态才算“搜到了”（statusHasResults），
+  /// "0 条" 不算；三个走 WebView 的源回来了但没解析出条目时，告诉用户
+  /// 去内置浏览器里直接搜，别再赖筛选条件。
   List<String> _emptyReasonLines() {
     final lines = <String>[];
     final failed = <String>[];
+    final webEmpty = <String>[];
     var anyEmpty = false;
     var anyOk = false;
     for (final n in _queriedNames) {
@@ -722,7 +729,8 @@ class _SearchScreenState extends State<SearchScreen> {
         failed.add('$n：$s');
       } else if (s == '没结果') {
         anyEmpty = true;
-      } else if (s.contains('条')) {
+        if (_isWebOnlySource(n)) webEmpty.add(n);
+      } else if (statusHasResults(s)) {
         anyOk = true;
       }
     }
@@ -739,7 +747,17 @@ class _SearchScreenState extends State<SearchScreen> {
     } else {
       lines.add('换个词试试。');
     }
+    if (webEmpty.isNotEmpty) {
+      lines.add('${webEmpty.join(' / ')}在内置浏览器里能打开，点上面状态条进去直接搜这个词看看。');
+    }
     return lines;
+  }
+
+  bool _isWebOnlySource(String name) {
+    for (final s in allSources()) {
+      if (s.name == name) return s.webViewOnly;
+    }
+    return false;
   }
 
   Widget _chipRow({required String label, required List<Widget> children}) {

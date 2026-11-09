@@ -370,4 +370,32 @@ setVideoUrlLow('https://xh2-cdn.example.com/video_360p.mp4')
     expect(StreamResolver.parseVideoAuthor('<html></html>', 'spankbang').author, '');
     expect(StreamResolver.parseVideoAuthor('<html></html>', 'eporner').author, '');
   });
+
+  test('第 47 条：eporner 作者只认视频页 vit-uploader，相关视频的 mb-uploader 不误认', () {
+    // VM 实测真片段：视频页 185,020 字节里上传者就在这里。
+    expect(
+      StreamResolver.parseVideoAuthor(
+        '<li class="vit-uploader"><a href="/profile/fepaciw123/" title="Uploader">fepaciw123</a></li>',
+        'eporner',
+      ).author,
+      'fepaciw123',
+    );
+    // 相关视频里的 mb-uploader 是别人的，别拿来当作者。
+    expect(
+      StreamResolver.parseVideoAuthor(
+        '<div><span class="mb-uploader">SomeoneElse</span></div>',
+        'eporner',
+      ).author,
+      '',
+    );
+    // vit-uploader 在，mb-uploader 也在时只取 vit-uploader 的。
+    expect(
+      StreamResolver.parseVideoAuthor(
+        '<li class="vit-uploader"><a href="/profile/fepaciw123/" title="Uploader">fepaciw123</a></li>'
+        '<div><span class="mb-uploader">SomeoneElse</span></div>',
+        'eporner',
+      ).author,
+      'fepaciw123',
+    );
+  });
 }

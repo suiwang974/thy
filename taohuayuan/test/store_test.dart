@@ -68,4 +68,23 @@ void main() {
     await store2.setShortsMuted(true);
     expect(store.shortsMuted, isTrue);
   });
+
+  test('短视频轮换计数 + 各标签位置（第 46/48 条）：默认 0，存了重启还记得', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    expect(store.shortsRotation, 0);
+    expect(store.shortsPosition('rec'), 0);
+    expect(store.shortsPosition('newest'), 0);
+    expect(store.shortsPosition('hottest'), 0);
+    await store.setShortsRotation(3);
+    await store.setShortsPosition('rec', 120);
+    await store.setShortsPosition('newest', 5);
+    await store.setShortsPosition('hottest', 77);
+    // 重新加载还记得，各标签互不干扰。
+    final store2 = await Store.load();
+    expect(store2.shortsRotation, 3);
+    expect(store2.shortsPosition('rec'), 120);
+    expect(store2.shortsPosition('newest'), 5);
+    expect(store2.shortsPosition('hottest'), 77);
+  });
 }

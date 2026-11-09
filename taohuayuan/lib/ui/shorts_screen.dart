@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../data/sources.dart';
 import '../models/video_item.dart';
 import '../services/adblock_service.dart';
 import '../services/fullscreen_controls.dart';
@@ -13,6 +14,62 @@ import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import 'author_screen.dart';
 import 'download_button.dart';
+
+/// 短视频顶上的三个标签（第 48 条）：推荐 / 最新 / 最热门。
+/// 各记各的位置，切过去再切回来接着刷，互不干扰。
+enum ShortsTab { rec, newest, hottest }
+
+const _shortsTabLabels = {
+  ShortsTab.rec: '推荐',
+  ShortsTab.newest: '最新',
+  ShortsTab.hottest: '最热门',
+};
+
+/// 第 48 条：最新 = 发布时间倒序，没有发布时间的放后面（List.sort 是稳定的，
+/// 同分段内保持原顺序）。
+List<VideoItem> sortShortsByNewest(List<VideoItem> items) {
+  final out = List<VideoItem>.of(items);
+  out.sort((a, b) {
+    final aHas = a.publishedAtMs > 0;
+    final bHas = b.publishedAtMs > 0;
+    if (aHas != bHas) return aHas ? -1 : 1;
+    return b.publishedAtMs.compareTo(a.publishedAtMs);
+  });
+  return out;
+}
+
+/// 第 48 条：最热门 = 播放量倒序，没有播放量的放后面。
+List<VideoItem> sortShortsByHottest(List<VideoItem> items) {
+  final out = List<VideoItem>.of(items);
+  out.sort((a, b) {
+    final aHas = a.views > 0;
+    final bHas = b.views > 0;
+    if (aHas != bHas) return aHas ? -1 : 1;
+    return b.views.compareTo(a.views);
+  });
+  return out;
+}
+
+/// 第 49 条：底部“短视频”栏的刷新控制器——main.dart 持有它，点栏时调 refresh()。
+class ShortsRefreshController {
+  VoidCallback? _onRefresh;
+  void bind(VoidCallback cb) => _onRefresh = cb;
+  void refresh() => _onRefresh?.call();
+}
+
+/// 第 49 条和第 46 条的分工（点栏到底刷不刷，就这一条规则说了算）：
+/// - 已经在短视频栏时再点它 → 刷新，换一批新的（跟抖音一样）；
+/// - 从别的栏切过来 → 只导航，不刷新——不然 46 条的续播位置永远看不到，
+///   App 一打开短视频就在后台按续播位置加载好了，点进来就该接着刷。
+/// App 启动永远落在推荐（_index = 0），用户只有点栏才能进短视频，
+/// 所以“每次点栏都刷新”会把 46 条杀死；只有“已在栏内再点”才刷新，
+/// 两条才同时活着。
+bool shouldRefreshShortsOnTabTap({
+  required int tappedIndex,
+  required int currentIndex,
+  required int shortsIndex,
+}) =>
+    tappedIndex == shortsIndex && currentIndex == shortsIndex;
 
 /// 短视频页：竖屏上下滑，滑到哪段就真播哪段的视频（不是只放封面图）。
 /// 数据走已启用源的实时热门（没有本地目录）；滑到下一段前先预探它的直链。
@@ -25,7 +82,8 @@ import 'download_button.dart';
 class ShortsScreen extends StatefulWidget {
   final Store store;
   final bool visible; // 短视频栏当前是不是显示的那一栏
-  const ShortsScreen({super.key, required this.store, this.visible = true});
+  final ShortsRefreshController? refreshController; // 第 49 条：点栏刷新用
+  const ShortsScreen({super.key, required this.store, this.visible = true, this.refreshController});
 
   @override
   State<ShortsScreen> createState() => _ShortsScreenState();
@@ -36,7 +94,18 @@ class ShortsScreen extends StatefulWidget {
 bool isShortForShorts(VideoItem v) => v.durationSec <= 0 || v.durationSec <= 1800;
 
 class _ShortsScreenState extends State<ShortsScreen> {
-  List<VideoItem> _items = [];
+  /// 三个标签的列表（第 48 条）：推荐 = 底流原顺序；最新/最热门 = 各自排好序。
+  /// 追加新批次时只在尾部接排好序的新批次，不整体重排——整体重排会让正在播
+  /// 的那段换掉、从头开始播。
+  List<VideoItem> _recItems = [];
+  List<VideoItem> _newItems = [];
+  List<VideoItem> _hotItems = [];
+  /// “最新”标签额外的新片：eporner API order=latest 真拉的，只进最新，
+  /// 不污染推荐。
+  List<VideoItem> _latestExtra = [];
+  int _latestPage = 1;
+  bool _latestLoaded = false;
+  ShortsTab _tab = ShortsTab.rec;
   bool _loading = true;
   bool _loadingMore = false;
   bool _noMore = false;
@@ -47,49 +116,194 @@ class _ShortsScreenState extends State<ShortsScreen> {
   static const _moreQueries = ['3d', 'asian', 'footjob'];
   // 当前是第几段 + 是不是静音：所有段共用，换段不重置。
   final ValueNotifier<int> _currentPage = ValueNotifier<int>(0);
+  PageController? _pageController;
   late final ValueNotifier<bool> _muted;
+  // 第 49 条：流的代际——_load/_refresh 换一批就 +1，正在飞的 _loadMore /
+  // _loadLatestExtra 回来时发现代际变了就丢弃，别把旧批次追加进新流里。
+  int _feedGen = 0;
+  bool _refreshing = false;
 
   @override
   void initState() {
     super.initState();
     _muted = ValueNotifier<bool>(widget.store.shortsMuted);
+    widget.refreshController?.bind(_refresh);
     _load();
   }
 
   @override
   void dispose() {
+    _pageController?.dispose();
     _currentPage.dispose();
     _muted.dispose();
     super.dispose();
   }
 
-  Future<void> _load() async {
-    final feed = await SearchService(disabledSources: widget.store.disabledSources).homeFeed();
-    if (!mounted) return;
-    setState(() {
-      // 实时热门流：直接拿来竖滑真播（解析不到直链的段，进页后显示“暂时播不了”，可继续滑走）。
-      _items = feed.where(isShortForShorts).toList();
-      _loading = false;
-    });
-    if (_items.isNotEmpty) {
-      // 预探第 2 段的直链，滑过去不用等。
-      unawaited(StreamResolver.prefetch(_items[1 % _items.length]));
+  List<VideoItem> _itemsForTab(ShortsTab tab) {
+    switch (tab) {
+      case ShortsTab.rec:
+        return _recItems;
+      case ShortsTab.newest:
+        return _newItems;
+      case ShortsTab.hottest:
+        return _hotItems;
     }
+  }
+
+  int _clampPos(int pos, int len) {
+    if (len <= 0) return 0;
+    if (pos < 0) return 0;
+    if (pos >= len) return len - 1;
+    return pos;
+  }
+
+  /// 第 46 条：每次打开（ShortsScreen 在 IndexedStack 里常驻，initState 只在
+  /// App 启动时跑一次）轮换计数 +1，homeFeed 按它换词、换页取新一批；
+  /// 位置从上次刷到的地方继续，不再每次从第 1 条开始。
+  Future<void> _load() async {
+    final rotation = widget.store.shortsRotation + 1;
+    await widget.store.setShortsRotation(rotation);
+    final feed = await SearchService(disabledSources: widget.store.disabledSources)
+        .homeFeed(rotation: rotation);
+    if (!mounted) return;
+    final base = feed.where(isShortForShorts).toList();
+    final start =
+        _clampPos(widget.store.shortsPosition(ShortsTab.rec.name), base.length);
+    setState(() {
+      _recItems = base;
+      _newItems = sortShortsByNewest(base);
+      _hotItems = sortShortsByHottest(base);
+      _loading = false;
+      _currentPage.value = start;
+      _pageController = PageController(initialPage: start);
+    });
+    if (base.isNotEmpty) {
+      // 预探第 2 段的直链，滑过去不用等。
+      unawaited(StreamResolver.prefetch(base[1 % base.length]));
+    }
+  }
+
+  /// 第 48 条：切标签——先把当前标签的位置存下来，再跳到新标签上次的位置；
+  /// 各标签互不干扰。第一次进“最新”才拉 eporner 的真新片（只拉一次）。
+  Future<void> _switchTab(ShortsTab tab) async {
+    if (tab == _tab || _loading) return;
+    await widget.store.setShortsPosition(_tab.name, _currentPage.value);
+    if (tab == ShortsTab.newest && !_latestLoaded) {
+      _latestLoaded = true;
+      unawaited(_loadLatestExtra());
+    }
+    final items = _itemsForTab(tab);
+    final start = _clampPos(widget.store.shortsPosition(tab.name), items.length);
+    setState(() {
+      _tab = tab;
+      _currentPage.value = start;
+    });
+    // 等这一帧按新列表建好再跳，不然页数对不上。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _pageController?.jumpToPage(start);
+    });
+  }
+
+  /// 第 49 条：用户主动点底部“短视频”栏（已在栏内再点）→ 换一批新的，
+  /// 从第 1 条开始刷。跟 46 条分工：46 是打开 App 续播（不动位置），
+  /// 49 是主动点才刷新；刷新后位置从 0 开始，之后随刷随存（下次打开接着续）。
+  /// 刷不到新的（断网/源全挂）就留着上一批，不拿空白页充数。
+  Future<void> _refresh() async {
+    if (_loading || _refreshing) return;
+    _refreshing = true;
+    final gen = ++_feedGen;
+    final rotation = widget.store.shortsRotation + 1;
+    await widget.store.setShortsRotation(rotation);
+    final feed = await SearchService(disabledSources: widget.store.disabledSources)
+        .homeFeed(rotation: rotation);
+    if (!mounted || gen != _feedGen) {
+      _refreshing = false;
+      return;
+    }
+    final base = feed.where(isShortForShorts).toList();
+    if (base.isEmpty) {
+      _refreshing = false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('没刷到新的，还是上一批，检查网络后重试')),
+      );
+      return;
+    }
+    setState(() {
+      _recItems = base;
+      _newItems = sortShortsByNewest(base);
+      _hotItems = sortShortsByHottest(base);
+      _latestExtra = [];
+      _latestPage = 1;
+      _latestLoaded = false;
+      _noMore = false;
+      _emptyBatches = 0;
+      _morePage = 1;
+      _moreQueryIdx = 0;
+      _loadingMore = false;
+      _currentPage.value = 0;
+    });
+    // 位置从 0 开始存，免得下次打开跳回旧位置；当前标签不变（在“最新”里点
+    // 刷新就刷最新的），只把 eporner 新片重新拉一份。
+    unawaited(widget.store.setShortsPosition(_tab.name, 0));
+    if (_tab == ShortsTab.newest) {
+      _latestLoaded = true;
+      unawaited(_loadLatestExtra());
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _pageController?.jumpToPage(0);
+    });
+    _refreshing = false;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已换一批新的'), duration: Duration(seconds: 1)),
+    );
+    unawaited(StreamResolver.prefetch(base[1 % base.length]));
+  }
+
+  /// 第 48 条：“最新”标签的真新片：eporner API order=latest。
+  /// 追加时只接排好序的新批次，不整体重排（正在播的那段不能换掉）。
+  Future<void> _loadLatestExtra() async {
+    final gen = _feedGen;
+    try {
+      final r = await EpornerSource().latest(page: _latestPage);
+      if (!mounted || gen != _feedGen) return;
+      final fresh = r.items.where(isShortForShorts).toList();
+      if (fresh.isEmpty) return;
+      _latestPage++;
+      final seen = <String>{
+        ..._recItems.map((v) => v.id),
+        ..._latestExtra.map((v) => v.id),
+      };
+      final deduped = fresh.where((v) => seen.add(v.id)).toList();
+      if (deduped.isEmpty) return;
+      setState(() {
+        _latestExtra = [..._latestExtra, ...deduped];
+        _newItems = [..._newItems, ...sortShortsByNewest(deduped)];
+      });
+    } catch (_) {}
   }
 
   /// 滑到底自动加载下一批：各源按默认词翻页搜（只查已启用源、只留 30 分钟内的）。
   /// 连续 3 批都没新短片才认到底；加载中不重复触发。
+  /// 追加的批次内部各自排好序接在尾部，不整体重排正在播的列表。
   Future<void> _loadMore() async {
     if (_loadingMore || _noMore) return;
     setState(() => _loadingMore = true);
+    final gen = _feedGen;
     final q = _moreQueries[_moreQueryIdx % _moreQueries.length];
     _moreQueryIdx++;
     final page = _morePage++;
     try {
       final more = await SearchService(disabledSources: widget.store.disabledSources)
           .searchPage(q, page);
-      if (!mounted) return;
-      final seen = _items.map((v) => v.id).toSet();
+      // 第 49 条：等回来的路上流被刷新换过一批了，旧批次直接丢，别追加进新流。
+      if (!mounted || gen != _feedGen) {
+        if (mounted) setState(() => _loadingMore = false);
+        return;
+      }
+      final seen = <String>{
+        ..._recItems.map((v) => v.id),
+        ..._latestExtra.map((v) => v.id),
+      };
       final fresh = more.where((v) => isShortForShorts(v) && !seen.contains(v.id)).toList();
       setState(() {
         _loadingMore = false;
@@ -98,12 +312,16 @@ class _ShortsScreenState extends State<ShortsScreen> {
           if (_emptyBatches >= 3) _noMore = true;
         } else {
           _emptyBatches = 0;
-          _items = [..._items, ...fresh];
+          _recItems = [..._recItems, ...fresh];
+          _newItems = [..._newItems, ...sortShortsByNewest(fresh)];
+          _hotItems = [..._hotItems, ...sortShortsByHottest(fresh)];
         }
       });
     } catch (_) {
       if (mounted) setState(() => _loadingMore = false);
     }
+    // 第 48 条：最新标签滑到底，eporner 再拉下一页新片并进去。
+    if (_tab == ShortsTab.newest) unawaited(_loadLatestExtra());
   }
 
   @override
@@ -111,28 +329,85 @@ class _ShortsScreenState extends State<ShortsScreen> {
     if (_loading) {
       return const Center(child: CircularProgressIndicator(color: Colors.pinkAccent));
     }
-    if (_items.isEmpty) {
+    final items = _itemsForTab(_tab);
+    if (items.isEmpty) {
       return const Center(child: Text('短视频流是空的，检查网络后切到推荐页下拉刷新再试', style: TextStyle(color: Colors.white70)));
     }
-    return PageView.builder(
-      scrollDirection: Axis.vertical,
-      itemCount: _items.length,
-      onPageChanged: (i) {
-        _currentPage.value = i;
-        // 滑到第 i 段，预探第 i+1 段的直链。
-        if (i + 1 < _items.length) unawaited(StreamResolver.prefetch(_items[i + 1]));
-        // 快滑到底了，提前加载下一批。
-        if (i >= _items.length - 3) unawaited(_loadMore());
-      },
-      itemBuilder: (_, i) => _ShortPage(
-        item: _items[i],
-        index: i,
-        total: _items.length,
-        store: widget.store,
-        tabVisible: widget.visible,
-        currentPage: _currentPage,
-        muted: _muted,
-      ),
+    return Stack(
+      children: [
+        PageView.builder(
+          controller: _pageController,
+          scrollDirection: Axis.vertical,
+          itemCount: items.length,
+          onPageChanged: (i) {
+            _currentPage.value = i;
+            // 第 46 条：位置随刷随存，退出重进从这里继续。
+            unawaited(widget.store.setShortsPosition(_tab.name, i));
+            // 滑到第 i 段，预探第 i+1 段的直链。
+            if (i + 1 < items.length) unawaited(StreamResolver.prefetch(items[i + 1]));
+            // 快滑到底了，提前加载下一批。
+            if (i >= items.length - 3) unawaited(_loadMore());
+          },
+          itemBuilder: (_, i) => _ShortPage(
+            key: ValueKey(items[i].id),
+            item: items[i],
+            index: i,
+            total: items.length,
+            store: widget.store,
+            tabVisible: widget.visible,
+            currentPage: _currentPage,
+            muted: _muted,
+          ),
+        ),
+        // 第 48 条：顶上三个标签（推荐 / 最新 / 最热门），各记各的位置。
+        Positioned(
+          top: 0,
+          left: 0,
+          right: 0,
+          child: SafeArea(
+            child: Container(
+              padding: const EdgeInsets.only(top: 6, bottom: 10),
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [Colors.black54, Colors.transparent],
+                ),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: ShortsTab.values.map((t) {
+                  final selected = t == _tab;
+                  return GestureDetector(
+                    onTap: () => _switchTab(t),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(_shortsTabLabels[t]!,
+                              style: TextStyle(
+                                  color: selected ? Colors.white : Colors.white60,
+                                  fontSize: selected ? 17 : 15,
+                                  fontWeight: selected ? FontWeight.bold : FontWeight.normal)),
+                          const SizedBox(height: 3),
+                          Container(
+                            width: 20,
+                            height: 3,
+                            decoration: BoxDecoration(
+                                color: selected ? Colors.pinkAccent : Colors.transparent,
+                                borderRadius: BorderRadius.circular(2)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -146,6 +421,7 @@ class _ShortPage extends StatefulWidget {
   final ValueNotifier<int> currentPage;
   final ValueNotifier<bool> muted;
   const _ShortPage({
+    super.key,
     required this.item,
     required this.index,
     required this.total,
@@ -174,6 +450,10 @@ class _ShortPageState extends State<_ShortPage> {
   List<StreamVariant> _variants = [];
   String? _variantLabel;
   String? _currentStreamUrl;
+  // 第 47 条：作者补过没有（只补一次，没补上不反复拉同一条）。
+  bool _authorTried = false;
+  bool _resolvingAuthor = false;
+  bool _authorFailed = false;
 
   bool get _isCurrent => widget.currentPage.value == widget.index;
   bool get _shouldPlay => widget.tabVisible && _isCurrent;
@@ -196,7 +476,27 @@ class _ShortPageState extends State<_ShortPage> {
     if (oldWidget.tabVisible != widget.tabVisible) _applyPlayState();
   }
 
-  void _onPageChanged() => _applyPlayState();
+  void _onPageChanged() {
+    _applyPlayState();
+    // 第 47 条：轮到这一段了，没作者就去视频页补一个（只补一次）。
+    if (_isCurrent) unawaited(_maybeResolveAuthor());
+  }
+
+  /// 第 47 条：当前这段没作者时，拉视频页补一个（eporner 的作者只能这么拿：
+  /// API 里没有上传者字段，embed 页里也没有，只有视频页有 vit-uploader）。
+  /// 补上了头像列立刻变作者；没补上记下来，本页不再反复拉。
+  Future<void> _maybeResolveAuthor() async {
+    if (_authorTried || _displayItem.author.isNotEmpty || _resolvingAuthor) return;
+    _authorTried = true;
+    setState(() => _resolvingAuthor = true);
+    final updated = await StreamResolver.resolveAuthor(widget.item);
+    if (!mounted) return;
+    setState(() {
+      _resolvingAuthor = false;
+      _displayItem = updated;
+      if (updated.author.isEmpty) _authorFailed = true;
+    });
+  }
 
   void _onMutedChanged() {
     final m = widget.muted.value;
@@ -282,6 +582,8 @@ class _ShortPageState extends State<_ShortPage> {
       await c.setPlaybackSpeed(_speed);
       // 只有轮到这一段、且短视频栏可见才出声播；没轮到它就只准备好、不播。
       if (_shouldPlay) await c.play();
+      // 第 47 条：初始就是当前这段的，没作者也补一个（滑过来的走 _onPageChanged）。
+      if (_isCurrent) unawaited(_maybeResolveAuthor());
       unawaited(_loadVariants());
     } catch (e) {
       if (mounted) {
@@ -444,38 +746,84 @@ class _ShortPageState extends State<_ShortPage> {
     ));
   }
 
-  /// 第 42 条：右侧栏作者头像 + 关注（TikTok 那样）；点头像进作者页。
+  /// 第 47 条：右侧栏作者头像 + 关注（TikTok 那样），一直显示；
+  /// 有作者：头像圆圈 + 名字 + 关注，点头像进作者页。
+  /// 没作者：显示来源首字母 + 来源名 + “找作者”，点一下去视频页抠发布者
+  /// （eporner 的作者只能这么拿）；抠到了立刻变作者，抠不到显示“没找到”。
   Widget _authorAvatarButton() {
     final author = _displayItem.author;
-    final followed = widget.store.followedAuthors.contains(author);
+    final known = author.isNotEmpty;
+    final followed = known && widget.store.followedAuthors.contains(author);
+    final label = known ? author : _displayItem.source;
     return Column(
       children: [
         GestureDetector(
-          onTap: () => _openAuthor(author),
-          child: CircleAvatar(
-            radius: 22,
-            backgroundColor: Colors.pinkAccent,
-            backgroundImage: _displayItem.authorAvatar.isNotEmpty
-                ? NetworkImage(_displayItem.authorAvatar)
-                : null,
-            child: _displayItem.authorAvatar.isEmpty
-                ? Text(author.isNotEmpty ? author[0].toUpperCase() : '?',
-                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
-                : null,
+          onTap: () async {
+            if (known) {
+              _openAuthor(author);
+              return;
+            }
+            if (_resolvingAuthor) return;
+            if (_authorFailed) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('这个源站没给作者信息，去详情页或源站看')),
+              );
+              return;
+            }
+            await _maybeResolveAuthor();
+            if (mounted && _displayItem.author.isNotEmpty) {
+              _openAuthor(_displayItem.author);
+            }
+          },
+          child: Column(
+            children: [
+              CircleAvatar(
+                radius: 22,
+                backgroundColor: known ? Colors.pinkAccent : Colors.white24,
+                backgroundImage: _displayItem.authorAvatar.isNotEmpty
+                    ? NetworkImage(_displayItem.authorAvatar)
+                    : null,
+                child: _displayItem.authorAvatar.isEmpty
+                    ? Text(
+                        known ? author[0].toUpperCase() : label[0].toUpperCase(),
+                        style: const TextStyle(
+                            color: Colors.white, fontWeight: FontWeight.bold))
+                    : null,
+              ),
+              const SizedBox(height: 4),
+              SizedBox(
+                width: 64,
+                child: Text(label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.white, fontSize: 11)),
+              ),
+            ],
           ),
         ),
         const SizedBox(height: 4),
         GestureDetector(
           onTap: () async {
-            await widget.store.toggleFollow(author);
-            if (mounted) setState(() {});
+            if (known) {
+              await widget.store.toggleFollow(author);
+              if (mounted) setState(() {});
+              return;
+            }
+            if (_resolvingAuthor || _authorFailed) return;
+            await _maybeResolveAuthor();
           },
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
             decoration: BoxDecoration(
                 color: followed ? Colors.white24 : Colors.pinkAccent,
                 borderRadius: BorderRadius.circular(999)),
-            child: Text(followed ? '已关注' : '+ 关注',
+            child: Text(
+                known
+                    ? (followed ? '已关注' : '+ 关注')
+                    : (_resolvingAuthor
+                        ? '找找…'
+                        : (_authorFailed ? '没找到' : '找作者')),
                 style: const TextStyle(color: Colors.white, fontSize: 11)),
           ),
         ),
@@ -657,7 +1005,7 @@ class _ShortPageState extends State<_ShortPage> {
                 GestureDetector(
                   onTap: _displayItem.author.isEmpty ? null : () => _openAuthor(_displayItem.author),
                   child: Text(
-                      '${_displayItem.author.isEmpty ? _displayItem.source : '👤 ${_displayItem.author}'}${_displayItem.durationText.isEmpty ? '' : ' · ${_displayItem.durationText}'}',
+                      '${_displayItem.author.isEmpty ? _displayItem.source : '👤 ${_displayItem.author}'}${_displayItem.durationText.isEmpty ? ' · 时长未知' : ' · ${_displayItem.durationText}'}',
                       style: TextStyle(
                           color: Colors.white70,
                           fontSize: 13,
@@ -671,11 +1019,9 @@ class _ShortPageState extends State<_ShortPage> {
             right: 12, bottom: 76,
             child: Column(
               children: [
-                // 第 42 条：作者头像 + 关注，放在点赞上面。
-                if (_displayItem.author.isNotEmpty) ...[
-                  _authorAvatarButton(),
-                  const SizedBox(height: 8),
-                ],
+                // 第 47 条：作者头像 + 关注一直显示（没作者时显示来源 + “找作者”）。
+                _authorAvatarButton(),
+                const SizedBox(height: 8),
                 IconButton(
                   icon: Icon(_liked ? Icons.favorite : Icons.favorite_border,
                       color: _liked ? Colors.red : Colors.white, size: 30),

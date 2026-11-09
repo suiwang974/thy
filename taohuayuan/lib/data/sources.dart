@@ -63,6 +63,10 @@ abstract class Source {
     if (page <= 1) return search(query);
     return SourceResult(sourceId: id, sourceName: name);
   }
+
+  /// “最新”（第 48 条：短视频“最新”标签）：默认走 home()（热门里按时间排，
+  /// 没发布时间的放后面）；eporner 用 API order=latest 真拉新片。
+  Future<SourceResult> latest({int page = 1}) async => home(page: page);
 }
 
 /// ---------- 工具 ----------
@@ -302,6 +306,22 @@ class EpornerSource extends Source {
       return SourceResult(sourceId: id, sourceName: name, error: e.toString());
     }
   }
+
+  @override
+  Future<SourceResult> latest({int page = 1}) async {
+    // 第 48 条：短视频“最新”标签用 API order=latest 真拉新片
+    // （VM 验通：返回 11-06~11-08 的新片，added 字段就是发布时间）。
+    try {
+      final uri = Uri.parse('https://www.eporner.com/api/v2/video/search/'
+          '?query=&per_page=100&page=$page&order=latest&format=json');
+      final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 20));
+      final json = jsonDecode(_decodeBody(res)) as Map<String, dynamic>;
+      final vids = (json['videos'] ?? []) as List;
+      return SourceResult(sourceId: id, sourceName: name, items: parseVideos(vids));
+    } catch (e) {
+      return SourceResult(sourceId: id, sourceName: name, error: e.toString());
+    }
+  }
 }
 
 /// ---------- 2. Rule34Video：搜索页 HTML 解析，详情页有 master.m3u8 ----------
@@ -436,15 +456,28 @@ class NiacgSource extends Source {
   String get webHomeUrl => 'https://www.niacg.com/';
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
+  /// 第 45 条：真页的 <a> 里 title 属性可能在 href 前面（旧正则要求 href 在
+  /// 前、title 紧跟在后，属性一换顺序就 0 条——三个源搜不到的头号嫌疑）。
+  /// 先按 href 抓锚点，再从整个标签里取 title 属性，取不到取 img 的 alt，
+  /// 再取不到取锚点可见文字。时长：niacg 列表页不显示时长（站方没给），
+  /// 不编一个，durationSec=0 就是“未知”，过滤不过滤、卡片标“时长未知”。
   static List<VideoItem> parseSearchHtml(String html) {
     final out = <VideoItem>[];
     final seen = <String>{};
-    final re = RegExp(r'href="(\/showinfo-21-(\d+)-0\.html)"[^>]*title="([^"]*)"');
+    final re = RegExp(
+        r'<a\b[^>]*href="(\/showinfo-21-(\d+)-0\.html)"[^>]*>(.*?)</a>',
+        dotAll: true);
     for (final m in re.allMatches(html)) {
       if (out.length >= 100 || seen.contains(m.group(2))) continue;
       seen.add(m.group(2)!);
+      final tag = m.group(0)!;
+      final inner = m.group(3) ?? '';
+      final title = RegExp(r'''title="([^"]*)"''').firstMatch(tag)?.group(1) ??
+          RegExp(r'''<img[^>]+alt="([^"]*)"''').firstMatch(inner)?.group(1) ??
+          _stripTags(inner);
       // 第 42 条：niacg 标题里的 [作者] 前缀就是发布者。
-      final niacgTitle = _cleanTitle(m.group(3) ?? '');
+      final niacgTitle = _cleanTitle(_decodeEntities(title));
+      if (niacgTitle.isEmpty) continue;
       out.add(VideoItem(
         id: 'niacg-${m.group(2)}',
         title: niacgTitle,
@@ -528,14 +561,22 @@ class Lianzu11Source extends Source {
   static List<VideoItem> parseSearchHtml(String html) {
     final out = <VideoItem>[];
     final seen = <String>{};
+    // 第 45 条：首页链接本身（https://lianzu11.com/）不是视频，导航里的
+    // “首页”点进来会变成一条标题叫“首页”的假视频，先排除。
     final re = RegExp(r'''<a[^>]+href="(https:\/\/lianzu11\.com\/[^"]+)"[^>]*>([\s\S]*?)<\/a>''');
     for (final m in re.allMatches(html)) {
       if (out.length >= 100) break;
       final href = m.group(1)!;
-      if (seen.contains(href) || RegExp(r'page\/|category|tag\/').hasMatch(href)) continue;
+      if (seen.contains(href) ||
+          href == 'https://lianzu11.com/' ||
+          RegExp(r'page\/|category|tag\/').hasMatch(href)) {
+        continue;
+      }
       final inner = m.group(2) ?? '';
       final text = _stripTags(inner);
-      if (text.isEmpty) continue;
+      if (text.isEmpty) {
+        continue;
+      }
       seen.add(href);
       // 第 37 条：时长只在可见文本里找，不扫原始 HTML 属性。
       final durText = _durationFromElement(inner) ?? _durationFromText(_stripTags(inner));
@@ -959,7 +1000,9 @@ class HanimeSource extends Source {
     final base = 'https://$host';
     final items = <VideoItem>[];
     final seen = <String>{};
-    final anchorRe = RegExp(r'<a\b[^>]*href="([^"]*watch[^"]*)"[^>]*>(.*?)</a>',
+    // 第 45 条：视频链接不只 "watch" 一种写法（/videos/hentai/... 也要认，
+    // 旧正则只认 watch，真页换种写法就 0 条）。
+    final anchorRe = RegExp(r'<a\b[^>]*href="([^"]*(?:watch|/videos?/)[^"]*)"[^>]*>(.*?)</a>',
         dotAll: true, caseSensitive: false);
     for (final m in anchorRe.allMatches(html)) {
       final pageUrl = _absUrl(m.group(1)!, base);

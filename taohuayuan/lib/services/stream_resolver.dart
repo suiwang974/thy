@@ -174,6 +174,18 @@ class StreamResolver {
         return (author: a, authorAvatar: '');
       }
     }
+    if (source == 'eporner') {
+      // 第 47 条：视频页里上传者就在 <li class="vit-uploader"><a title="Uploader">名字</a></li>
+      // （VM 拉真页验过：fepaciw123）。相关视频的 <span class="mb-uploader"> 别碰，
+      // 那不是这条的上传者；embed 页里没有作者信息，别去那里找。
+      final m = RegExp(
+        r'''<li[^>]*class="[^"]*vit-uploader[^"]*"[^>]*>\s*<a[^>]*>([^<]+)</a>''',
+        dotAll: true,
+      ).firstMatch(html);
+      if (m != null && m.group(1)!.trim().isNotEmpty) {
+        return (author: clean(m.group(1)!), authorAvatar: '');
+      }
+    }
     // 通用兜底：JSON-LD author（对象或字符串）、rel=author、WP 作者链接。
     final ld = RegExp(r'"author"\s*:\s*\{\s*"@type"[^}]{0,200}?"name"\s*:\s*"([^"]+)"')
             .firstMatch(html)
@@ -234,6 +246,46 @@ class StreamResolver {
     try {
       await resolve(item);
     } catch (_) {}
+  }
+
+  /// 第 47 条：给没作者的条目补作者（短视频当前这段）：拉视频页 HTML，
+  /// parseVideoAuthor 抠发布者。命中进 _enriched（播放页也受益），
+  /// 没命中记下来，本会话不再重复拉同一条。eporner 的作者只能这么拿：
+  /// API 里没有上传者字段，embed 页里也没有，只有视频页有 vit-uploader。
+  static final Set<String> _authorMissed = {};
+
+  static Future<VideoItem> resolveAuthor(VideoItem item) async {
+    if (item.author.isNotEmpty) return item;
+    final enriched = _enriched[item.id];
+    if (enriched != null && enriched.author.isNotEmpty) return enriched;
+    if (_authorMissed.contains(item.id)) return enriched ?? item;
+    final page = item.pageUrl;
+    if (page == null || page.isEmpty) {
+      _authorMissed.add(item.id);
+      return enriched ?? item;
+    }
+    try {
+      final res = await http
+          .get(Uri.parse(page), headers: {'User-Agent': _ua})
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode != 200) {
+        _authorMissed.add(item.id);
+        return enriched ?? item;
+      }
+      final parsed = parseVideoAuthor(utf8.decode(res.bodyBytes), item.source);
+      if (parsed.author.isEmpty) {
+        _authorMissed.add(item.id);
+        return enriched ?? item;
+      }
+      final updated = (enriched ?? item).copyWith(
+          author: parsed.author, authorAvatar: parsed.authorAvatar);
+      if (_enriched.length > 100) _enriched.clear();
+      _enriched[item.id] = updated;
+      return updated;
+    } catch (_) {
+      _authorMissed.add(item.id);
+      return enriched ?? item;
+    }
   }
 
   static Future<ResolvedStream?> resolve(VideoItem item) async {

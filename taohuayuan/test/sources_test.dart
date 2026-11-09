@@ -43,6 +43,16 @@ void main() {
     expect(items[0].pageUrl, 'https://www.niacg.com/showinfo-21-12345-0.html');
   });
 
+  test('第 45 条：Niacg 解析容错——title 在 href 前面、只有 img alt 也收', () {
+    const html = '''
+<a title="标题在前" href="/showinfo-21-11111-0.html"><img src="https://x.com/a.jpg"></a>
+<a href="/showinfo-21-22222-0.html"><img src="https://x.com/b.jpg" alt="只有 alt 的标题"></a>
+<a href="/showinfo-21-33333-0.html"></a>
+''';
+    final items = NiacgSource.parseSearchHtml(html);
+    expect(items.map((v) => v.title).toList(), ['标题在前', '只有 alt 的标题']);
+  });
+
   test('Lianzu11 搜索页解析：排除分页/分类链接', () {
     const html = '''
 <a href="https://lianzu11.com/post-1"><img src="https://lianzu11.com/t.jpg">恋足视频一</a>
@@ -52,6 +62,16 @@ void main() {
     final items = Lianzu11Source.parseSearchHtml(html);
     expect(items.length, 1);
     expect(items[0].title, '恋足视频一');
+  });
+
+  test('第 45 条：Lianzu11 解析容错——首页链接本身不成视频', () {
+    const html = '''
+<a href="https://lianzu11.com/">首页</a>
+<a href="https://lianzu11.com/post-9"><img src="https://lianzu11.com/t9.jpg">恋足视频九</a>
+''';
+    final items = Lianzu11Source.parseSearchHtml(html);
+    expect(items.length, 1);
+    expect(items[0].title, '恋足视频九');
   });
 
   test('10 个在线源，没有本地目录源', () {
@@ -170,16 +190,30 @@ void main() {
     const html = '''
 <a href="/watch?v=12345"><div class="title">Test Hentai Title</div><img src="https://cdn.example.com/poster.jpg"><span>24:36</span></a>
 <a href="/watch?v=67890"><div class="home-rows-videos-title">Second Title</div></a>
-<a href="/videos/999">不是 watch 链接，不收</a>
+<a href="/videos/999"><div class="title">Videos Form Title</div></a>
 ''';
     final items = HanimeSource.parseSearchHtml(html, 'hanime1.me', 'hanime1');
-    expect(items.length, 2);
+    expect(items.length, 3);
     expect(items[0].title, 'Test Hentai Title');
     expect(items[0].pageUrl, 'https://hanime1.me/watch?v=12345');
     expect(items[0].poster, 'https://cdn.example.com/poster.jpg');
     expect(items[0].durationSec, 1476);
     expect(items[0].source, 'hanime1');
     expect(items[1].title, 'Second Title');
+    // 第 45 条：/videos/ 形式的视频链接也收（旧解析只认 watch 会漏）。
+    expect(items[2].title, 'Videos Form Title');
+    expect(items[2].pageUrl, 'https://hanime1.me/videos/999');
+  });
+
+  test('第 45 条：Hanime 解析容错——/videos/hentai/ 形式的视频链接也收', () {
+    const html = '''
+<a href="/videos/hentai/12345"><div class="title">Videos Hentai Title</div></a>
+<a href="/watch?v=67890"><div class="title">Watch Form Title</div></a>
+''';
+    final items = HanimeSource.parseSearchHtml(html, 'hanime1.me', 'hanime1');
+    expect(items.length, 2);
+    expect(items[0].title, 'Videos Hentai Title');
+    expect(items[1].title, 'Watch Form Title');
   });
 
   test('Hanime 源：webViewOnly，搜索地址带 genre=裏番', () {

@@ -25,6 +25,18 @@ void main() {
     expect(EpornerSource.parseVideos(vids).length, vids.length);
   }, timeout: const Timeout(Duration(seconds: 60)));
 
+  test('第 48 条：Eporner latest 实测——order=latest 返回的就是最近的新片', () async {
+    final r = await EpornerSource().latest(page: 1);
+    expect(r.error, isNull);
+    expect(r.items, isNotEmpty);
+    final dated = r.items.where((v) => v.publishedAtMs > 0).toList();
+    expect(dated, isNotEmpty);
+    // 返回的都是最近几天的新片（added 字段即发布时间），不是几年前的老片。
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final newest = dated.map((v) => v.publishedAtMs).reduce((a, b) => a > b ? a : b);
+    expect(now - newest, lessThan(14 * 24 * 3600 * 1000));
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
   test('Rule34Video 搜索页实时抓 foot 有结果', () async {
     final res = await http
         .get(Uri.parse('https://rule34-videos.com/search/?q=foot'), headers: {'User-Agent': _ua})

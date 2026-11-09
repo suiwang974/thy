@@ -251,6 +251,25 @@ class Store {
     await _prefs.setInt(_feedRotationKey, value);
   }
 
+  // ---- 短视频轮换计数 + 各标签位置（第 46/48 条）----
+  // 打开短视频栏就 +1，homeFeed 按它换词、换页取新一批；每次打开都是新一批，
+  // 不再固定 1–200 条。位置按标签各记各的（推荐/最新/最热门），切标签再切回来、
+  // 退出重进都从这个位置继续，互不干扰。
+  static const _shortsRotationKey = 'taohuayuan_shorts_rotation';
+  static const _shortsPosPrefix = 'taohuayuan_shorts_pos_';
+
+  int get shortsRotation => _prefs.getInt(_shortsRotationKey) ?? 0;
+
+  Future<void> setShortsRotation(int value) async {
+    await _prefs.setInt(_shortsRotationKey, value);
+  }
+
+  int shortsPosition(String tab) => _prefs.getInt('$_shortsPosPrefix$tab') ?? 0;
+
+  Future<void> setShortsPosition(String tab, int index) async {
+    await _prefs.setInt('$_shortsPosPrefix$tab', index);
+  }
+
   // ---- 内置浏览器默认翻译成中文（第 35 条，用户定）----
   // 默认 true：浏览器打开页面就走 translate.goog 翻成中文；
   // AppBar 里的翻译按钮可随时切回原文，选择持久保存。

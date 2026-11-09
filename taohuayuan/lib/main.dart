@@ -87,6 +87,8 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int _index = 0;
+  // 第 49 条：底部“短视频”栏的刷新控制器（点栏刷新用）。
+  final _shortsRefresh = ShortsRefreshController();
 
   void _openAuthor(String author) {
     Navigator.of(context).push(MaterialPageRoute(
@@ -99,7 +101,10 @@ class _HomeShellState extends State<HomeShell> {
     final pages = <Widget>[
       HomeScreen(store: widget.store, onAuthorTap: _openAuthor),
       // 短视频栏不可见时（用户在推荐页），短视频不许自动播出声（第 15 条）。
-      ShortsScreen(store: widget.store, visible: _index == 1),
+      ShortsScreen(
+          store: widget.store,
+          visible: _index == 1,
+          refreshController: _shortsRefresh),
       BrowserSourcesScreen(store: widget.store),
       ProfileScreen(store: widget.store, onAuthorTap: _openAuthor),
     ];
@@ -107,7 +112,15 @@ class _HomeShellState extends State<HomeShell> {
       body: IndexedStack(index: _index, children: pages),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _index,
-        onTap: (i) => setState(() => _index = i),
+        onTap: (i) {
+          // 第 49 条：已经在短视频栏时再点它，就刷新换一批新的（跟抖音一样）；
+          // 从别的栏切过来只导航，不刷新——不然 46 条的续播位置永远看不到。
+          if (shouldRefreshShortsOnTabTap(
+              tappedIndex: i, currentIndex: _index, shortsIndex: 1)) {
+            _shortsRefresh.refresh();
+          }
+          setState(() => _index = i);
+        },
         type: BottomNavigationBarType.fixed,
         backgroundColor: const Color(0xFF1C1C22),
         selectedItemColor: Colors.pinkAccent,

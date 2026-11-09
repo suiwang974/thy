@@ -52,7 +52,7 @@ class PosterThumb extends StatelessWidget {
           Text(item.title, maxLines: 3, overflow: TextOverflow.ellipsis,
               style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
-          Text('${item.source}${item.durationText.isEmpty ? '' : ' · ${item.durationText}'}',
+          Text('${item.source}${item.durationText.isEmpty ? ' · 时长未知' : ' · ${item.durationText}'}',
               style: const TextStyle(color: Colors.white60, fontSize: 11)),
         ],
       ),
@@ -82,15 +82,16 @@ class VideoCard extends StatelessWidget {
             child: Stack(
               children: [
                 Positioned.fill(child: PosterThumb(item: item)),
-                if (item.durationText.isNotEmpty)
-                  Positioned(
-                    left: 6, bottom: 6,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                      decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(4)),
-                      child: Text(item.durationText, style: const TextStyle(color: Colors.white, fontSize: 11)),
-                    ),
+                // 第 45 条：时长 chip 一直显示——有就显示时长，没有就标“时长未知”，
+                // 别让用户以为这条没时长就是坏的；时长未知的不过滤，照常能播。
+                Positioned(
+                  left: 6, bottom: 6,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(4)),
+                    child: Text(item.durationText.isEmpty ? '时长未知' : item.durationText, style: const TextStyle(color: Colors.white, fontSize: 11)),
                   ),
+                ),
                 // 下载入口（第 27 条：每个视频都要有，点一下就开始下；
                 // 点它不进播放页——IconButton 的手势赢了外层卡片的 onTap）。
                 // 第 30 条：放封面右下角的小图标（16px + shrinkWrap），
@@ -124,7 +125,7 @@ class VideoCard extends StatelessWidget {
               Expanded(
                 child: Text(
                     reason ??
-                        '${item.source}${item.durationText.isEmpty ? '' : ' · ${item.durationText}'}',
+                        '${item.source}${item.durationText.isEmpty ? ' · 时长未知' : ' · ${item.durationText}'}',
                     maxLines: 1, overflow: TextOverflow.ellipsis,
                     style: TextStyle(color: reason != null ? Colors.pink.shade200 : Colors.white54, fontSize: 12)),
               ),
