@@ -1080,6 +1080,18 @@ class DownloadManager extends ChangeNotifier {
     _pumpQueue();
   }
 
+  /// 失败的任务重试（第 38 条）：先丢掉旧直链地址（签名可能过期、CDN 可能轮换），
+  /// 再走 resumeTask 的重解析路径；已下完的部分接着续传，不用从头下。
+  Future<void> retryTask(String id) async {
+    final t = taskFor(id);
+    if (t == null || t.status != DownloadStatus.error) return;
+    _jobs.remove(id);
+    t.status = DownloadStatus.paused;
+    t.error = null;
+    _notifyAndPersist(persist: true);
+    await resumeTask(id);
+  }
+
   /// 取消下载中/排队中的任务（删临时文件，不删已下完的成品）。
   Future<void> cancelTask(String id) async {
     final job = _jobs[id];
@@ -1123,10 +1135,28 @@ class DownloadManager extends ChangeNotifier {
     _notifyAndPersist(persist: true);
   }
 
-  String _shortError(Object e) {
-    final s = e.toString().replaceAll(RegExp(r'\s+'), ' ');
-    return s.length > 120 ? '${s.substring(0, 120)}…' : s;
+  /// 第 38 条：下载失败不许把原始异常堆栈直接甩给用户看（之前
+  /// `HandshakeException: ... CERTIFICATE_VERIFY_FAILED: Hostname mismatch
+  /// (handshake.cc:320)` 就这么原样上了下载管理页）。按原因写人话：
+  /// 证书错、断网、源站拒绝各给一句话 + 能怎么办；其他错误才截断原文。
+  static String humanDownloadError(Object e) {
+    final s = e.toString();
+    if (s.contains('CERTIFICATE_VERIFY_FAILED') || s.contains('HandshakeException')) {
+      return '证书验证失败：直链域名和证书对不上（可能是源站换了 CDN 节点，或手机开了代理/VPN）。重试会重新解析直链，也可去内置浏览器里嗅探下载';
+    }
+    if (s.contains('SocketException') ||
+        s.contains('Connection refused') ||
+        s.contains('Network is unreachable') ||
+        s.contains('Connection reset')) {
+      return '网络连不上（断网或源站连不上），检查网络后重试';
+    }
+    if (s.contains('403')) return '源站拒绝了这次下载（403），直链可能过期了，重试会重新解析';
+    if (s.contains('404')) return '直链找不到了（404），重试会重新解析';
+    final flat = s.replaceAll(RegExp(r'\s+'), ' ');
+    return flat.length > 120 ? '${flat.substring(0, 120)}…' : flat;
   }
+
+  String _shortError(Object e) => humanDownloadError(e);
 }
 
 class _DownloadJob {

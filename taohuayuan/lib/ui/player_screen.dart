@@ -9,9 +9,11 @@ import 'package:webview_flutter/webview_flutter.dart';
 import '../models/video_item.dart';
 import '../services/adblock_service.dart';
 import '../services/downloader.dart';
+import '../services/fullscreen_controls.dart';
 import '../services/sniffer.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
+import 'author_screen.dart';
 import 'download_button.dart';
 import 'sniff_sheet.dart';
 import 'web_source_browser.dart';
@@ -66,9 +68,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // 第 34 条：官方播放器 WebView 里嗅到的媒体（和内置浏览器同一套嗅探）。
   List<SniffedMedia> _embedSniffed = [];
   String _embedPageTitle = '';
+  // 第 43+44 条：全屏控制条自动隐藏（播的时候 3 秒无操作自动藏，点画面再出现）。
+  late final FullscreenControls _fsControls;
 
   @override
   void initState() {
+    _fsControls = FullscreenControls(onChanged: () {
+      if (mounted) setState(() {});
+    });
     super.initState();
     _current = widget.item;
     _liked = widget.store.likedIds.contains(_current.id);
@@ -152,6 +159,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final stream = await StreamResolver.resolve(item);
     if (!mounted) return;
     _currentStreamUrl = stream?.url;
+    // 第 42 条：解析详情页时可能补上了作者/封面/时长（视频页找发布者），
+    // 播之前把补全版换上，作者行才能显示出来。
+    final enriched = StreamResolver.enrich(item);
+    if (enriched.author.isNotEmpty ||
+        enriched.poster != item.poster ||
+        enriched.durationSec != item.durationSec) {
+      item = enriched;
+      setState(() => _current = enriched);
+    }
     if (stream == null) {
       // 没直链：自动切 App 内嵌官方播放器（WebView），不只给外跳按钮当唯一出路。
       // 用户 2026-11-09 原话：能在本站看就在本站看，不要跑来跑去。
@@ -171,19 +187,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
       await c.initialize();
       if (!mounted) return;
-      // mp4 在解析时算不出时长，这里用播放器初始化后的真实时长再核一次：
-      // 真实不到列表一半就是预览，不播，切官方播放器并写明。
+      // mp4 在解析时算不出时长，这里用播放器初始化后的真实时长再核一次。
+      // 第 37 条：先纠正离谱的列表时长（比如把图片尺寸 320:180 当成 320:18，
+      // 列表写 320:18、真实只有 15 分钟），再判预览——15 分钟的正片不能因为
+      // 列表写错就被当成“带水印的预览”切走。
       final actualSec = c.value.duration.inSeconds;
-      if (StreamResolver.isPreviewDuration(listedSec: item.durationSec, actualSec: actualSec)) {
+      var listedSec = item.durationSec;
+      if (actualSec > 0 && listedSec > 0 && (listedSec > actualSec * 4 || actualSec > listedSec * 4)) {
+        listedSec = actualSec;
+        item = item.copyWith(durationSec: actualSec);
+        _current = item;
+      }
+      if (StreamResolver.isPreviewDuration(listedSec: listedSec, actualSec: actualSec)) {
         await c.dispose();
         if (!mounted) return;
         _embedOfficial(_previewText(item, actualSec));
         return;
-      }
-      if (actualSec > 0 && item.durationSec > 0 && actualSec > item.durationSec * 2) {
-        // 真实时长比列表时长长一倍以上：列表写错了（比如列表写 156:52 这种
-        // 离谱值），显示改成真实时长，别让用户以为是另一条片。
-        _current = item.copyWith(durationSec: actualSec);
       }
       setState(() {
         _controller = c;
@@ -197,6 +216,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
       await c.setPlaybackSpeed(_speed);
       await c.play();
+      // 第 44 条：新一段播起来，全屏控制条重新计时（播的时候 3 秒后藏）。
+      _fsControls.poke(isPlaying: true);
       // 看门狗 + 画质档位：播起来之后 5 秒再看一眼。
       // 注意：灰框的真根因是视频区 widget 在真机上抛错（release 下只剩灰框，
       // 见 main.dart 的 ErrorWidget 兜底注释），不是没尺寸——尺寸在
@@ -280,6 +301,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await c.setPlaybackSpeed(_speed);
       if (wasPlaying) await c.play();
       _startWatchdog(c);
+      // 第 44 条：切档也是操作，控制条重新计时（播的时候 3 秒后才藏）。
+      _fsControls.poke(isPlaying: wasPlaying);
     } catch (e) {
       if (!mounted) return;
       _embedOfficial('切画质失败：${_shortReason(e)}');
@@ -351,6 +374,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   /// 官方播放器 WebView 里嗅视频（第 34 条）：和内置浏览器同一套嗅探，
   /// 嗅到就出瘦条（播/下载），嗅不到不打扰。
+  /// 第 42 条：页面里抠到的作者也顺带补上（eporner/lianzu11/hanime 这类
+  /// HTTP 拿不到作者的源，在 WebView 里打开视频页时靠它补）。
   Future<void> _sniffEmbed(WebViewController wc) async {
     try {
       final r = await Sniffer.sniff(wc, pageUrl: _current.pageUrl ?? '');
@@ -358,6 +383,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
       setState(() {
         _embedSniffed = r.items;
         _embedPageTitle = r.pageTitle;
+        if (r.author.isNotEmpty && _current.author.isEmpty) {
+          _current = _current.copyWith(author: r.author);
+        }
       });
       // 视频可能是懒加载的：4 秒后再嗅一次。
       await Future.delayed(const Duration(seconds: 4));
@@ -367,7 +395,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
       setState(() {
         _embedSniffed = r2.items;
         _embedPageTitle = r2.pageTitle;
+        if (r2.author.isNotEmpty && _current.author.isEmpty) {
+          _current = _current.copyWith(author: r2.author);
+        }
       });
+    } catch (_) {}
+  }
+
+  /// 第 40 条：手动嗅探（官方播放器里没出嗅探条时点一下，嗅不到就明说，
+  /// 不让用户找不到入口）。
+  Future<void> _sniffEmbedOnce() async {
+    final wc = _webController;
+    if (wc == null) return;
+    try {
+      final r = await Sniffer.sniff(wc, pageUrl: _current.pageUrl ?? '');
+      if (!mounted || _webController == null) return;
+      setState(() {
+        _embedSniffed = r.items;
+        _embedPageTitle = r.pageTitle;
+        if (r.author.isNotEmpty && _current.author.isEmpty) {
+          _current = _current.copyWith(author: r.author);
+        }
+      });
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(r.items.isEmpty
+              ? '本页没嗅到视频（列表页没有可播的视频，点进视频页再试）'
+              : '嗅到 ${r.items.length} 个视频')));
     } catch (_) {}
   }
 
@@ -456,6 +509,59 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return '这条直链只有 $actual，是带水印的预览，不是正片（列表写 $listed）';
   }
 
+  /// 第 42 条：作者行——头像（有真头像就显示，没有画首字母圆圈）+ 名字 + 关注。
+  /// 点头像/名字进作者页，列他发布的所有视频。
+  Widget _authorRow() {
+    final author = _current.author;
+    final followed = widget.store.followedAuthors.contains(author);
+    return Row(
+      children: [
+        GestureDetector(
+          onTap: () => _openAuthor(author),
+          child: CircleAvatar(
+            radius: 18,
+            backgroundColor: Colors.pinkAccent,
+            backgroundImage: _current.authorAvatar.isNotEmpty
+                ? NetworkImage(_current.authorAvatar)
+                : null,
+            child: _current.authorAvatar.isEmpty
+                ? Text(author.isNotEmpty ? author[0].toUpperCase() : '?',
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
+                : null,
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: GestureDetector(
+            onTap: () => _openAuthor(author),
+            child: Text(author,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold)),
+          ),
+        ),
+        TextButton(
+          onPressed: () async {
+            await widget.store.toggleFollow(author);
+            if (mounted) setState(() {});
+          },
+          style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+          child: Text(followed ? '已关注 ✓' : '+ 关注',
+              style: const TextStyle(color: Colors.pinkAccent, fontSize: 14)),
+        ),
+      ],
+    );
+  }
+
+  void _openAuthor(String author) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => AuthorScreen(author: author, store: widget.store),
+    ));
+  }
+
   /// 备选按钮文案（通用规则）：有广告的站如实说，没广告的直接说官方播放器。
   /// 按钮点开是在 App 里嵌官方播放器，不踢出到外部浏览器。
   String get _fallbackButtonLabel => StreamResolver.sourcePageHasAds(_current.source)
@@ -483,11 +589,21 @@ class _PlayerScreenState extends State<PlayerScreen> {
       await SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     }
-    setState(() => _isFullscreen = !_isFullscreen);
+    if (!mounted) return;
+    setState(() {
+      _isFullscreen = !_isFullscreen;
+      // 第 43+44 条：进全屏控制条先出现、播的时候开始 3 秒计时；出全屏恢复常显。
+      if (_isFullscreen) {
+        _fsControls.poke(isPlaying: _controller?.value.isPlaying ?? false);
+      } else {
+        _fsControls.reset();
+      }
+    });
   }
 
   @override
   void dispose() {
+    _fsControls.dispose();
     _watchdog?.cancel();
     _recordProgress();
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
@@ -499,7 +615,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   Widget build(BuildContext context) {
     final c = _controller;
-    return Scaffold(
+    // 第 43 条：全屏时系统返回先退全屏，不直接退出播放页。
+    return PopScope(
+      canPop: !_isFullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _isFullscreen) _toggleFullscreen();
+      },
+      child: Scaffold(
       backgroundColor: Colors.black,
       appBar: _isFullscreen
           ? null
@@ -537,22 +659,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ),
               ],
             ),
-      body: Column(
-        children: [
-          AspectRatio(
-            aspectRatio: _isFullscreen ? 16 / 9 : 16 / 9,
-            child: Container(
-              color: Colors.black,
-              // 注意：这里不要加 Clip.hardEdge——v3 没加时在这台手机上播得好好的，
-              // v4 加上它之后详情页开始出灰框（灰框真根因见 main.dart 注释：
-              // 视频区 widget 抛错、release 下只剩灰框）。报错区已经收紧到能
-              // 塞进 16:9 框里，不用裁剪兜底。
-              child: _buildVideoArea(c),
+      // 第 43 条：全屏时视频区直接占满屏幕——之前套的 16:9 外框在横屏下
+      // 比屏幕高，底部控制条被裁到屏外（截图里只有大播放键、没有控制条
+      // 就是这么来的），视频本身也被裁成放大裁切的样子。
+      body: _isFullscreen
+          ? _buildVideoArea(c)
+          : Column(
+              children: [
+                AspectRatio(
+                  aspectRatio: 16 / 9,
+                  child: Container(
+                    color: Colors.black,
+                    // 注意：这里不要加 Clip.hardEdge——v3 没加时在这台手机上播得好好的，
+                    // v4 加上它之后详情页开始出灰框（灰框真根因见 main.dart 注释：
+                    // 视频区 widget 抛错、release 下只剩灰框）。报错区已经收紧到能
+                    // 塞进 16:9 框里，不用裁剪兜底。
+                    child: _buildVideoArea(c),
+                  ),
+                ),
+                Expanded(child: _buildInfo()),
+              ],
             ),
-          ),
-          if (!_isFullscreen) Expanded(child: _buildInfo()),
-        ],
-      ),
+    ),
     );
   }
 
@@ -560,7 +688,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // 内嵌官方播放器优先渲染（修死代码 bug：之前 _error 非空就永远走报错分支，
     // WebView 永远渲染不出来，点“在源站看”什么都没发生）。
     if (_webController != null) {
-      return Column(
+      final content = Column(
         children: [
           Expanded(child: WebViewWidget(controller: _webController!)),
           // 第 33 条：提示条改成一行瘦条（原因一行省略 + [重试直链] 小按钮 + ✕），
@@ -587,6 +715,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                         minimumSize: Size.zero,
                         tapTargetSize: MaterialTapTargetSize.shrinkWrap),
                     child: const Text('重试直链', style: TextStyle(fontSize: 12)),
+                  ),
+                  // 第 43 条：官方播放器也要能进/出全屏（之前这条路根本没有全屏键）。
+                  IconButton(
+                    icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white70, size: 18),
+                    tooltip: _isFullscreen ? '退出全屏' : '全屏',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: _toggleFullscreen,
                   ),
                   IconButton(
                     icon: const Icon(Icons.close, color: Colors.white70, size: 18),
@@ -615,6 +751,23 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     label: const Text('官方播放器', style: TextStyle(color: Colors.white54, fontSize: 12)),
                   ),
                   const Spacer(),
+                  // 第 40 条：手动嗅探入口常驻（没出嗅探条时点一下，嗅不到就明说）。
+                  TextButton(
+                    onPressed: _sniffEmbedOnce,
+                    style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                    child: const Text('嗅探', style: TextStyle(fontSize: 12)),
+                  ),
+                  // 第 43 条：官方播放器也要能进/出全屏。
+                  IconButton(
+                    icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white70, size: 18),
+                    tooltip: _isFullscreen ? '退出全屏' : '全屏',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: _toggleFullscreen,
+                  ),
                   TextButton(
                     onPressed: _closeWeb,
                     style: TextButton.styleFrom(
@@ -738,6 +891,26 @@ class _PlayerScreenState extends State<PlayerScreen> {
             ),
         ],
       );
+      // 第 43 条：官方播放器全屏——源站播放器自己可能没有控制条，
+      // 全屏时叠加我们自己的退出键（右上角常显），底下瘦条（重试/嗅探/去浏览器看）就是控制入口。
+      if (!_isFullscreen) return content;
+      return Stack(
+        children: [
+          content,
+          Positioned(
+            top: 8,
+            right: 8,
+            child: Container(
+              decoration: const BoxDecoration(color: Colors.black54, shape: BoxShape.circle),
+              child: IconButton(
+                icon: const Icon(Icons.fullscreen_exit, color: Colors.white),
+                tooltip: '退出全屏',
+                onPressed: _toggleFullscreen,
+              ),
+            ),
+          ),
+        ],
+      );
     }
     if (_loading) {
       return const Center(child: CircularProgressIndicator(color: Colors.pinkAccent));
@@ -810,22 +983,34 @@ class _PlayerScreenState extends State<PlayerScreen> {
         // 控制条是 Stack 的直接子项，钉在 16:9 框底部。
         AspectRatio(aspectRatio: safeAr, child: VideoPlayer(c)),
         GestureDetector(
-          onTap: () => setState(() {
-            if (c.value.isPlaying) {
-              _userPaused = true;
-              c.pause();
-            } else {
-              _userPaused = false;
-              c.play();
-            }
-          }),
+          // 第 43+44 条：点视频区只做暂停/继续 + 唤出控制条（播的时候重新计时 3 秒），
+          // 绝不触发放大/全屏切换。
+          onTap: () {
+            final wasPlaying = c.value.isPlaying;
+            setState(() {
+              if (wasPlaying) {
+                _userPaused = true;
+                c.pause();
+              } else {
+                _userPaused = false;
+                c.play();
+              }
+              _fsControls.poke(isPlaying: !wasPlaying);
+            });
+          },
           child: Container(color: Colors.transparent),
         ),
         if (!c.value.isPlaying)
           const Icon(Icons.play_circle_fill, color: Colors.white70, size: 72),
         Positioned(
           left: 0, right: 0, bottom: 0,
-          child: Container(
+          child: AnimatedOpacity(
+            // 第 44 条：全屏播的时候 3 秒无操作自动藏控制条；竖屏常显。
+            opacity: (!_isFullscreen || _fsControls.visible) ? 1.0 : 0.0,
+            duration: const Duration(milliseconds: 200),
+            child: IgnorePointer(
+              ignoring: _isFullscreen && !_fsControls.visible,
+              child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: const BoxDecoration(
               gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter,
@@ -839,15 +1024,19 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   children: [
                     IconButton(
                       icon: Icon(c.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
-                      onPressed: () => setState(() {
-                        if (c.value.isPlaying) {
-                          _userPaused = true;
-                          c.pause();
-                        } else {
-                          _userPaused = false;
-                          c.play();
-                        }
-                      }),
+                      onPressed: () {
+                        final wasPlaying = c.value.isPlaying;
+                        setState(() {
+                          if (wasPlaying) {
+                            _userPaused = true;
+                            c.pause();
+                          } else {
+                            _userPaused = false;
+                            c.play();
+                          }
+                          _fsControls.poke(isPlaying: !wasPlaying);
+                        });
+                      },
                     ),
                     Text(
                       '${_fmt(c.value.position)} / ${_fmt(c.value.duration)}',
@@ -870,11 +1059,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     _speedButton(),
                     IconButton(
                       icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
+                      tooltip: _isFullscreen ? '退出全屏' : '全屏',
                       onPressed: _toggleFullscreen,
                     ),
                   ],
                 ),
               ],
+            ),
+              ),
             ),
           ),
         ),
@@ -905,7 +1097,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return PopupMenuButton<double>(
       icon: Text('${_speed}x', style: const TextStyle(color: Colors.white, fontSize: 13)),
       onSelected: (v) async {
-        setState(() => _speed = v);
+        setState(() {
+          _speed = v;
+          // 第 44 条：调倍速也是操作，控制条重新计时。
+          _fsControls.poke(isPlaying: _controller?.value.isPlaying ?? false);
+        });
         await _controller?.setPlaybackSpeed(v);
       },
       itemBuilder: (_) => speeds
@@ -924,11 +1120,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
         children: [
           Text(_current.title, style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
+          // 第 42 条：作者行（TikTok 那样：头像 + 名字 + 关注，点头像/名字进作者页）。
+          if (_current.author.isNotEmpty) ...[
+            _authorRow(),
+            const SizedBox(height: 8),
+          ],
           Wrap(
             spacing: 8,
             children: [
               _chip(_current.source),
-              if (_current.author.isNotEmpty) _chip('作者：${_current.author}'),
               if (_current.batch.isNotEmpty) _chip(_current.batch),
               if (_current.resolution.isNotEmpty) _chip(_current.resolution),
               if (_current.durationText.isNotEmpty) _chip('时长 ${_current.durationText}'),

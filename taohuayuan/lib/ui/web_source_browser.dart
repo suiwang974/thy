@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -91,6 +92,9 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           if (mounted) await _sniffVideo();
           // 第 35 条：默认翻译成中文（翻译页加载失败自动回落原文 + toast）。
           if (mounted) await _maybeTranslate();
+          // 第 39 条：翻译页加载完看内容判断（Google 的错误页是 HTTP 200，
+          // 不触发 onWebResourceError，不看内容就回落不了）。
+          if (mounted) await _checkTranslation();
         },
         // 广告拦截第一层（第 26 条）：顶层跳转到广告域名直接不让跳
         // （弹窗/跳转广告就是这么来的）。第一方（当前站自己的域名）
@@ -110,20 +114,11 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           return NavigationDecision.navigate;
         },
         onWebResourceError: (error) {
-          // 翻译页加载失败：自动回落原文（第 35 条），不假装翻译可用。
+          // 翻译页加载失败：按回落链走（Google -> Bing -> 原文，第 39 条），不假装翻译可用。
           if (error.isForMainFrame == true &&
-              Translator.isTranslatedUrl(error.url ?? '')) {
-            final back = _originalUrl.isNotEmpty
-                ? _originalUrl
-                : Translator.originalUrlFromTranslated(error.url!);
-            _lastTranslatedFor = '';
-            _originalUrl = '';
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('翻译加载失败，已切回原文')),
-              );
-            }
-            _controller.loadRequest(Uri.parse(back));
+              (Translator.isTranslatedUrl(error.url ?? '') ||
+                  Translator.isBingTranslatedUrl(error.url ?? ''))) {
+            _fallbackFromTranslated(error.url!);
             return;
           }
           // 主页面加载失败（断网、被拦、证书错）：是 hanime 镜像就自动切另一个。
@@ -206,6 +201,77 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     _lastTranslatedFor = _currentUrl;
     _originalUrl = _currentUrl;
     await _controller.loadRequest(Uri.parse(Translator.toTranslatedUrl(_currentUrl)));
+  }
+
+  /// 第 39 条：翻译页打不开/翻不了时的回落链：Google -> Bing -> 原文。
+  /// onWebResourceError（主框报错）和 _checkTranslation（内容是错误页）都走这里。
+  void _fallbackFromTranslated(String failedUrl) {
+    var back = _originalUrl.isNotEmpty
+        ? _originalUrl
+        : Translator.originalUrlFromTranslated(failedUrl);
+    // Google 翻不了就试 Bing（国内一般能直接打开）；Bing 也不行就回原文。
+    if (Translator.isTranslatedUrl(failedUrl)) {
+      final bing = Translator.toBingTranslatedUrl(back);
+      if (bing != back) {
+        _lastTranslatedFor = back;
+        _controller.loadRequest(Uri.parse(bing));
+        return;
+      }
+    }
+    // 原文地址拿不到（理论上不会发生：_maybeTranslate 一定先记了原文），
+    // 就不乱跳，只提示。
+    if (back.isEmpty ||
+        Translator.isTranslatedUrl(back) ||
+        Translator.isBingTranslatedUrl(back)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('翻译服务不通，已切回原文')),
+        );
+      }
+      return;
+    }
+    _lastTranslatedFor = '';
+    _originalUrl = '';
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('翻译服务不通（Google/Bing 都打不开），已切回原文')),
+      );
+    }
+    _controller.loadRequest(Uri.parse(back));
+  }
+
+  /// 第 39 条：翻译页加载完看内容判断——Google 的 "Can't translate this page"
+  /// 是 HTTP 200 正常页，不触发 onWebResourceError，不看内容就永远回落不了，
+  /// 用户直接看到英文错误页。读不到内容就不判断，别把好页当坏页切走。
+  Future<void> _checkTranslation() async {
+    if (!Translator.isTranslatedUrl(_currentUrl) &&
+        !Translator.isBingTranslatedUrl(_currentUrl)) {
+      return;
+    }
+    String title = '';
+    String body = '';
+    try {
+      final t = await _controller.runJavaScriptReturningResult('document.title');
+      try {
+        final d = jsonDecode(t.toString());
+        if (d is String) title = d;
+      } catch (_) {
+        title = t.toString();
+      }
+      final b = await _controller.runJavaScriptReturningResult(
+        "document.body ? document.body.innerText.slice(0, 500) : ''",
+      );
+      try {
+        final d = jsonDecode(b.toString());
+        if (d is String) body = d;
+      } catch (_) {
+        body = b.toString();
+      }
+    } catch (_) {
+      return;
+    }
+    if (!Translator.isTranslationFailurePage(title, body)) return;
+    _fallbackFromTranslated(_currentUrl);
   }
 
   /// AppBar 翻译按钮：开/关翻译（选择持久保存到 Store）。
@@ -318,6 +384,30 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                 await _controller.reload();
                 await Future.delayed(const Duration(seconds: 2));
                 await _sniffVideo();
+              },
+            ),
+            // 第 40 条：手动嗅探入口常驻（页里有视频却没出嗅探条时点一下；
+            // 嗅不到就明说本页没有，不要让用户找不到功能）。
+            IconButton(
+              icon: const Icon(Icons.radar, color: Colors.white),
+              tooltip: '嗅探本页视频',
+              onPressed: () async {
+                await _sniffVideo();
+                if (!context.mounted) return;
+                if (_sniffed.isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('本页没嗅到视频（列表页没有可播的视频，点进视频页再试）')),
+                  );
+                } else {
+                  SniffSheet.show(
+                    context,
+                    items: _sniffed,
+                    pageTitle: _cleanPageTitle,
+                    sourceId: widget.sourceId,
+                    pageUrl: _currentUrl,
+                    store: widget.store,
+                  );
+                }
               },
             ),
           ],

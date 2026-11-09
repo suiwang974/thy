@@ -3,6 +3,7 @@ import 'dart:async';
 import '../data/search_map.dart';
 import '../data/sources.dart';
 import '../models/video_item.dart';
+import 'web_search.dart';
 
 /// 排序方式。
 enum SortOrder { relevance, newest, mostViewed, longest }
@@ -94,8 +95,6 @@ class SearchFilters {
 /// - 中文词映射走所有搜索路径（searchAll / searchPage / homeFeed 的兜底搜索
 ///   都先过 mapSearchQuery，33a1582 只接一条路导致供应商页搜“足” 0 结果的教训）。
 class SearchService {
-  final List<Source> sources;
-
   /// 单个源最多等 8 秒，超时就跳过，不拖全场。
   static const sourceTimeout = Duration(seconds: 8);
 
@@ -105,13 +104,31 @@ class SearchService {
   static const slowSourceTimeout = Duration(seconds: 15);
   static const _slowSourceIds = {'niacg', 'lianzu11', 'hanime1', 'hanimeone'};
 
+  /// WebView 内搜索的源一次最多等 75 秒：Cloudflare 验证本身就要几秒，
+  /// 三个源排队串行时后两个要等前面的；HTTP 源不受影响，先回来的先显示。
+  /// WebSearchRunner 内部单次约 30 秒超时，75 秒是三源排队的上限。
+  static const webSearchTimeout = Duration(seconds: 75);
+
+  Duration _timeoutFor(Source s) {
+    if (s.webViewOnly && webSearch != null) return webSearchTimeout;
+    return _slowSourceIds.contains(s.id) ? slowSourceTimeout : sourceTimeout;
+  }
+
+  /// 第 41 条：WebView 内搜索的入口（搜索页/作者页挂一个隐藏 WebView 传进来）。
+  /// 设了它，webViewOnly 的源（niacg、lianzu11、hanime）就参与搜索/翻页，
+  /// 和普通源一样进结果列表；没设时保持老行为（只走内置浏览器按钮）。
+  /// 注意：hanime1/hanimeone 是同一站两个镜像，只搜首选的 hanimeone.me
+  /// （WebSearchRunner 内部过不了验证时自动切另一个镜像），不搜两份重结果。
+  WebSearchHandler? webSearch;
+
+  /// 参与 WebView 搜索的源：构造时传进来的 webViewOnly 源，hanime 只留首选镜像。
+  List<Source> get webSearchSources =>
+      _baseSources.where((s) => s.webViewOnly && s.id != 'hanime1').toList();
+
   /// 慢源后台最多再试次数（不含第一次）：第 1 次失败后 2 秒试第 2 次，
   /// 再失败 8 秒后试第 3 次；3 次都失败才算死，通过 onRetryFailed 告诉界面。
   static const maxRetries = 2;
   static const _retryDelays = [Duration(seconds: 2), Duration(seconds: 8)];
-
-  Duration _timeoutFor(Source s) =>
-      _slowSourceIds.contains(s.id) ? slowSourceTimeout : sourceTimeout;
 
   /// 最近一次搜索/热门流里每个源花了多少毫秒（源 id -> 毫秒）。
   final Map<String, int> lastLatencies = {};
@@ -122,16 +139,41 @@ class SearchService {
   /// 现在服务层强制生效：推荐、短视频、搜索、追番、作者页全走这一道。
   final Set<String> disabledSources;
 
-  /// HTTP 能查的源（已启用、且不是 webViewOnly）。
+  /// 构造时传进来的源（只按开关过滤，不过 webViewOnly；`sources` 再按
+  /// webSearch 有没有决定要不要把 webViewOnly 的源算进来——字段初始化时
+  /// runner 还没挂上，`sources` 必须是 getter 才能晚点再算，第 41 条）。
+  final List<Source> _baseSources;
+
+  /// 能参与搜索的源：没设 webSearch 时只有 HTTP 源（webViewOnly 的源会被 WAF
+  /// 拦，搜了也是误导人的“0 条”）；设了 webSearch，webViewOnly 的源也进来
+  /// 走 WebView 搜索。hanime 两个镜像只留首选的 hanimeone.me（另一个由
+  /// WebSearchRunner 内部当备选），不搜两份重结果。
+  List<Source> get sources {
+    final http = _baseSources.where((s) => !s.webViewOnly).toList();
+    if (webSearch == null) return http;
+    return [...http, ...webSearchSources];
+  }
+
+  /// HTTP 能查的源（已启用、且不是 webViewOnly；webSearch 设了时，
+  /// webViewOnly 的源也留下来走 WebView 搜索——第 41 条）。
   /// webViewOnly 的源（niacg、lianzu11、hanime1、hanimeone）会被 WAF/
   /// Cloudflare 按 TLS 指纹拦，纯 HTTP 请求永远拿不到真结果，只会产出
-  /// 误导人的“0 条”——所以 HTTP 搜索/热门根本不查它们（2026-11-09 定），
-  /// 它们只走内置浏览器（见 webSources）。
-  SearchService({List<Source>? sources, Set<String> disabledSources = const {}})
+  /// 误导人的“0 条”——所以没设 webSearch 时 HTTP 搜索/热门根本不查它们
+  /// （2026-11-09 定），它们只走内置浏览器（见 webSources）。
+  SearchService({List<Source>? sources, Set<String> disabledSources = const {}, this.webSearch})
       : disabledSources = disabledSources,
-        sources = (sources ?? allSources())
-            .where((s) => !disabledSources.contains(s.id) && !s.webViewOnly)
+        _baseSources = (sources ?? allSources())
+            .where((s) => !disabledSources.contains(s.id))
             .toList();
+
+  /// 单个源怎么查（第 41 条）：webViewOnly 的源走 WebView 搜索，
+  /// 其他源走原来的 HTTP 搜索/翻页。
+  Future<SourceResult> _searchSource(Source s, String query, {int page = 1}) {
+    if (s.webViewOnly && webSearch != null) {
+      return webSearch!.search(s, query, page: page);
+    }
+    return page <= 1 ? s.search(query) : s.searchPage(query, page);
+  }
 
   /// 需要走内置浏览器的源（已启用、webViewOnly）：搜索页给它们放按钮，
   /// 不参与 HTTP 搜索，不在状态条里报“0 条”。
@@ -161,7 +203,7 @@ class SearchService {
       final sw = Stopwatch()..start();
       SourceResult r;
       try {
-        r = await s.search(query).timeout(_timeoutFor(s));
+        r = await _searchSource(s, query).timeout(_timeoutFor(s));
       } on TimeoutException {
         r = SourceResult(
             sourceId: s.id,
@@ -195,7 +237,7 @@ class SearchService {
       await Future.delayed(_retryDelays[attempt]);
       try {
         final sw = Stopwatch()..start();
-        final r = await s.search(query).timeout(_timeoutFor(s));
+        final r = await _searchSource(s, query).timeout(_timeoutFor(s));
         sw.stop();
         lastLatencies[s.id] = sw.elapsedMilliseconds;
         if (r.items.isEmpty && r.error == null) {
@@ -238,7 +280,7 @@ class SearchService {
     final active = _activeSources(filters);
     final results = await Future.wait(active.map((s) async {
       try {
-        return await s.searchPage(query, page).timeout(_timeoutFor(s));
+        return await _searchSource(s, query, page: page).timeout(_timeoutFor(s));
       } catch (_) {
         return SourceResult(sourceId: s.id, sourceName: s.name);
       }
@@ -298,7 +340,10 @@ class SearchService {
   }) async {
     final items = <VideoItem>[];
     final failed = <Source>[];
-    await Future.wait(sources.map((s) async {
+    // 第 41 条：热门流只走 HTTP 源——webViewOnly 的源没有 WebView 搜索入口
+    // （homeFeed 不挂隐藏 WebView），HTTP 搜它们只会产误导人的“0 条”。
+    final httpSources = sources.where((s) => !s.webViewOnly).toList();
+    await Future.wait(httpSources.map((s) async {
       final sw = Stopwatch()..start();
       SourceResult r;
       try {

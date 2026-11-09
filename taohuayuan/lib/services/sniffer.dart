@@ -82,7 +82,11 @@ class SniffedMedia {
 class SniffResult {
   final List<SniffedMedia> items;
   final String pageTitle;
-  const SniffResult(this.items, this.pageTitle);
+  /// 第 42 条：页面里的发布者（JSON-LD author、uploader 链接等，JS 里抠的；
+  /// 拿不到就是 ''——eponner/lianzu11/hanime 这类 HTTP 拿不到作者的源，
+  /// 在内置浏览器/官方播放器里打开视频页时靠它补上）。
+  final String author;
+  const SniffResult(this.items, this.pageTitle, [this.author = '']);
 }
 
 class Sniffer {
@@ -109,6 +113,7 @@ class Sniffer {
     required String pageUrl,
   }) async {
     var title = '';
+    var pageAuthor = '';
     var candidates = <String>[];
     var domDurations = <String, double>{};
     try {
@@ -125,10 +130,21 @@ class Sniffer {
         "out.resources.push(u);});}catch(e){}"
         "var h=document.documentElement?document.documentElement.outerHTML:'';"
         "out.html=h.slice(0,400000);"
+        "try{var author='';"
+        "var lds=document.querySelectorAll('script[type=\"application/ld+json\"]');"
+        "for(var i=0;i<lds.length&&!author;i++){try{var j=JSON.parse(lds[i].textContent);"
+        "var a=j.author||(j['@graph']&&j['@graph'][0]&&j['@graph'][0].author);"
+        "if(a)author=(typeof a==='string'?a:(a.name||''));}catch(e){}}"
+        "if(!author){var u=document.querySelector('[data-label=\"thumb_username\"]');if(u)author=u.textContent.trim();}"
+        "if(!author){var t=document.querySelector('.uploader-tag .name');if(t)author=t.textContent.replace(/[0-9.,kKmM\\s]+\$/,'').trim();}"
+        "if(!author){var r=document.querySelector('a[rel=\"author\"]');if(r)author=r.textContent.trim();}"
+        "if(!author){var e=document.querySelector('.entry-author a,.posted-by a,.author-name');if(e)author=e.textContent.trim();}"
+        "if(author)out.author=author;}catch(e){}"
         "return JSON.stringify(out);})()",
       );
       final decoded = jsonDecode(raw.toString()) as Map<String, dynamic>;
       title = (decoded['title'] ?? '').toString();
+      pageAuthor = (decoded['author'] ?? '').toString().trim();
       final videos = (decoded['videos'] as List?) ?? [];
       for (final v in videos) {
         final m = v as Map<String, dynamic>;
@@ -152,7 +168,7 @@ class Sniffer {
       domDurations: domDurations,
       pageUrl: pageUrl,
     );
-    return SniffResult(items, title);
+    return SniffResult(items, title, pageAuthor);
   }
 
   /// 页面 HTML 内正则扫媒体地址（绝对 + 相对地址都认）。

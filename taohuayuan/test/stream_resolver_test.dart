@@ -321,4 +321,53 @@ setVideoUrlLow('https://xh2-cdn.example.com/video_360p.mp4')
     expect(raw, endsWith('}]'));
     expect(StreamResolver.extractJsonArray(html, '"missing"'), isNull);
   });
+
+  test('第 37 条：预览判定——15 分钟的实际不可能是预览（列表时长写错了）', () {
+    // 用户真机案例：列表 320:18（19218 秒）、真实 15:41（941 秒）——正片不是预览。
+    expect(StreamResolver.isPreviewDuration(listedSec: 19218, actualSec: 941), isFalse);
+    // 列表 60 分钟、真实 4 分钟是预览（真实短）。
+    expect(StreamResolver.isPreviewDuration(listedSec: 3600, actualSec: 240), isTrue);
+    // 列表 60 分钟、真实 6 分钟不是预览（超过 5 分钟上限，按列表错处理）。
+    expect(StreamResolver.isPreviewDuration(listedSec: 3600, actualSec: 360), isFalse);
+  });
+
+  test('第 42 条：视频页作者解析——pornhub/xvideos/r34/niacg/xhamster', () {
+    expect(
+      StreamResolver.parseVideoAuthor(
+        '{"username":"Pink Pussy Creampie","viewkey":"6acf472d64e8e"}',
+        'pornhub',
+      ).author,
+      'Pink Pussy Creampie',
+    );
+    expect(
+      StreamResolver.parseVideoAuthor(
+        '<a href="/darcy-dark-1" class="btn uploader-tag hover-name"><span class="name">DarcyDark <span>58k</span></span></a>',
+        'xvideos',
+      ).author,
+      'DarcyDark',
+    );
+    expect(
+      StreamResolver.parseVideoAuthor(
+        '{"@type":"VideoObject","author": "LazyProcrastinator"}',
+        'rule34videos',
+      ).author,
+      'LazyProcrastinator',
+    );
+    expect(
+      StreamResolver.parseVideoAuthor(
+        '<title>[AlphaG] Capture Yixuan + Naked [中文字幕]</title>',
+        'niacg',
+      ).author,
+      'AlphaG',
+    );
+    final xh = StreamResolver.parseVideoAuthor(
+      '{"author":{"id":58272582,"pageUrl":"https://xhamster.com/users/privatfeet20","isRetired":false,"isVerified":false,"name":"PrivatFeet20","thumbUrl":"https://ic-ut-nss.xhcdn.com/a/thumb.jpg"}}',
+      'xhamster',
+    );
+    expect(xh.author, 'PrivatFeet20');
+    expect(xh.authorAvatar, 'https://ic-ut-nss.xhcdn.com/a/thumb.jpg');
+    // 没抠到返回空，不编一个。
+    expect(StreamResolver.parseVideoAuthor('<html></html>', 'spankbang').author, '');
+    expect(StreamResolver.parseVideoAuthor('<html></html>', 'eporner').author, '');
+  });
 }

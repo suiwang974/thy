@@ -200,6 +200,30 @@ void main() {
       }
     });
   });
+
+  test('第 38 条：下载失败写人话，不甩原始堆栈', () {
+    expect(
+      DownloadManager.humanDownloadError(
+        'HandshakeException: Handshake error in client (OS Error: CERTIFICATE_VERIFY_FAILED: Hostname mismatch(handshake.cc:320))',
+      ),
+      contains('证书验证失败'),
+    );
+    expect(
+      DownloadManager.humanDownloadError('SocketException: Failed host lookup'),
+      contains('网络连不上'),
+    );
+    expect(
+      DownloadManager.humanDownloadError('HTTP 403 Forbidden'),
+      contains('403'),
+    );
+    // 原始堆栈里的文件名行号不许出现在给用户看的文案里。
+    expect(
+      DownloadManager.humanDownloadError(
+        'HandshakeException: Handshake error in client (OS Error: CERTIFICATE_VERIFY_FAILED: Hostname mismatch(handshake.cc:320))',
+      ),
+      isNot(contains('handshake.cc')),
+    );
+  });
 }
 
 void _serveFile(HttpRequest req, Uint8List bytes, {required bool supportRange}) {

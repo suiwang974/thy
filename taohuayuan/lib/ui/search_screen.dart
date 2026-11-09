@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
 import '../data/search_map.dart';
 import '../data/sources.dart';
 import '../models/video_item.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
+import '../services/web_search.dart';
 import 'player_screen.dart';
 import 'web_source_browser.dart';
 import 'widgets.dart';
@@ -56,9 +58,18 @@ class _SearchScreenState extends State<SearchScreen> {
 
   SearchFilters _filters = const SearchFilters();
 
+  // 第 41 条：WebView 内搜索用的隐藏 WebView（1x1 藏在页里，不占地方）：
+  // niacg/lianzu11/hanime 的纯 HTTP 请求会被 WAF/Cloudflare 拦，
+  // 只有真浏览器指纹能过验证，所以搜索页挂一个隐藏 WebView 替它们搜。
+  late final WebViewController _webController;
+  late final WebSearchRunner _webRunner;
+
   @override
   void initState() {
     super.initState();
+    _webController = WebViewController();
+    _webRunner = WebSearchRunner(_webController);
+    _service.webSearch = _webRunner;
     if (widget.initialQuery != null && widget.initialQuery!.isNotEmpty) {
       _controller.text = widget.initialQuery!;
       _doSearch(widget.initialQuery!);
@@ -139,7 +150,10 @@ class _SearchScreenState extends State<SearchScreen> {
     }
     final enabled = _enabledSources;
     final svc = SearchService(
-        sources: enabled.where((s) => _filters.sourceIds.isEmpty || _filters.sourceIds.contains(s.id)).toList());
+        sources: enabled.where((s) => _filters.sourceIds.isEmpty || _filters.sourceIds.contains(s.id)).toList(),
+        // 第 41 条：每轮搜索都带上 WebView 搜索入口，否则 niacg/lianzu11/hanime
+        // 又会被构造器当成纯 HTTP 源滤掉。
+        webSearch: _webRunner);
     // 先把要查的源都标成“还在搜”，回来的源再逐个改状态。
     final queried = svc.sources;
     setState(() {
@@ -292,6 +306,17 @@ class _SearchScreenState extends State<SearchScreen> {
       ),
       body: CustomScrollView(
         slivers: [
+          // 第 41 条：WebView 内搜索用的隐藏 WebView（1x1 藏着，不占地方不挡手）。
+          SliverToBoxAdapter(
+            child: Offstage(
+              offstage: true,
+              child: SizedBox(
+                width: 1,
+                height: 1,
+                child: WebViewWidget(controller: _webController),
+              ),
+            ),
+          ),
           SliverToBoxAdapter(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
@@ -368,8 +393,8 @@ class _SearchScreenState extends State<SearchScreen> {
               ],
             ),
           ),
-          // 要过验证的源走内置浏览器（App 里直接搜不到），只占一行小按钮，
-          // 不再是两个大按钮 + 一堆状态占满屏（第 11 条）。
+          // 第 41 条：这三个源现在也一起搜（隐藏 WebView 过验证），结果直接进列表；
+          // 下面这排按钮是“直接逛站”的入口，不是搜不到的替代品。
           if (webSources.isNotEmpty)
             SliverToBoxAdapter(
               child: Padding(
@@ -377,7 +402,7 @@ class _SearchScreenState extends State<SearchScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('要过验证的源走内置浏览器（App 里直接搜不到）：',
+                    const Text('上面三个源也会一起搜；想直接逛站就点这里：',
                         style: TextStyle(color: Colors.white54, fontSize: 12)),
                     const SizedBox(height: 6),
                     Wrap(
@@ -387,15 +412,11 @@ class _SearchScreenState extends State<SearchScreen> {
                         if (hasHanime)
                           OutlinedButton(
                             onPressed: _openHanime,
-                            child: Text(_lastQuery == null || _lastQuery!.isEmpty
-                                ? '打开 Hanime（成人动漫）'
-                                : '去 Hanime 搜「$_lastQuery」'),
+                            child: const Text('打开 Hanime 浏览'),
                           ),
                         ...otherWeb.map((s) => OutlinedButton(
                               onPressed: () => _openWebSource(s),
-                              child: Text(_lastQuery == null || _lastQuery!.isEmpty
-                                  ? '打开 ${s.name}'
-                                  : '去 ${s.name} 搜「$_lastQuery」'),
+                              child: Text('打开 ${s.name} 浏览'),
                             )),
                       ],
                     ),

@@ -108,15 +108,124 @@ class StreamResolver {
     return j == null ? null : int.tryParse(j.group(1)!);
   }
 
+  /// 第 42 条：视频页 HTML -> 发布者/上传者/频道名（+头像，有才填）。
+  /// 每个源的字段不一样，逐源抠（2026-11-09 VM 实测过真页的才写死）：
+  /// - pornhub：视频页 JSON 里 `"username":"..."`（全页唯一，和 viewkey 同一块 JSON）。
+  /// - xvideos：`uploader-tag` 链接里的名字（去掉后面的粉丝数）。
+  /// - xhamster：视频页 JSON 里 `"author":{"name":"...","thumbUrl":"..."}`。
+  /// - rule34videos：JSON-LD `"author": "..."`。
+  /// - niacg：`<title>` 里的 [作者] 前缀（站内标题都这么写）。
+  /// - spankbang / lianzu11 / hanime：通用兜底（JSON-LD author、rel=author、
+  ///   uploader/channel 链接）——VM 下没见过真页，抠不到返回 ''，不编一个。
+  /// - eporner：API、embed 页、xhr 里都没有作者字段，视频页又有年龄验证墙，
+  ///   HTTP 这条路拿不到作者（见 parseVideoAuthor 的注释）；作者只能等用户在
+  ///   内置浏览器/官方播放器里打开视频页时由 Sniffer 从 DOM 里补。
+  static ({String author, String authorAvatar}) parseVideoAuthor(String html, String source) {
+    String clean(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (source == 'pornhub') {
+      final m = RegExp(r'"username"\s*:\s*"([^"]+)"').firstMatch(html);
+      if (m != null) {
+        return (author: clean(m.group(1)!), authorAvatar: '');
+      }
+    }
+    if (source == 'xvideos') {
+      final m = RegExp(
+        r'''<a[^>]+class="[^"]*uploader-tag[^"]*"[^>]*>(.*?)</a>''',
+        dotAll: true,
+      ).firstMatch(html);
+      if (m != null) {
+        var name = clean(m.group(1)!.replaceAll(RegExp(r'<[^>]+>'), ' '));
+        // 名字后面跟的粉丝数（"DarcyDark 58k"）去掉；名字本身带数字的不动
+        // （只去尾部纯数字 token）。
+        final parts = name.split(' ').where((w) => w.isNotEmpty).toList();
+        while (parts.isNotEmpty && RegExp(r'^[\d.,]+[kKmM]?$').hasMatch(parts.last)) {
+          parts.removeLast();
+        }
+        name = parts.join(' ');
+        if (name.isNotEmpty) {
+          return (author: name, authorAvatar: '');
+        }
+      }
+    }
+    if (source == 'xhamster') {
+      final obj = RegExp(r'"author":\{[^}]{0,500}\}').firstMatch(html);
+      if (obj != null) {
+        final body = obj.group(0)!;
+        final name = RegExp(r'"name"\s*:\s*"([^"]+)"').firstMatch(body)?.group(1);
+        final thumb = RegExp(r'"thumbUrl"\s*:\s*"([^"]+)"').firstMatch(body)?.group(1);
+        if (name != null && name.isNotEmpty) {
+          return (
+            author: clean(name),
+            authorAvatar: (thumb ?? '').replaceAll(r'\/', '/'),
+          );
+        }
+      }
+    }
+    if (source == 'rule34videos') {
+      final m = RegExp(r'"author"\s*:\s*"([^"]+)"').firstMatch(html);
+      if (m != null) {
+        return (author: clean(m.group(1)!), authorAvatar: '');
+      }
+    }
+    if (source == 'niacg') {
+      final title = RegExp(r'<title>([^<]+)</title>').firstMatch(html)?.group(1) ?? '';
+      final a = _niacgAuthorFromTitle(title);
+      if (a.isNotEmpty) {
+        return (author: a, authorAvatar: '');
+      }
+    }
+    // 通用兜底：JSON-LD author（对象或字符串）、rel=author、WP 作者链接。
+    final ld = RegExp(r'"author"\s*:\s*\{\s*"@type"[^}]{0,200}?"name"\s*:\s*"([^"]+)"')
+            .firstMatch(html)
+            ?.group(1) ??
+        RegExp(r'"author"\s*:\s*"([^"]+)"').firstMatch(html)?.group(1);
+    if (ld != null && ld.isNotEmpty) {
+      return (author: clean(ld), authorAvatar: '');
+    }
+    final rel = RegExp(r'''<a[^>]+rel="author"[^>]*>([^<]+)</a>''').firstMatch(html)?.group(1);
+    if (rel != null && rel.trim().isNotEmpty) {
+      return (author: clean(rel), authorAvatar: '');
+    }
+    final wp = RegExp(
+      r'''<[^>]+class="[^"]*(?:author-name|entry-author)[^"]*"[^>]*>([^<]+)<''',
+    ).firstMatch(html)?.group(1);
+    if (wp != null && wp.trim().isNotEmpty) {
+      return (author: clean(wp), authorAvatar: '');
+    }
+    return (author: '', authorAvatar: '');
+  }
+
+  /// niacg 标题里的 [作者] 前缀（和 sources.dart 里的 _niacgAuthorFromTitle 同一套规则，
+  /// 这里单抄一份：stream_resolver 不 import sources，避免循环依赖）。
+  static String _niacgAuthorFromTitle(String title) {
+    final m = RegExp(r'^\[([^\]]+)\]').firstMatch(title.trim());
+    if (m == null) return '';
+    final a = m.group(1)!.trim();
+    if (RegExp(r'^(中文字幕|字幕|中文|4K|1080p|720p|无码|有码)$').hasMatch(a)) return '';
+    return a;
+  }
+
   /// 从详情页 HTML 里补封面/时长（只补缺的：没封面才补封面、没时长才补时长）。
+  /// 第 42 条：顺带补作者（视频页找发布者；搜索时没抠到的这里补上）。
   static void _enrichFromDetail(VideoItem item, String html) {
     final poster = item.poster.isEmpty ? parseOgImage(html) : null;
     final duration = item.durationSec <= 0 ? parseOgDuration(html) : null;
-    if (poster == null && duration == null) return;
-    if (_enriched.length > 100) _enriched.clear();
+    final author = item.author.isEmpty ? parseVideoAuthor(html, item.source) : null;
+    if (poster == null &&
+        duration == null &&
+        (author == null || author.author.isEmpty)) {
+      return;
+    }
+    if (_enriched.length > 100) {
+      _enriched.clear();
+    }
     _enriched[item.id] = item.copyWith(
       poster: poster ?? item.poster,
       durationSec: duration ?? item.durationSec,
+      author: (author != null && author.author.isNotEmpty) ? author.author : item.author,
+      authorAvatar: (author != null && author.authorAvatar.isNotEmpty)
+          ? author.authorAvatar
+          : item.authorAvatar,
     );
   }
 
@@ -389,10 +498,13 @@ class StreamResolver {
   }
 
   /// 预览判定（供单元测试直接验，也供播放页用播放器真实时长核对时复用）：
-  /// 列表时长已知、真实时长已知、真实不到列表一半 -> 是预览。
-  /// 比如列表 10 分钟、直链只有 1 分钟，就是 Eporner 那种带水印预览。
+  /// 列表时长已知、真实时长已知、真实不到列表一半、且真实本身很短
+  /// （<= 5 分钟）-> 是预览。比如列表 10 分钟、直链只有 1 分钟，
+  /// 就是 Eporner 那种带水印预览。
+  /// 第 37 条：15 分钟的“实际”不可能是预览——那是列表时长写错了
+  /// （把图片尺寸 320:180 当成 320:18），不能因为列表错就把正片当预览。
   static bool isPreviewDuration({required int listedSec, required int actualSec}) {
-    return listedSec > 0 && actualSec > 0 && actualSec * 2 < listedSec;
+    return listedSec > 0 && actualSec > 0 && actualSec <= 300 && actualSec * 2 < listedSec;
   }
 
   /// 供单元测试直接验：媒体播放列表正文 -> 总时长（秒，相加 #EXTINF）。

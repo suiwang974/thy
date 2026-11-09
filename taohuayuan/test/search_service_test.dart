@@ -2,8 +2,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:taohuayuan/data/sources.dart';
 import 'package:taohuayuan/models/video_item.dart';
 import 'package:taohuayuan/services/search_service.dart';
+import 'package:taohuayuan/services/web_search.dart';
 
-class FakeSource implements Source {
+class FakeSource extends Source {
   final String _id;
   final Duration delay;
   final List<VideoItem> items;
@@ -44,6 +45,20 @@ class FakeSource implements Source {
 
 VideoItem v(String id, {String title = '', List<String> keywords = const [], int durationSec = 0}) =>
     VideoItem(id: id, title: title, source: 'fake', keywords: keywords, durationSec: durationSec);
+
+
+/// 第 41 条的假 WebView 搜索：按源 id 返回配好的条目，记下透传的页码。
+class FakeWebSearch implements WebSearchHandler {
+  final Map<String, List<VideoItem>> bySource;
+  final List<int> pagesSeen = [];
+  FakeWebSearch(this.bySource);
+
+  @override
+  Future<SourceResult> search(Source source, String query, {int page = 1}) async {
+    pagesSeen.add(page);
+    return SourceResult(sourceId: source.id, sourceName: source.name, items: bySource[source.id] ?? []);
+  }
+}
 
 void main() {
   test('单源 8 秒超时跳过，不拖全场：慢源报超时，快源正常出结果', () async {
@@ -254,10 +269,61 @@ void main() {
     expect(raw, 4);
     expect(merged.length, 3);
   });
+  test('第 41 条：设了 webSearch，webViewOnly 的源参与搜索；没设时不参与', () async {
+    final web = FakeWebSearch({
+      'niacg': [v('n1', title: 'foot')],
+      'lianzu11': [v('l1', title: 'foot')],
+    });
+    final svc = SearchService(
+      sources: [
+        FakeSource('http-ok', items: [v('a', title: 'foot')]),
+        NiacgSource(),
+        Lianzu11Source(),
+      ],
+      webSearch: web,
+    );
+    expect(svc.sources.map((s) => s.id), ['http-ok', 'niacg', 'lianzu11']);
+    final results = await svc.searchAll('foot');
+    final ids = results.expand((r) => r.items).map((i) => i.id).toSet();
+    expect(ids, {'a', 'n1', 'l1'});
+    // 没设 webSearch 时 webViewOnly 的源不参与搜索。
+    final svc2 = SearchService(sources: [
+      FakeSource('http-ok', items: [v('a', title: 'foot')]),
+      NiacgSource(),
+      Lianzu11Source(),
+    ]);
+    expect(svc2.sources.map((s) => s.id), ['http-ok']);
+  }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('第 41 条：hanime 两个镜像只搜首选的 hanimeone', () async {
+    final web = FakeWebSearch({'hanimeone': [v('h1', title: 'foot')]});
+    final svc = SearchService(
+      sources: [
+        FakeSource('http-ok', items: [v('a', title: 'foot')]),
+        HanimeSource('hanime1.me'),
+        HanimeSource('hanimeone.me'),
+      ],
+      webSearch: web,
+    );
+    expect(svc.sources.map((s) => s.id), ['http-ok', 'hanimeone']);
+    expect(svc.webSearchSources.map((s) => s.id), ['hanimeone']);
+    final results = await svc.searchAll('foot');
+    expect(results.map((r) => r.sourceId), isNot(contains('hanime1')));
+    expect(results.expand((r) => r.items).map((i) => i.id), contains('h1'));
+  }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('第 41 条：web 源翻页走 WebSearchHandler，页码透传', () async {
+    final web = FakeWebSearch({'niacg': [v('n2', title: 'foot')]});
+    final svc = SearchService(sources: [NiacgSource()], webSearch: web);
+    final items = await svc.searchPage('foot', 2);
+    expect(web.pagesSeen, [2]);
+    expect(items.map((i) => i.id), ['n2']);
+  }, timeout: const Timeout(Duration(seconds: 30)));
+
 }
 
 /// 按词/页返回不同条目的假源：验 homeFeed 轮换是不是真换了批。
-class QueryFakeSource implements Source {
+class QueryFakeSource extends Source {
   final String _id;
   const QueryFakeSource(this._id);
 
@@ -289,7 +355,7 @@ class QueryFakeSource implements Source {
 }
 
 /// 第一次调用超时（拖 9 秒），之后每次都立刻成功：模拟“慢的源后台再试成功”。
-class FlakySource implements Source {
+class FlakySource extends Source {
   final String _id;
   final List<VideoItem> items;
   var _calls = 0;
@@ -326,4 +392,5 @@ class FlakySource implements Source {
 
   @override
   Future<SourceResult> home({int page = 1}) async => search('');
+
 }

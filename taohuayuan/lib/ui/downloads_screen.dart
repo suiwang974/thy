@@ -131,16 +131,27 @@ class DownloadsScreen extends StatelessWidget {
             ),
             if (t.status == DownloadStatus.error) ...[
               const SizedBox(height: 8),
-              OutlinedButton(
-                onPressed: () async {
-                  await manager.cancelTask(t.id);
-                  if (context.mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('已删掉失败的任务，重新点下载图标再下')),
-                    );
-                  }
-                },
-                child: const Text('删掉这条'),
+              Row(
+                children: [
+                  // 第 38 条：失败了能重试（先重新解析直链再下，签名过期/换 CDN 节点
+                  // 都能顺带修掉；已下完的部分接着续传，不用从头下）。
+                  OutlinedButton(
+                    onPressed: () => manager.retryTask(t.id),
+                    child: const Text('重试'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () async {
+                      await manager.cancelTask(t.id);
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('已删掉失败的任务，重新点下载图标再下')),
+                        );
+                      }
+                    },
+                    child: const Text('删掉这条'),
+                  ),
+                ],
               ),
             ],
           ],

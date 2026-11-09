@@ -7,9 +7,11 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_item.dart';
 import '../services/adblock_service.dart';
+import '../services/fullscreen_controls.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
+import 'author_screen.dart';
 import 'download_button.dart';
 
 /// 短视频页：竖屏上下滑，滑到哪段就真播哪段的视频（不是只放封面图）。
@@ -257,16 +259,19 @@ class _ShortPageState extends State<_ShortPage> {
       if (!mounted) return;
       // mp4 靠播放器初始化后的真实时长再核一次：是预览就不播。
       // 时长用补全后的条目（详情页预探时可能补了真实时长）。
+      // 第 37 条：先纠正离谱的列表时长（比如把图片尺寸当成时长），再判预览——
+      // 15 分钟的正片不能因为列表写错就被当成预览切走。
       final actualSec = c.value.duration.inSeconds;
-      if (StreamResolver.isPreviewDuration(listedSec: _displayItem.durationSec, actualSec: actualSec)) {
+      var listedSec = _displayItem.durationSec;
+      if (actualSec > 0 && listedSec > 0 && (listedSec > actualSec * 4 || actualSec > listedSec * 4)) {
+        listedSec = actualSec;
+        _displayItem = _displayItem.copyWith(durationSec: actualSec);
+      }
+      if (StreamResolver.isPreviewDuration(listedSec: listedSec, actualSec: actualSec)) {
         await c.dispose();
         if (!mounted) return;
         _embedOfficial('这段直链只有预览，用官方播放器看');
         return;
-      }
-      if (actualSec > 0 && _displayItem.durationSec > 0 && actualSec > _displayItem.durationSec * 2) {
-        // 真实时长比列表时长长一倍以上：列表写错了，显示改成真实时长。
-        _displayItem = _displayItem.copyWith(durationSec: actualSec);
       }
       setState(() {
         _controller = c;
@@ -431,6 +436,51 @@ class _ShortPageState extends State<_ShortPage> {
     );
     await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  }
+
+  void _openAuthor(String author) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => AuthorScreen(author: author, store: widget.store),
+    ));
+  }
+
+  /// 第 42 条：右侧栏作者头像 + 关注（TikTok 那样）；点头像进作者页。
+  Widget _authorAvatarButton() {
+    final author = _displayItem.author;
+    final followed = widget.store.followedAuthors.contains(author);
+    return Column(
+      children: [
+        GestureDetector(
+          onTap: () => _openAuthor(author),
+          child: CircleAvatar(
+            radius: 22,
+            backgroundColor: Colors.pinkAccent,
+            backgroundImage: _displayItem.authorAvatar.isNotEmpty
+                ? NetworkImage(_displayItem.authorAvatar)
+                : null,
+            child: _displayItem.authorAvatar.isEmpty
+                ? Text(author.isNotEmpty ? author[0].toUpperCase() : '?',
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
+                : null,
+          ),
+        ),
+        const SizedBox(height: 4),
+        GestureDetector(
+          onTap: () async {
+            await widget.store.toggleFollow(author);
+            if (mounted) setState(() {});
+          },
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+                color: followed ? Colors.white24 : Colors.pinkAccent,
+                borderRadius: BorderRadius.circular(999)),
+            child: Text(followed ? '已关注' : '+ 关注',
+                style: const TextStyle(color: Colors.white, fontSize: 11)),
+          ),
+        ),
+      ],
+    );
   }
 
   @override
@@ -603,8 +653,16 @@ class _ShortPageState extends State<_ShortPage> {
                 Text(_displayItem.title, maxLines: 2, overflow: TextOverflow.ellipsis,
                     style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 6),
-                Text('${_displayItem.author.isEmpty ? _displayItem.source : '👤 ${_displayItem.author}'}${_displayItem.durationText.isEmpty ? '' : ' · ${_displayItem.durationText}'}',
-                    style: const TextStyle(color: Colors.white70, fontSize: 13)),
+                // 第 42 条：作者名可点（进作者页）；没作者时显示来源名。
+                GestureDetector(
+                  onTap: _displayItem.author.isEmpty ? null : () => _openAuthor(_displayItem.author),
+                  child: Text(
+                      '${_displayItem.author.isEmpty ? _displayItem.source : '👤 ${_displayItem.author}'}${_displayItem.durationText.isEmpty ? '' : ' · ${_displayItem.durationText}'}',
+                      style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                          decoration: _displayItem.author.isEmpty ? null : TextDecoration.underline)),
+                ),
                 Text('第 ${widget.index + 1} / ${widget.total} 段', style: const TextStyle(color: Colors.white54, fontSize: 12)),
               ],
             ),
@@ -613,6 +671,11 @@ class _ShortPageState extends State<_ShortPage> {
             right: 12, bottom: 76,
             child: Column(
               children: [
+                // 第 42 条：作者头像 + 关注，放在点赞上面。
+                if (_displayItem.author.isNotEmpty) ...[
+                  _authorAvatarButton(),
+                  const SizedBox(height: 8),
+                ],
                 IconButton(
                   icon: Icon(_liked ? Icons.favorite : Icons.favorite_border,
                       color: _liked ? Colors.red : Colors.white, size: 30),
@@ -681,16 +744,23 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
   VideoPlayerController? _c;
   double _speed = 1.0;
   String? _label;
+  // 第 44 条：全屏控制条 3 秒无操作自动隐藏，点画面再出现。
+  late final FullscreenControls _fsControls;
 
   @override
   void initState() {
     super.initState();
+    _fsControls = FullscreenControls(onChanged: () {
+      if (mounted) setState(() {});
+    });
     _speed = widget.speed;
     _label = widget.variantLabel;
     _c = widget.controllerNotifier.value;
     _c?.addListener(_onTick);
     widget.controllerNotifier.addListener(_onControllerChanged);
     widget.mutedNotifier.addListener(_onTick);
+    // 第 44 条：进全屏控制条先出现，播的时候开始 3 秒计时。
+    _fsControls.poke(isPlaying: _c?.value.isPlaying ?? false);
   }
 
   void _onControllerChanged() {
@@ -698,6 +768,8 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
     _c = widget.controllerNotifier.value;
     _c?.addListener(_onTick);
     if (mounted) setState(() {});
+    // 第 44 条：短视频切到下一段，全屏控制条重新计时。
+    _fsControls.poke(isPlaying: _c?.value.isPlaying ?? false);
   }
 
   void _onTick() {
@@ -706,6 +778,7 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
 
   @override
   void dispose() {
+    _fsControls.dispose();
     _c?.removeListener(_onTick);
     widget.controllerNotifier.removeListener(_onControllerChanged);
     widget.mutedNotifier.removeListener(_onTick);
@@ -727,15 +800,18 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // 点视频区 = 暂停/继续；退出只走右上角 ✕ 和系统返回。
+          // 点视频区 = 暂停/继续 + 唤出控制条（播的时候重新计时 3 秒），
+          // 退出只走右上角 ✕ 和系统返回；点画面绝不触发放大。
           GestureDetector(
             onTap: () {
               if (c == null) return;
-              if (c.value.isPlaying) {
+              final wasPlaying = c.value.isPlaying;
+              if (wasPlaying) {
                 c.pause();
               } else {
                 c.play();
               }
+              setState(() => _fsControls.poke(isPlaying: !wasPlaying));
             },
             child: Container(
               color: Colors.black,
@@ -748,7 +824,13 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
             const Center(child: Icon(Icons.play_circle_fill, color: Colors.white70, size: 80)),
           Positioned(
             left: 16, right: 16, top: 12,
-            child: Row(
+            child: AnimatedOpacity(
+              // 第 44 条：顶栏和底栏一起藏，3 秒无操作自动隐藏，点画面再出现。
+              opacity: _fsControls.visible ? 1.0 : 0.0,
+              duration: const Duration(milliseconds: 200),
+              child: IgnorePointer(
+                ignoring: !_fsControls.visible,
+                child: Row(
               children: [
                 Expanded(
                   child: Text(widget.item.title, maxLines: 1, overflow: TextOverflow.ellipsis,
@@ -760,12 +842,19 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
                   onPressed: () => Navigator.of(context).pop(),
                 ),
               ],
+                ),
+              ),
             ),
           ),
           if (c != null)
             Positioned(
               left: 16, right: 16, bottom: 12,
-              child: Container(
+              child: AnimatedOpacity(
+                opacity: _fsControls.visible ? 1.0 : 0.0,
+                duration: const Duration(milliseconds: 200),
+                child: IgnorePointer(
+                  ignoring: !_fsControls.visible,
+                  child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                 decoration: const BoxDecoration(
                   gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter,
@@ -784,11 +873,13 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
                         IconButton(
                           icon: Icon(c.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
                           onPressed: () {
-                            if (c.value.isPlaying) {
+                            final wasPlaying = c.value.isPlaying;
+                            if (wasPlaying) {
                               c.pause();
                             } else {
                               c.play();
                             }
+                            setState(() => _fsControls.poke(isPlaying: !wasPlaying));
                           },
                         ),
                         Text('${_fmt(c.value.position)} / ${_fmt(c.value.duration)}',
@@ -799,6 +890,7 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
                           tooltip: muted ? '点一下出声' : '静音',
                           onPressed: () {
                             widget.mutedNotifier.value = !muted;
+                            setState(() => _fsControls.poke(isPlaying: c.value.isPlaying));
                           },
                         ),
                         // 倍速。
@@ -809,7 +901,10 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
                             child: Text('${_speed}x', style: const TextStyle(color: Colors.white, fontSize: 13)),
                           ),
                           onSelected: (v) {
-                            setState(() => _speed = v);
+                            setState(() {
+                              _speed = v;
+                              _fsControls.poke(isPlaying: c.value.isPlaying);
+                            });
                             // ValueChanged<double> 返回 void，不能 await；
                             // 父级回调里自己会调 setPlaybackSpeed。
                             widget.onSpeedChanged(v);
@@ -829,7 +924,10 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
                                   style: const TextStyle(color: Colors.white, fontSize: 13)),
                             ),
                             onSelected: (v) async {
-                              setState(() => _label = v.label);
+                              setState(() {
+                                _label = v.label;
+                                _fsControls.poke(isPlaying: c.value.isPlaying);
+                              });
                               await widget.onVariantSelected(v);
                             },
                             itemBuilder: (_) => widget.variants
@@ -842,6 +940,8 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
                     ),
                   ],
                 ),
+              ),
+              ),
               ),
             ),
         ],

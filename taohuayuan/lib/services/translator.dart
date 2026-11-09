@@ -26,6 +26,7 @@ class Translator {
     if (host == 'localhost' || host == '127.0.0.1') return false;
     if (RegExp(r'^\d+\.\d+\.\d+\.\d+$').hasMatch(host)) return false; // IP 不翻
     if (isTranslatedUrl(url)) return false;
+    if (isBingTranslatedUrl(url)) return false; // 第 39 条：Bing 翻译页也是翻译页，别再拿 Google 翻它
     return true;
   }
 
@@ -48,6 +49,32 @@ class Translator {
       '_x_tr_pto': 'wapp',
     };
     return u.replace(host: host, queryParameters: query).toString();
+  }
+
+  /// Bing 翻译代理（第 39 条：Google translate.goog 在用户手机网络下不通时
+  /// 的备选；Bing 国内一般能直接打开。VM 下探不到——沙盒网络连不上
+  /// microsofttranslator.com，手机实跑为准）。
+  static String toBingTranslatedUrl(String url) {
+    final u = Uri.tryParse(url);
+    if (u == null || !isTranslatableUrl(url)) return url;
+    return 'https://www.microsofttranslator.com/bv.aspx?ref=SERP&br=ro&mkt=zh-CN&dl=zh&lp=EN_ZH-CHS&a=${Uri.encodeComponent(url)}';
+  }
+
+  /// 已经是 Bing 翻译页。
+  static bool isBingTranslatedUrl(String url) {
+    final host = Uri.tryParse(url)?.host ?? '';
+    return host == 'www.microsofttranslator.com';
+  }
+
+  /// 翻译失败页的特征（第 39 条的根因）：Google 的 "Can't translate this page"
+  /// 是 HTTP 200 正常页，不触发 onWebResourceError，所以只靠报错回落永远等不到，
+  /// 用户直接看到英文错误页。必须加载完看内容判断，不通就换 Bing、再不行回原文。
+  static bool isTranslationFailurePage(String title, String bodyText) {
+    final t = '$title $bodyText'.toLowerCase();
+    return t.contains("can't translate this page") ||
+        t.contains('cannot translate this page') ||
+        t.contains('translation failed') ||
+        t.contains('无法翻译此页');
   }
 
   /// 翻译页地址 -> 原文地址（翻不回去就返回原串）。

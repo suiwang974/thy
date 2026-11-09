@@ -263,4 +263,114 @@ void main() {
     expect(items.map((v) => v.id).toSet().length, 2);
     expect(items.first.id, 'pornhub-viewkey:6acf472d64e8e');
   });
+
+  test('第 37 条：pornhub 时长只认 <var class="duration">，不认 img 地址里的 320:180', () {
+    const html = """
+<a href="/view_video.php?viewkey=6acf472d64e8e" title="Gym-Clothed Wife Fucks Husband" class="fade img">
+<img src="https://pix-cdn77.phncdn.com/c6541/videos/202610/14/65758345/original/01a.jpg/plain/rs:fit:320:180?hash=abc" alt="Gym-Clothed Wife Fucks Husband">
+<div class="marker-overlays"><var class="duration">15:41</var></div>
+</a>
+""";
+    final items = HtmlSearchSource.parseHtml(
+      html,
+      'https://www.pornhub.com',
+      'pornhub',
+      r'/view_video\.php\?viewkey=[A-Za-z0-9]+',
+    );
+    expect(items.length, 1);
+    // 15:41 = 941 秒；旧代码先命中 img 地址里的 320:18，错成 19218 秒。
+    expect(items[0].durationSec, 941);
+  });
+
+  test('第 37 条：没有时长元素时，img 地址里的 320:180 不能当成时长', () {
+    const html = """
+<a href="/view_video.php?viewkey=6acf472d64e8e" title="Test Video"><img src="https://pix-cdn77.phncdn.com/x.jpg/plain/rs:fit:320:180?hash=abc" alt="Test Video"></a>
+""";
+    final items = HtmlSearchSource.parseHtml(
+      html,
+      'https://www.pornhub.com',
+      'pornhub',
+      r'/view_video\.php\?viewkey=[A-Za-z0-9]+',
+    );
+    expect(items.length, 1);
+    expect(items[0].durationSec, 0);
+  });
+
+  test('第 42 条：pornhub 搜索时抠上传者（usernameWrap 里的 thumb_username）', () {
+    const html = """
+<a href="/view_video.php?viewkey=6acf472d64e8e" title="Test Video" class="img"><img src="https://example.com/t.jpg" alt="Test Video"><var class="duration">10:05</var></a>
+<div class="thumbnail-info-wrapper"><div class="thumbnail-info"><span class="title"><a href="/view_video.php?viewkey=6acf472d64e8e">Test Video</a></span><div class="usernameWrap"><a href="/model/pink-pussy-creampie" title="Pink Pussy Creampie" data-label="thumb_username">Pink Pussy Creampie</a></div></div></div>
+""";
+    final items = HtmlSearchSource.parseHtml(
+      html,
+      'https://www.pornhub.com',
+      'pornhub',
+      r'/view_video\.php\?viewkey=[A-Za-z0-9]+',
+    );
+    expect(items.length, 1);
+    expect(items[0].author, 'Pink Pussy Creampie');
+    expect(items[0].durationSec, 605);
+  });
+
+  test('第 42 条：xvideos 搜索时抠上传者（metadata 里的 <span class="name">）', () {
+    const html = """
+<a href="/video.upltcpbcb6f/footjob_and_blowjob"><img src="https://example.com/blank.gif" data-src="https://example.com/r.jpg"><span class="top-right-tags"><span class="video-hd-mark">1080p</span></span></a>
+<div class="thumb-under"><p class="title"><a href="/video.upltcpbcb6f/footjob_and_blowjob" title="Footjob and blowjob">Footjob and blowjob <span class="duration">9 min</span></a></p><p class="metadata"><span class="bg"><span class="duration">9 min</span><span><a href="/darcy-dark-1"><span class="name">DarcyDark</span></a></span></span></p></div>
+""";
+    final items = HtmlSearchSource.parseHtml(
+      html,
+      'https://www.xvideos.com',
+      'xvideos',
+      r'/video\.[^"]+',
+    );
+    expect(items.length, 1);
+    expect(items[0].author, 'DarcyDark');
+    expect(items[0].durationSec, 540); // 9 min
+    expect(items[0].resolution, '1080p');
+  });
+
+  test('第 42 条：niacg 标题里的 [作者] 前缀就是发布者，[中文字幕] 不是', () {
+    const html = """
+<a href="/showinfo-21-10702-0.html" title="[AlphaG] Capture Yixuan + Naked [中文字幕]">x</a>
+<a href="/showinfo-21-10703-0.html" title="[中文字幕] 普通标题">y</a>
+""";
+    final items = NiacgSource.parseSearchHtml(html);
+    expect(items.length, 2);
+    expect(items[0].author, 'AlphaG');
+    expect(items[1].author, '');
+  });
+
+  test('第 37 条：lianzu11 时长只认可见文本，不认属性里的假时长', () {
+    const html = """
+<a href="https://lianzu11.com/post-1"><img src="https://lianzu11.com/t.jpg" data-time="99:99">恋足视频一 12:34</a>
+""";
+    final items = Lianzu11Source.parseSearchHtml(html);
+    expect(items.length, 1);
+    expect(items[0].durationSec, 754);
+  });
+
+  test('第 37 条：hanime 时长只认可见文本', () {
+    const html = """
+<a href="https://hanimeone.me/watch?v=abc"><img src="https://example.com/t.jpg"><div class="title">Test Title</div><span>25:10</span></a>
+""";
+    final items = HanimeSource.parseSearchHtml(html, 'hanimeone.me', 'hanimeone');
+    expect(items.length, 1);
+    expect(items[0].durationSec, 1510);
+  });
+
+  test('第 41 条：WebView 搜索分页地址 + 解析入口', () {
+    expect(NiacgSource().webSearchUrlPage('foot', 2), contains('page=2'));
+    expect(Lianzu11Source().webSearchUrlPage('foot', 2),
+        'https://lianzu11.com/page/2/?s=foot');
+    expect(HanimeSource('hanimeone.me').webSearchUrlPage('foot', 2),
+        contains('page=2'));
+    expect(
+        HanimeSource('hanimeone.me').parseWebSearchHtml(
+            '<a href="https://hanimeone.me/watch?v=x"><div class="title">T</div></a>').length,
+        1);
+    expect(
+        NiacgSource().parseWebSearchHtml(
+            '<a href="/showinfo-21-1-0.html" title="[A] T">x</a>').length,
+        1);
+  });
 }

@@ -31,6 +31,8 @@ class SourceResult {
 }
 
 abstract class Source {
+  const Source();
+
   String get id;
   String get name;
 
@@ -43,6 +45,14 @@ abstract class Source {
   /// 其他源也提供：搜不到/握手失败时点状态条就能去内置浏览器里看，不卡死）。
   String webSearchUrl(String query) => '';
   String get webHomeUrl => '';
+
+  /// 第 41 条：WebView 内搜索用的分页地址（默认第 1 页就是 webSearchUrl；
+  /// niacg/lianzu11/hanime 各自拼 page 参数）。
+  String webSearchUrlPage(String query, int page) => webSearchUrl(query);
+
+  /// 第 41 条：WebView 里抓到的搜索页 HTML -> 条目（浏览器能过验证，
+  /// 拿 outerHTML 走同一套解析）。默认空（不参与 WebView 搜索）。
+  List<VideoItem> parseWebSearchHtml(String html) => const [];
 
   Future<SourceResult> search(String query);
   Future<SourceResult> home({int page = 1});
@@ -65,6 +75,8 @@ String? _first(RegExp re, String s) => re.firstMatch(s)?.group(1);
 int _parseDuration(String s) {
   final t = s.trim();
   if (t.isEmpty) return 0;
+  final secMatch = RegExp(r'^(\d+)\s*sec$').firstMatch(t);
+  if (secMatch != null) return int.parse(secMatch.group(1)!);
   final minMatch = RegExp(r'^(\d+)\s*min$').firstMatch(t);
   if (minMatch != null) return int.parse(minMatch.group(1)!) * 60;
   if (RegExp(r'^\d+$').hasMatch(t)) return int.parse(t);
@@ -74,6 +86,37 @@ int _parseDuration(String s) {
   if (nums.length == 2) return nums[0] * 60 + nums[1];
   if (nums.length == 3) return nums[0] * 3600 + nums[1] * 60 + nums[2];
   return 0;
+}
+
+/// 第 37 条：从 HTML 里找时长——只能在可见文本/时长专属元素里找，绝不能在原始
+/// HTML 里直接扫。Pornhub 缩略图地址里含 `rs:fit:320:180`（图片缩放参数），
+/// 旧代码在锚点内先命中 `320:18`（`320:180` 的前半截），全站卡片时长都错成
+/// 320:18（= 19218 秒），还连带把 15 分钟正片误判成“带水印的预览”。
+/// 两道防线：①优先 `<var|span class="duration">` 里的值；②其余一律先去标签
+/// 再扫可见文本；③正则后加 `(?!\d)`，`320:18` 后面跟了个 `0` 就不算时长。
+final _durationTextRe = RegExp(r'(\d+:\d{2}(?::\d{2})?)(?!\d)');
+
+/// 时长专属元素（pornhub 是 `<var class="duration">10:05</var>`，
+/// xvideos 是 `<span class="duration">9 min</span>`）里的值。
+String? _durationFromElement(String html) {
+  final m = RegExp(
+    r'''<(?:var|span)[^>]*class="[^"]*duration[^"]*"[^>]*>([^<]+)</(?:var|span)>''',
+  ).firstMatch(html);
+  return m?.group(1)?.trim();
+}
+
+/// 可见文本里的第一个时长（已去标签）；没有返回 ''。
+String _durationFromText(String visibleText) =>
+    _durationTextRe.firstMatch(visibleText)?.group(1) ?? '';
+
+/// niacg 标题里的 [作者] 前缀（站内标题都这么写，如 “[AlphaG] Capture Yixuan”）。
+/// 排除纯标签词（[中文字幕] 这类不是作者）。
+String _niacgAuthorFromTitle(String title) {
+  final m = RegExp(r'^\[([^\]]+)\]').firstMatch(title.trim());
+  if (m == null) return '';
+  final a = m.group(1)!.trim();
+  if (RegExp(r'^(中文字幕|字幕|中文|4K|1080p|720p|无码|有码)$').hasMatch(a)) return '';
+  return a;
 }
 
 /// 解 HTML 实体（&quot; &#039; &amp; &lt; &gt; &nbsp;）。
@@ -160,7 +203,7 @@ bool _isJunkTitle(String title) {
 
 /// ---------- 1. Eporner：官方 JSON API，无需解析 HTML ----------
 
-class EpornerSource implements Source {
+class EpornerSource extends Source {
   @override
   String get id => 'eporner';
   @override
@@ -263,7 +306,7 @@ class EpornerSource implements Source {
 
 /// ---------- 2. Rule34Video：搜索页 HTML 解析，详情页有 master.m3u8 ----------
 
-class Rule34VideosSource implements Source {
+class Rule34VideosSource extends Source {
   static const _base = 'https://rule34-videos.com';
   @override
   String get id => 'rule34videos';
@@ -298,7 +341,8 @@ class Rule34VideosSource implements Source {
         if (_isRealPoster(candidate)) poster = candidate;
       }
       if (poster.isEmpty) poster = _pickPoster(inner, _base);
-      final durText = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), inner) ?? '';
+      // 第 37 条：时长只在可见文本里找，不扫原始 HTML 属性（同 HtmlSearchSource）。
+      final durText = _durationFromElement(inner) ?? _durationFromText(_stripTags(inner));
       final text = _stripTags(inner);
       out.add(VideoItem(
         id: 'r34-$href',
@@ -368,7 +412,7 @@ class Rule34VideosSource implements Source {
 /// 带 Referer 返回 200/206），直链本身能抓到。
 /// niacg 官方站本身没广告，拿不到直链时嵌官方播放器当备选。
 
-class NiacgSource implements Source {
+class NiacgSource extends Source {
   @override
   String get id => 'niacg';
   @override
@@ -382,6 +426,13 @@ class NiacgSource implements Source {
       'https://www.niacg.com/e/search/?searchget=1&keyboard=${Uri.encodeComponent(query)}&show=title&classid=21';
 
   @override
+  String webSearchUrlPage(String query, int page) =>
+      'https://www.niacg.com/e/search/?searchget=1&keyboard=${Uri.encodeComponent(query)}&show=title&classid=21&page=$page';
+
+  @override
+  List<VideoItem> parseWebSearchHtml(String html) => parseSearchHtml(html);
+
+  @override
   String get webHomeUrl => 'https://www.niacg.com/';
 
   /// 供单元测试直接验：搜索页 HTML -> 条目。
@@ -392,9 +443,12 @@ class NiacgSource implements Source {
     for (final m in re.allMatches(html)) {
       if (out.length >= 100 || seen.contains(m.group(2))) continue;
       seen.add(m.group(2)!);
+      // 第 42 条：niacg 标题里的 [作者] 前缀就是发布者。
+      final niacgTitle = _cleanTitle(m.group(3) ?? '');
       out.add(VideoItem(
         id: 'niacg-${m.group(2)}',
-        title: _cleanTitle(m.group(3) ?? ''),
+        title: niacgTitle,
+        author: _niacgAuthorFromTitle(niacgTitle),
         source: 'niacg',
         pageUrl: 'https://www.niacg.com${m.group(1)}',
       ));
@@ -447,7 +501,7 @@ class NiacgSource implements Source {
 /// 修法：标 webViewOnly，搜索走内置浏览器（Chrome 指纹能过验证）；
 /// HTTP 入口保留但先判状态码，非 200 直接报错，不静默 0 条。
 
-class Lianzu11Source implements Source {
+class Lianzu11Source extends Source {
   @override
   String get id => 'lianzu11';
   @override
@@ -459,6 +513,13 @@ class Lianzu11Source implements Source {
   @override
   String webSearchUrl(String query) =>
       'https://lianzu11.com/?s=${Uri.encodeComponent(query)}';
+
+  @override
+  String webSearchUrlPage(String query, int page) =>
+      'https://lianzu11.com/${page > 1 ? 'page/$page/' : ''}?s=${Uri.encodeComponent(query)}';
+
+  @override
+  List<VideoItem> parseWebSearchHtml(String html) => parseSearchHtml(html);
 
   @override
   String get webHomeUrl => 'https://lianzu11.com/';
@@ -476,7 +537,8 @@ class Lianzu11Source implements Source {
       final text = _stripTags(inner);
       if (text.isEmpty) continue;
       seen.add(href);
-      final durText = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), inner) ?? '';
+      // 第 37 条：时长只在可见文本里找，不扫原始 HTML 属性。
+      final durText = _durationFromElement(inner) ?? _durationFromText(_stripTags(inner));
       out.add(VideoItem(
         id: 'lianzu11-$href',
         title: _cleanTitle(text.length > 120 ? text.substring(0, 120) : text),
@@ -539,7 +601,7 @@ class Lianzu11Source implements Source {
 /// 播的时候先试解析直链（xvideos 有 setVideoUrlHigh/Low/HLS，优先直链），
 /// 解析不到就走官方播放器/官方页备选（有广告的站要如实说，见 StreamResolver）。
 
-class HtmlSearchSource implements Source {
+class HtmlSearchSource extends Source {
   final String _id;
   final String _name;
   final String Function(String q, int page) _url;
@@ -626,14 +688,17 @@ class HtmlSearchSource implements Source {
       }
       title = _cleanTitle(title);
       if (_isJunkTitle(title)) continue;
-      var durText = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), inner) ?? '';
+      // 第 37 条：时长只认时长元素里的值，其次锚点可见文本，最后锚点后面的兄弟节点；
+      // 原始 HTML 属性里的数字（如 img 地址 rs:fit:320:180）不许当成时长。
+      var durText = _durationFromElement(inner) ?? _durationFromText(_stripTags(inner));
       if (durText.isEmpty) {
         final tail = html.substring(m.end, (m.end + 400).clamp(0, html.length));
-        durText = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), tail) ?? '';
+        durText = _durationFromElement(tail) ?? _durationFromText(_stripTags(tail));
         if (durText.isEmpty) {
           // "30 sec" -> 纯秒数；"5 min" -> 带 min 后缀（_parseDuration 会 x60）。
-          final secs = _first(RegExp(r'(\d+)\s*sec'), tail);
-          final mins = secs == null ? _first(RegExp(r'(\d+)\s*min'), tail) : null;
+          final tailText = _stripTags(tail);
+          final secs = _first(RegExp(r'(\d+)\s*sec'), tailText);
+          final mins = secs == null ? _first(RegExp(r'(\d+)\s*min'), tailText) : null;
           if (secs != null) {
             durText = secs;
           } else if (mins != null) {
@@ -641,10 +706,27 @@ class HtmlSearchSource implements Source {
           }
         }
       }
+      // 第 42 条：搜索时顺带抠作者（视频页解析是第二道，见 StreamResolver.parseVideoAuthor）。
+      // - pornhub：锚点后面的 usernameWrap 里 data-label="thumb_username"
+      //   或 class="usernameLink" 的链接文字就是上传者（model/频道/个人号都长这样）。
+      // - xvideos：锚点后面的 metadata 里 <span class="name"> 就是上传者。
+      // 尾巴窗口按源收紧：取到的是这条自己的作者，不许串到下一条去。
+      var author = '';
+      if (sourceId == 'pornhub') {
+        final tail2 = html.substring(m.end, (m.end + 2000).clamp(0, html.length));
+        author = _cleanTitle(_first(
+              RegExp(r'''(?:data-label="thumb_username"|class="usernameLink")[^>]*>([^<]+)<'''),
+              tail2) ??
+            '');
+      } else if (sourceId == 'xvideos') {
+        final tail2 = html.substring(m.end, (m.end + 900).clamp(0, html.length));
+        author = _cleanTitle(_first(RegExp(r'<span class="name">([^<]+)</span>'), tail2) ?? '');
+      }
       final res = _first(RegExp(r'\b(2160p|1440p|1080p|720p|4K)\b'), inner) ?? '';
       out.add(VideoItem(
         id: '$sourceId-$key',
         title: title,
+        author: author,
         durationSec: _parseDuration(durText),
         resolution: res,
         poster: _pickPoster(inner, base),
@@ -701,7 +783,7 @@ class HtmlSearchSource implements Source {
 /// 静态 HTML 里大部分卡片是占位符（标题被打成 ***、没有 img），只有前十来张是真的；
 /// 但同一页嵌的 videoThumbProps JSON 里有全部 46 条的真实标题、时长（秒）、封面、
 /// 播放量、作者（landing.name）、是否超清。JSON 拿不到时退回通用锚点解析。
-class XhamsterSource implements Source {
+class XhamsterSource extends Source {
   @override
   String get id => 'xhamster';
   @override
@@ -800,7 +882,7 @@ class XhamsterSource implements Source {
 /// 是同一个站的两个镜像域名，内容一样，不是两个站；hanime1.me 常被
 /// Cloudflare 验证拦住，hanimeone.me 能进。App 里只当成一个站显示，
 /// 一个打不开就自动切另一个（见 mirrorUrl / preferredHost）。
-class HanimeSource implements Source {
+class HanimeSource extends Source {
   final String _host; // 'hanime1.me' 或 'hanimeone.me'
   HanimeSource(this._host);
 
@@ -837,6 +919,12 @@ class HanimeSource implements Source {
   @override
   String webSearchUrl(String query, [int page = 1]) =>
       'https://$_host/search?query=${Uri.encodeComponent(query)}&page=$page&genre=%E8%A3%8F%E7%95%AA';
+
+  @override
+  String webSearchUrlPage(String query, int page) => webSearchUrl(query, page);
+
+  @override
+  List<VideoItem> parseWebSearchHtml(String html) => parseSearchHtml(html, _host, id);
 
   @override
   Future<SourceResult> search(String query) async => _fetch(webSearchUrl(query));
@@ -898,11 +986,15 @@ class HanimeSource implements Source {
       if (img != null && img.isNotEmpty && _isRealPoster(img)) {
         poster = _absUrl(img, base);
       }
-      final dur = _first(RegExp(r'(\d+:\d{2}(?::\d{2})?)'), inner);
+      // 第 37 条：时长只在可见文本里找，不扫原始 HTML 属性。
+      final durEl = _durationFromElement(inner);
+      final dur = (durEl != null && durEl.isNotEmpty)
+          ? durEl
+          : _durationFromText(_stripTags(inner));
       items.add(VideoItem(
         id: '$sourceId-$pageUrl',
         title: title,
-        durationSec: dur == null ? 0 : _parseDuration(dur),
+        durationSec: dur.isEmpty ? 0 : _parseDuration(dur),
         poster: poster,
         source: sourceId,
         pageUrl: pageUrl,

@@ -6,6 +6,8 @@ class VideoItem {
   final String id;
   final String title;
   final String author;
+  /// 作者头像（视频页 JSON 里有才填，如 xhamster 的 thumbUrl；没有就画首字母圆圈）。
+  final String authorAvatar;
   final String batch; // 保留字段（在线源为空）；播放页不再按批次分组。
   final int durationSec;
   final String resolution; // 如 '1080p'；在线源多数不提供，空 = 未知。
@@ -23,6 +25,7 @@ class VideoItem {
     required this.id,
     required this.title,
     this.author = '',
+    this.authorAvatar = '',
     this.batch = '',
     this.durationSec = 0,
     this.resolution = '',
@@ -86,6 +89,7 @@ class VideoItem {
   VideoItem copyWith({
     String? title,
     String? author,
+    String? authorAvatar,
     int? durationSec,
     String? resolution,
     String? poster,
@@ -100,6 +104,7 @@ class VideoItem {
         id: id,
         title: title ?? this.title,
         author: author ?? this.author,
+        authorAvatar: authorAvatar ?? this.authorAvatar,
         batch: batch,
         durationSec: durationSec ?? this.durationSec,
         resolution: resolution ?? this.resolution,
@@ -168,6 +173,7 @@ class VideoItem {
         'id': id,
         'title': title,
         'author': author,
+        'authorAvatar': authorAvatar,
         'batch': batch,
         'durationSec': durationSec,
         'resolution': resolution,
@@ -188,6 +194,7 @@ class VideoItem {
         // 读出来时顺手修掉，乱码标题不许再上屏。
         title: repairMojibake((j['title'] ?? '') as String),
         author: repairMojibake((j['author'] ?? '') as String),
+        authorAvatar: (j['authorAvatar'] ?? '') as String,
         batch: (j['batch'] ?? '') as String,
         durationSec: ((j['durationSec'] ?? 0) as num).toInt(),
         resolution: (j['resolution'] ?? '') as String,
