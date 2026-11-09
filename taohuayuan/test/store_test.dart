@@ -87,4 +87,53 @@ void main() {
     expect(store2.shortsPosition('newest'), 5);
     expect(store2.shortsPosition('hottest'), 77);
   });
+
+  test('第 60 条：喜欢的标签手动加/删，搜过的词单条删', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    await store.addLikedTag(' Cosplay ');
+    await store.addLikedTag('cosplay'); // 重复加不重复存
+    await store.addLikedTag('3d');
+    expect(store.likedTags, {'cosplay', '3d'});
+    await store.removeLikedTag('cosplay');
+    expect(store.likedTags, {'3d'});
+    // 搜过的词单条删，别的留着。
+    await store.recordSearchTerm('足');
+    await store.recordSearchTerm('3d');
+    await store.removeSearchTerm('足');
+    expect(store.searchTerms, ['3d']);
+  });
+
+  test('第 60 条：不喜欢的标签手动加/删；降权条目贡献的删了不再回来', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    // 手动加的。
+    await store.dislikeTag('femdom');
+    expect(store.dislikedTags, contains('femdom'));
+    await store.removeDislikedTag('femdom');
+    expect(store.dislikedTags, isNot(contains('femdom')));
+    // 条目降权贡献的：删掉后，之后再降权别的条目（重算并集）也不复活；
+    // 但之后又降权一条带这标签的新片，它会合理地回来——那是新贡献，不是复活。
+    final a = VideoItem(
+        id: 'a', title: 't', source: 'eporner', keywords: ['femdom']);
+    final b = VideoItem(
+        id: 'b', title: 't2', source: 'eporner', keywords: ['femdom']);
+    final c = VideoItem(
+        id: 'c', title: 't3', source: 'eporner', keywords: ['asian']);
+    await store.toggleDislike(a);
+    expect(store.dislikedTags, contains('femdom'));
+    await store.removeDislikedTag('femdom');
+    expect(store.dislikedTags, isNot(contains('femdom')));
+    await store.toggleDislike(c); // 触发重算并集
+    expect(store.dislikedTags, contains('asian'));
+    expect(store.dislikedTags, isNot(contains('femdom')));
+    await store.toggleDislike(b); // 新降权的条目带 femdom，合理回来
+    expect(store.dislikedTags, contains('femdom'));
+    // 清除口味数据：手动标签和降权条目一起清。
+    await store.addLikedTag('cosplay');
+    await store.clearTaste();
+    expect(store.likedTags, isEmpty);
+    expect(store.dislikedTags, isEmpty);
+    expect(store.dislikedItemIds, isEmpty);
+  });
 }

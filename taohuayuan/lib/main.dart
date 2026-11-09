@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'services/adblock_service.dart';
 import 'services/downloader.dart';
 import 'services/store.dart';
+import 'ui/app_background.dart';
 import 'ui/app_update_ui.dart';
 import 'ui/author_screen.dart';
 import 'ui/browser_sources_screen.dart';
@@ -125,7 +126,10 @@ class _HomeShellState extends State<HomeShell> {
       ProfileScreen(store: widget.store, onAuthorTap: _openAuthor),
     ];
     return Scaffold(
-      body: IndexedStack(index: _index, children: pages),
+      // 第 61 条：四个栏底层都铺用户指定的背景图——Scaffold 本身透明，
+      // 背景由 AppBackground 画；各栏自己的 Scaffold 也要透明（见各页）。
+      backgroundColor: Colors.transparent,
+      body: AppBackground(child: IndexedStack(index: _index, children: pages)),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _index,
         onTap: (i) {

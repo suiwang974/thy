@@ -49,6 +49,8 @@ class TasteProfile {
     for (final item in store.likedItems()) {
       tags.addAll(item.keywords.map((k) => k.toLowerCase()));
     }
+    // 第 60 条：用户在“我的口味”里手动加的喜欢标签，立刻进推荐画像。
+    tags.addAll(store.likedTags);
     for (final term in store.searchTerms) {
       // 原词（中文标题能命中）+ 映射后的英文词（英文标题/标签能命中）都进画像。
       tags.add(term.toLowerCase());

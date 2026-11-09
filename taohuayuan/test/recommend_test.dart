@@ -1,6 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:taohuayuan/models/video_item.dart';
 import 'package:taohuayuan/services/recommend.dart';
+import 'package:taohuayuan/services/store.dart';
 
 VideoItem item({
   required String id,
@@ -127,6 +129,22 @@ void main() {
     ], profile);
     final explore = ranked.where((s) => s.reason.startsWith('试试新口味')).toList();
     expect(explore.map((s) => s.item.id), isNot(contains('n1')));
+  });
+
+  test('第 60 条：手动加的喜欢标签进画像，立刻影响推荐排序', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    await store.addLikedTag('cosplay');
+    final profile = TasteProfile.fromStore(store);
+    expect(profile.tags, contains('cosplay'));
+    final ranked = rankRecommendations([
+      item(id: 'a', title: 'cosplay dance', keywords: ['cosplay']),
+      item(id: 'b', title: 'cooking show', keywords: ['cooking']),
+    ], profile);
+    expect(ranked.first.item.id, 'a');
+    // 删掉就不影响了。
+    await store.removeLikedTag('cosplay');
+    expect(TasteProfile.fromStore(store).tags, isNot(contains('cosplay')));
   });
 
 }

@@ -32,9 +32,13 @@ class BrowserSourcesScreen extends StatelessWidget {
     final hanime = sources.where((s) => s.id == 'hanime1' || s.id == 'hanimeone').toList();
     final others = sources.where((s) => s.id != 'hanime1' && s.id != 'hanimeone').toList();
     return Scaffold(
-      backgroundColor: const Color(0xFF141419),
+      // 第 61 条：透明，让 main.dart 的 AppBackground 透出来；卡片自带深色底。
+      backgroundColor: Colors.transparent,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF141419),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        surfaceTintColor: Colors.transparent,
         title: const Text('浏览器', style: TextStyle(color: Colors.white)),
       ),
       body: ListView(

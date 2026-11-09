@@ -27,29 +27,23 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
-  List<VideoItem> _history = [];
-  List<VideoItem> _liked = [];
   List<VideoItem> _followVideos = [];
   bool _followLoading = false;
   bool _followLoaded = false;
+  // 关注作者的新片是按哪一份关注名单搜出来的；名单变了旧结果作废（第 59 条顺手修）。
+  String _followLoadedFor = '';
   // 广告拦截更新状态（第 26 条）：点「更新规则」时的进度 + 结果。
   bool _adblockUpdating = false;
   String? _adblockResult;
 
-  @override
-  void initState() {
-    super.initState();
-    _history = widget.store.historyItems();
-    _liked = widget.store.likedItems();
-  }
-
   void _open(VideoItem item) {
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => PlayerScreen(item: item, store: widget.store),
-    )).then((_) => setState(() {
-          _history = widget.store.historyItems();
-          _liked = widget.store.likedItems();
-        }));
+    )).then((_) {
+          // 第 59 条：喜欢和观看记录在 build() 里现读，不用在这里缓存；
+          // 从播放页回来只触发一次重建即可。
+          if (mounted) setState(() {});
+        });
   }
 
   /// 关注作者的新片：各源实时搜作者名（最多同时搜 5 位作者，单个源 8 秒超时跳过）。
@@ -78,6 +72,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       _followVideos = found.where((v) => seen.add(v.id)).take(30).toList();
       _followLoading = false;
       _followLoaded = true;
+      _followLoadedFor = follows.join('|');
     });
   }
 
@@ -114,14 +109,134 @@ class _ProfileScreenState extends State<ProfileScreen> {
     );
   }
 
+  /// 一组口味标签（第 60 条）：标题 + 一排可 × 删除的芯片；空了给一句提示。
+  /// 删了立刻存本地（调 store 的方法），setState 后重建——推荐下次算分就生效。
+  Widget _tasteGroup({
+    required String label,
+    required String emptyHint,
+    required List<String> tags,
+    required Color chipColor,
+    required Future<void> Function(String tag) onDeleted,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label,
+              style: const TextStyle(
+                  color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          tags.isEmpty
+              ? Text(emptyHint,
+                  style: const TextStyle(color: Colors.white38, fontSize: 12))
+              : Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: tags
+                      .map((t) => InputChip(
+                            label: Text(t),
+                            backgroundColor: const Color(0xFF2A2A35),
+                            labelStyle: TextStyle(color: chipColor),
+                            deleteIcon: const Icon(Icons.close,
+                                size: 16, color: Colors.white54),
+                            onDeleted: () async {
+                              await onDeleted(t);
+                              if (mounted) setState(() {});
+                            },
+                          ))
+                      .toList(),
+                ),
+        ],
+      ),
+    );
+  }
+
+  /// 第 60 条：手动加一个标签——选“喜欢”进推荐画像，选“不喜欢”进降权。
+  Future<void> _showAddTagDialog() async {
+    final controller = TextEditingController();
+    var liked = true;
+    final added = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xFF1C1C22),
+          title: const Text('添加标签', style: TextStyle(color: Colors.white)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: controller,
+                autofocus: true,
+                style: const TextStyle(color: Colors.white),
+                decoration: const InputDecoration(
+                  hintText: '比如 footjob、3d、cosplay',
+                  hintStyle: TextStyle(color: Colors.white38),
+                ),
+                onSubmitted: (_) => Navigator.of(ctx).pop(true),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  ChoiceChip(
+                    label: const Text('喜欢'),
+                    selected: liked,
+                    onSelected: (_) => setDialogState(() => liked = true),
+                  ),
+                  const SizedBox(width: 8),
+                  ChoiceChip(
+                    label: const Text('不喜欢'),
+                    selected: !liked,
+                    onSelected: (_) => setDialogState(() => liked = false),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              const Text('喜欢的进推荐，不喜欢的降权；都只存手机本地。',
+                  style: TextStyle(color: Colors.white54, fontSize: 12)),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('添加'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (added != true) return;
+    final tag = controller.text.trim();
+    if (tag.isEmpty) return;
+    if (liked) {
+      await widget.store.addLikedTag(tag);
+    } else {
+      await widget.store.dislikeTag(tag);
+    }
+    if (mounted) setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) {
     final sources = allSources();
     final follows = widget.store.followedAuthors.toList()..sort();
+    // 第 59 条：喜欢和观看记录每次 build 都现读——底部四栏是 IndexedStack，
+    // 切栏不销毁页面，initState 只跑一次会一直显示 App 启动时的旧快照。
+    final liked = widget.store.likedItems();
+    final history = widget.store.historyItems();
     return Scaffold(
-      backgroundColor: const Color(0xFF141419),
+      // 第 61 条：透明，让 main.dart 的 AppBackground 透出来；卡片自带深色底。
+      backgroundColor: Colors.transparent,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF141419),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        surfaceTintColor: Colors.transparent,
         title: const Text('我的', style: TextStyle(color: Colors.white)),
       ),
       body: ListView(
@@ -348,7 +463,18 @@ class _ProfileScreenState extends State<ProfileScreen> {
               title: const Text('关注作者的新片', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
               subtitle: const Text('各源实时搜出来的；点开才加载', style: TextStyle(color: Colors.white54, fontSize: 12)),
               onExpansionChanged: (expanded) {
-                if (expanded) _loadFollowVideos();
+                if (expanded) {
+                  // 关注名单变了（别处关注/取关），旧的搜结果作废，重搜。
+                  final key =
+                      (widget.store.followedAuthors.toList()..sort()).join('|');
+                  if (_followLoaded && _followLoadedFor != key) {
+                    setState(() {
+                      _followLoaded = false;
+                      _followVideos = [];
+                    });
+                  }
+                  _loadFollowVideos();
+                }
               },
               children: [
                 Padding(
@@ -374,7 +500,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _sectionCard(
             title: '我喜欢的',
             subtitle: '在播放页点右上角的 ♥ 就会出现在这里',
-            child: _liked.isEmpty
+            child: liked.isEmpty
                 ? const Text('还没点过喜欢', style: TextStyle(color: Colors.white54))
                 : GridView.builder(
                     shrinkWrap: true,
@@ -382,28 +508,52 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
                       crossAxisCount: 2, crossAxisSpacing: 12, mainAxisSpacing: 14, childAspectRatio: 16 / 13,
                     ),
-                    itemCount: _liked.length,
-                    itemBuilder: (_, i) => VideoCard(item: _liked[i], onTap: () => _open(_liked[i])),
+                    itemCount: liked.length,
+                    itemBuilder: (_, i) => VideoCard(item: liked[i], onTap: () => _open(liked[i])),
                   ),
           ),
           _sectionCard(
             title: '我的口味',
-            subtitle: '只存手机本地，不上传；推荐就按这些算',
+            subtitle: '只存手机本地，不上传；推荐就按这些算；点 × 删掉一个标签',
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '喜欢 ${_liked.length} 条 · 关注 ${follows.length} 位作者 · 搜过 ${widget.store.searchTerms.length} 个词',
+                  '喜欢 ${liked.length} 条 · 关注 ${follows.length} 位作者 · 搜过 ${widget.store.searchTerms.length} 个词',
                   style: const TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                const SizedBox(height: 12),
+                _tasteGroup(
+                  label: '喜欢的标签',
+                  emptyHint: '还没手动加；点 ♥ 的视频关键词会自动进画像',
+                  tags: widget.store.likedTags.toList()..sort(),
+                  chipColor: Colors.pinkAccent,
+                  onDeleted: (t) => widget.store.removeLikedTag(t),
+                ),
+                _tasteGroup(
+                  label: '不喜欢的标签',
+                  emptyHint: '没有；点“不喜欢”的视频标签会出现在这里',
+                  tags: widget.store.dislikedTags.toList()..sort(),
+                  chipColor: Colors.white70,
+                  onDeleted: (t) => widget.store.removeDislikedTag(t),
+                ),
+                _tasteGroup(
+                  label: '搜过的词',
+                  emptyHint: '还没搜过',
+                  tags: widget.store.searchTerms,
+                  chipColor: Colors.white70,
+                  onDeleted: (t) => widget.store.removeSearchTerm(t),
+                ),
+                OutlinedButton(
+                  onPressed: _showAddTagDialog,
+                  style: OutlinedButton.styleFrom(foregroundColor: Colors.pinkAccent),
+                  child: const Text('＋ 添加标签'),
                 ),
                 const SizedBox(height: 8),
                 TextButton(
                   onPressed: () async {
                     await widget.store.clearTaste();
-                    setState(() {
-                      _history = widget.store.historyItems();
-                      _liked = widget.store.likedItems();
-                    });
+                    setState(() {});
                   },
                   child: const Text('清除口味数据（回到冷启动：足控 / 3D / 亚洲）'),
                 ),
@@ -413,10 +563,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _sectionCard(
             title: '观看记录',
             subtitle: '点开能接着看（续播）',
-            child: _history.isEmpty
+            child: history.isEmpty
                 ? const Text('还没看过片', style: TextStyle(color: Colors.white54))
                 : Column(
-                    children: _history.take(20).map((v) {
+                    children: history.take(20).map((v) {
                       final ratio = widget.store.watchRatio(v.id);
                       final pos = widget.store.watchPosition(v.id);
                       return ListTile(

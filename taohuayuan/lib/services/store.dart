@@ -120,8 +120,41 @@ class Store {
 
   List<String> get searchTerms => _strList(_searchTermsKey);
 
+  /// 删掉一个搜过的词（第 60 条：口味标签带 × 点一下就删，立刻存本地）。
+  Future<void> removeSearchTerm(String term) async {
+    final list = _strList(_searchTermsKey)..remove(term);
+    await _prefs.setStringList(_searchTermsKey, list);
+  }
+
+  // ---- 手动加的喜欢标签（第 60 条：进推荐算法；喜欢的视频关键词本来就
+  // 自动进画像——见 TasteProfile.fromStore——这里只存用户手动加的）----
+  static const _likedTagsKey = 'taohuayuan_liked_tags';
+
+  Set<String> get likedTags => _strList(_likedTagsKey).toSet();
+
+  Future<void> addLikedTag(String tag) async {
+    final t = tag.trim().toLowerCase();
+    if (t.isEmpty) return;
+    final tags = likedTags..add(t);
+    await _prefs.setStringList(_likedTagsKey, tags.toList());
+  }
+
+  Future<void> removeLikedTag(String tag) async {
+    final tags = likedTags..remove(tag.trim().toLowerCase());
+    await _prefs.setStringList(_likedTagsKey, tags.toList());
+  }
+
   // ---- 不喜欢的标签（点“不喜欢”就降权这类推荐）----
-  Set<String> get dislikedTags => _strList(_dislikedTagsKey).toSet();
+  // 分两份存：_dislikedTagsKey 是已降权条目贡献的标签并集（_rebuildDislikedTags
+  // 每次重算）；_manualDislikedTagsKey 是用户在“我的口味”里手动加的。
+  // dislikedTags 读出来是两份的并集；第 60 条的 × 删除要两份一起清，
+  // 还要把各条目贡献的 per-item 键里的这个标签也刮掉，不然下次重算又回来。
+  static const _manualDislikedTagsKey = 'taohuayuan_disliked_tags_manual';
+
+  Set<String> get dislikedTags => {
+        ..._strList(_dislikedTagsKey),
+        ..._strList(_manualDislikedTagsKey),
+      };
 
   /// 已降权的条目 id（持久保存，图标亮不亮就看这个）。
   static const _dislikedItemsKey = 'taohuayuan_disliked_items';
@@ -170,9 +203,31 @@ class Store {
     await _prefs.setStringList(_dislikedTagsKey, tags.toList());
   }
 
+  /// 手动加一个不喜欢的标签（第 60 条：进降权）。写手动那份，不动各条目
+  /// 贡献的并集——_rebuildDislikedTags 重算时不会把它冲掉。
   Future<void> dislikeTag(String tag) async {
-    final tags = dislikedTags..add(tag.trim().toLowerCase());
-    await _prefs.setStringList(_dislikedTagsKey, tags.toList());
+    final t = tag.trim().toLowerCase();
+    if (t.isEmpty) return;
+    final tags = _strList(_manualDislikedTagsKey).toSet()..add(t);
+    await _prefs.setStringList(_manualDislikedTagsKey, tags.toList());
+  }
+
+  /// 删掉一个不喜欢的标签（第 60 条）：手动那份 + 各条目贡献的 per-item
+  /// 键里都刮掉，再重算并集——删了就不再回来（除非之后又降权一条带这标签的片）。
+  Future<void> removeDislikedTag(String tag) async {
+    final t = tag.trim().toLowerCase();
+    if (t.isEmpty) return;
+    final manual = _strList(_manualDislikedTagsKey)..remove(t);
+    await _prefs.setStringList(_manualDislikedTagsKey, manual);
+    for (final id in dislikedItemIds) {
+      final key = 'taohuayuan_disliked_tags_$id';
+      final list = _prefs.getStringList(key);
+      if (list != null && list.contains(t)) {
+        list.remove(t);
+        await _prefs.setStringList(key, list);
+      }
+    }
+    await _rebuildDislikedTags();
   }
 
   // ---- 首页缓存：先读缓存立刻显示，后台再刷新 ----
@@ -328,7 +383,15 @@ class Store {
   }
 
   // ---- 清除口味数据（喜欢/关注/记录/搜过的词/不喜欢），源开关不动 ----
+  // 第 60 条：手动加的喜欢/不喜欢标签也要清；已降权条目和它们贡献的
+  // per-item 标签键一起清掉，不然下次 toggleDislike 重算又把旧标签复活。
   Future<void> clearTaste() async {
+    for (final id in dislikedItemIds) {
+      await _prefs.remove('taohuayuan_disliked_tags_$id');
+    }
+    await _prefs.remove(_dislikedItemsKey);
+    await _prefs.remove(_likedTagsKey);
+    await _prefs.remove(_manualDislikedTagsKey);
     await _prefs.remove(_likesKey);
     await _prefs.remove(_followsKey);
     await _prefs.remove(_historyKey);
