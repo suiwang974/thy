@@ -90,18 +90,67 @@ class _AuthorScreenState extends State<AuthorScreen> {
               ? const Center(child: CircularProgressIndicator(color: Colors.pinkAccent))
               : _videos.isEmpty
                   ? const Center(child: Text('这个作者暂无在线结果，换个名字试试', style: TextStyle(color: Colors.white54)))
-                  : GridView.builder(
-                      padding: const EdgeInsets.all(16),
-                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 2, crossAxisSpacing: 12, mainAxisSpacing: 14, childAspectRatio: 16 / 13,
-                      ),
-                      itemCount: _videos.length,
-                      itemBuilder: (_, i) => VideoCard(
-                        item: _videos[i],
-                        onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                          builder: (_) => PlayerScreen(item: _videos[i], playlist: _videos, store: widget.store),
-                        )),
-                      ),
+                  : Column(
+                      children: [
+                        // 第 58 条：作者头像——真头像 > 第一条作品的封面 > 首字母圆圈。
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                          child: Row(
+                            children: [
+                              CircleAvatar(
+                                radius: 28,
+                                backgroundColor: Colors.pinkAccent,
+                                backgroundImage: _videos.first.avatarOrCover.isNotEmpty
+                                    ? NetworkImage(_videos.first.avatarOrCover)
+                                    : null,
+                                child: _videos.first.avatarOrCover.isEmpty
+                                    ? Text(
+                                        widget.author.isNotEmpty
+                                            ? widget.author[0].toUpperCase()
+                                            : '?',
+                                        style: const TextStyle(
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 22))
+                                    : null,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(widget.author,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 17,
+                                            fontWeight: FontWeight.bold)),
+                                    Text('${_videos.length} 条视频',
+                                        style: const TextStyle(color: Colors.white54, fontSize: 13)),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Expanded(
+                          child: GridView.builder(
+                            padding: const EdgeInsets.all(16),
+                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 2, crossAxisSpacing: 12, mainAxisSpacing: 14, childAspectRatio: 16 / 13,
+                            ),
+                            itemCount: _videos.length,
+                            itemBuilder: (_, i) => VideoCard(
+                              item: _videos[i],
+                              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                                builder: (_) => PlayerScreen(item: _videos[i], playlist: _videos, store: widget.store),
+                              )),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
         ],
       ),

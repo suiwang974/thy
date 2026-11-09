@@ -53,4 +53,29 @@ void main() {
       ..remove('authorVideoCount');
     expect(VideoItem.fromJson(old).likeRate, 0);
   });
+
+  test('第 58 条：avatarOrCover——真头像 > 作品封面 > 首字母（空）', () {
+    // 真头像在时用真头像，不用封面。
+    const withAvatar = VideoItem(
+      id: 'ph-1', title: 't', source: 'pornhub', author: 'Dominatrix Mara',
+      authorAvatar: 'https://ei.phncdn.com/avatar.jpg',
+      poster: 'https://ci.phncdn.com/videos/thumb.jpg',
+    );
+    expect(withAvatar.avatarOrCover, 'https://ei.phncdn.com/avatar.jpg');
+    // 没真头像时用当前这条视频的封面（已有字段，不多拉一次）。
+    const noAvatar = VideoItem(
+      id: 'xv-1', title: 't', source: 'xvideos', author: 'LexxiLogan',
+      poster: 'https://img-hw.xvideos-cdn.com/thumb.jpg',
+    );
+    expect(noAvatar.avatarOrCover, 'https://img-hw.xvideos-cdn.com/thumb.jpg');
+    // 作者未知时不拿封面冒充来源头像，返回 '' 画首字母。
+    const unknown = VideoItem(
+      id: 'xv-2', title: 't', source: 'xvideos',
+      poster: 'https://img-hw.xvideos-cdn.com/thumb.jpg',
+    );
+    expect(unknown.avatarOrCover, '');
+    // 两样都没有时也是 ''。
+    const neither = VideoItem(id: 'xv-3', title: 't', source: 'xvideos', author: 'LexxiLogan');
+    expect(neither.avatarOrCover, '');
+  });
 }

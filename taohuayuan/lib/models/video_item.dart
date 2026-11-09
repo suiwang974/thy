@@ -6,7 +6,8 @@ class VideoItem {
   final String id;
   final String title;
   final String author;
-  /// 作者头像（视频页 JSON 里有才填，如 xhamster 的 thumbUrl；没有就画首字母圆圈）。
+  /// 作者头像（视频页 JSON 里有才填，如 xhamster 的 thumbUrl、pornhub 的 userAvatar；
+  /// 没有就画首字母圆圈——第 58 条补正：显示层先用 avatarOrCover 兜底作品封面）。
   final String authorAvatar;
   final String batch; // 保留字段（在线源为空）；播放页不再按批次分组。
   final int durationSec;
@@ -52,6 +53,16 @@ class VideoItem {
 
   /// 能不能直接播（有直链）。
   bool get playable => streamUrl != null && streamUrl!.isNotEmpty;
+
+  /// 第 58 条（用户 2026-11-09 补正）：作者头像显示优先级——
+  /// 真头像地址 > 该作者任一作品的封面（当前这条视频的 poster，已有字段，
+  /// 不多拉一次；作者页多条时用第一条的封面）> 首字母圆圈。
+  /// 作者未知时返回 ''（不拿封面冒充来源头像）；poster 为空也返回 ''，
+  /// 显示层照旧画首字母。
+  String get avatarOrCover {
+    if (author.isEmpty) return '';
+    return authorAvatar.isNotEmpty ? authorAvatar : poster;
+  }
 
   /// App 内嵌官方播放器用的地址：只嵌视频播放器本身（embed 播放页），
   /// 不要嵌整个源站网站（第 32 条：嵌整站根本看不了视频）。

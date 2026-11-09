@@ -516,7 +516,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return '这条直链只有 $actual，是带水印的预览，不是正片（列表写 $listed）';
   }
 
-  /// 第 42 条：作者行——头像（有真头像就显示，没有画首字母圆圈）+ 名字 + 关注。
+  /// 第 42 条：作者行——头像（第 58 条：真头像 > 作品封面 > 首字母圆圈，
+  /// 用 avatarOrCover）+ 名字 + 关注。
   /// 点头像/名字进作者页，列他发布的所有视频。
   Widget _authorRow() {
     final author = _current.author;
@@ -528,10 +529,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
           child: CircleAvatar(
             radius: 18,
             backgroundColor: Colors.pinkAccent,
-            backgroundImage: _current.authorAvatar.isNotEmpty
-                ? NetworkImage(_current.authorAvatar)
+            backgroundImage: _current.avatarOrCover.isNotEmpty
+                ? NetworkImage(_current.avatarOrCover)
                 : null,
-            child: _current.authorAvatar.isEmpty
+            child: _current.avatarOrCover.isEmpty
                 ? Text(author.isNotEmpty ? author[0].toUpperCase() : '?',
                     style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
                 : null,

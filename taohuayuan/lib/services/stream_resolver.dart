@@ -139,21 +139,40 @@ class StreamResolver {
   /// 第 42 条：视频页 HTML -> 发布者/上传者/频道名（+头像，有才填）。
   /// 每个源的字段不一样，逐源抠（2026-11-09 VM 实测过真页的才写死）：
   /// - pornhub：视频页 JSON 里 `"username":"..."`（全页唯一，和 viewkey 同一块 JSON）。
+  ///   第 58 条：真头像也在视频页里——视频信息行的
+  ///   `<div class="userAvatar"><a class="userAvatarLink"><img src="https://ei.phncdn.com/...jpg" alt="avatar">`
+  ///   （VM 实测真页：上传者 Dominatrix Mara，第一个 userAvatar 就是主视频的，
+  ///   评论区在后面）。
   /// - xvideos：`uploader-tag` 链接里的名字（去掉后面的粉丝数）。
+  ///   第 58 条：视频页全文 "avatar" 0 命中，uploader 链接里没有 img——没有真头像。
   /// - xhamster：视频页 JSON 里 `"author":{"name":"...","thumbUrl":"..."}`。
   /// - rule34videos：JSON-LD `"author": "..."`。
+  ///   第 58 条：VM 下连不上 rule34videos（服务器空回复），真页没见过，
+  ///   只有名字、没有头像分支。
   /// - niacg：`<title>` 里的 [作者] 前缀（站内标题都这么写）。
+  ///   第 58 条：视频页里作者只是文字链接，"avatar" 命中全是评论区 CSS，
+  ///   没有真头像。
   /// - spankbang / lianzu11 / hanime：通用兜底（JSON-LD author、rel=author、
   ///   uploader/channel 链接）——VM 下没见过真页，抠不到返回 ''，不编一个。
+  ///   第 58 条：hanime 两镜像 VM 下都是 Cloudflare 403；用户截图里 watch 页
+  ///   作者旁确实有个圆形头像，但标记结构没法在 VM 下核实，不猜正则——
+  ///   拿不到真头像时显示层按第 58 条补正用作品封面兜底。
   /// - eporner：API、embed 页、xhr 里都没有作者字段，视频页又有年龄验证墙，
   ///   HTTP 这条路拿不到作者（见 parseVideoAuthor 的注释）；作者只能等用户在
   ///   内置浏览器/官方播放器里打开视频页时由 Sniffer 从 DOM 里补。
+  ///   第 58 条：视频页 vit-uploader 只是文字链接；页里 "avatar" 命中全是
+  ///   评论者头像（/img/avatars/…）和访客 SVG 图标，不是上传者的——没有真头像。
   static ({String author, String authorAvatar}) parseVideoAuthor(String html, String source) {
     String clean(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
     if (source == 'pornhub') {
       final m = RegExp(r'"username"\s*:\s*"([^"]+)"').firstMatch(html);
       if (m != null) {
-        return (author: clean(m.group(1)!), authorAvatar: '');
+        // 第 58 条：真头像（见上面注释）；没有也只返回名字，不拿别的东西冒充。
+        final av = RegExp(
+          r'''<div class="userAvatar">\s*<a[^>]*>\s*<img[^>]*src="([^"]+)"[^>]*alt="avatar"''',
+        ).firstMatch(html);
+        final avatar = av == null ? '' : _absAvatar(av.group(1)!);
+        return (author: clean(m.group(1)!), authorAvatar: avatar);
       }
     }
     if (source == 'xvideos') {
@@ -234,6 +253,9 @@ class StreamResolver {
     }
     return (author: '', authorAvatar: '');
   }
+
+  /// 头像地址归一化：协议相对地址（//ei.phncdn.com/…）补 https；绝对地址原样返回。
+  static String _absAvatar(String u) => u.startsWith('//') ? 'https:$u' : u;
 
   /// niacg 标题里的 [作者] 前缀（和 sources.dart 里的 _niacgAuthorFromTitle 同一套规则，
   /// 这里单抄一份：stream_resolver 不 import sources，避免循环依赖）。

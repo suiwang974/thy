@@ -923,10 +923,12 @@ class _ShortPageState extends State<_ShortPage> {
               CircleAvatar(
                 radius: 22,
                 backgroundColor: known ? Colors.pinkAccent : Colors.white24,
-                backgroundImage: _displayItem.authorAvatar.isNotEmpty
-                    ? NetworkImage(_displayItem.authorAvatar)
+                // 第 58 条：真头像 > 当前这条视频的封面 > 首字母圆圈；
+                // 作者未知时 avatarOrCover 是 ''，照旧画来源首字母。
+                backgroundImage: _displayItem.avatarOrCover.isNotEmpty
+                    ? NetworkImage(_displayItem.avatarOrCover)
                     : null,
-                child: _displayItem.authorAvatar.isEmpty
+                child: _displayItem.avatarOrCover.isEmpty
                     ? Text(
                         known ? author[0].toUpperCase() : label[0].toUpperCase(),
                         style: const TextStyle(

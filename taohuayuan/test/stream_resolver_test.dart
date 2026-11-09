@@ -399,6 +399,51 @@ setVideoUrlLow('https://xh2-cdn.example.com/video_360p.mp4')
     );
   });
 
+  test('第 58 条：pornhub 真头像从 userAvatar 抠；xvideos/eporner/niacg 没有真头像', () {
+    // VM 实测真片段：上传者 Dominatrix Mara，视频信息行的 userAvatar 就是主视频的。
+    final ph = StreamResolver.parseVideoAuthor(
+      '{"username":"Dominatrix Mara","viewkey":"69c305dcb7ffc"}'
+      '<div class="video-info-row userRow"><div class="userInfoBlock">'
+      '<div class="userAvatar"><a href="/pornstar/dominatrix-mara" class="userAvatarLink">'
+      '<img loading="lazy" src="https://ei.phncdn.com/(m=bLazqgKlbyaT)(mh=yi3_14Ug4rgldr35)aa99a73c-e57a-41a8-9da9-16be0b8540be.jpg" alt="avatar">'
+      '</a></div></div></div>',
+      'pornhub',
+    );
+    expect(ph.author, 'Dominatrix Mara');
+    expect(
+      ph.authorAvatar,
+      'https://ei.phncdn.com/(m=bLazqgKlbyaT)(mh=yi3_14Ug4rgldr35)aa99a73c-e57a-41a8-9da9-16be0b8540be.jpg',
+    );
+    // 没 userAvatar 时只返回名字，头像空着（显示层用作品封面兜底）。
+    final phNoAv = StreamResolver.parseVideoAuthor(
+      '{"username":"Dominatrix Mara","viewkey":"69c305dcb7ffc"}',
+      'pornhub',
+    );
+    expect(phNoAv.author, 'Dominatrix Mara');
+    expect(phNoAv.authorAvatar, '');
+    // xvideos 视频页全文 "avatar" 0 命中：有名字、没头像。
+    final xv = StreamResolver.parseVideoAuthor(
+      '<a href="/lexxilogan" class="btn btn-default label main uploader-tag hover-name"><span class="name">LexxiLogan</span></a>',
+      'xvideos',
+    );
+    expect(xv.author, 'LexxiLogan');
+    expect(xv.authorAvatar, '');
+    // eporner vit-uploader 只是文字链接：有名字、没头像（评论者头像不算）。
+    final ep = StreamResolver.parseVideoAuthor(
+      '<li class="vit-uploader"><a href="/profile/SAEKO9999/" title="Uploader">SAEKO9999</a></li>',
+      'eporner',
+    );
+    expect(ep.author, 'SAEKO9999');
+    expect(ep.authorAvatar, '');
+    // niacg 作者只是文字链接：有名字、没头像。
+    final ni = StreamResolver.parseVideoAuthor(
+      '<title>[AlphaG] Capture Yixuan + Naked [中文字幕]</title>',
+      'niacg',
+    );
+    expect(ni.author, 'AlphaG');
+    expect(ni.authorAvatar, '');
+  });
+
   // ---------- 第 51 条：xvideos 档位太低 ----------
   test('第 51 条：xvideos High/Low 同地址只留一档（1440p 标签那条 High=Low=mp4_sd.mp4）', () {
     // VM 实测：1440p 标签视频 video.omvtbcb4257 的 setVideoUrlHigh/Low 都是
