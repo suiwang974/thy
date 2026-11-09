@@ -6,6 +6,8 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../data/sources.dart';
 import '../models/video_item.dart';
+import '../services/adblock_service.dart';
+import '../services/downloader.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import 'player_screen.dart';
@@ -53,6 +55,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   bool _forceExit = false;
   // 镜像已试过的域名：每个镜像只试一次，两个都试过了就不再切（不死循环）。
   final _triedHosts = <String>{};
+  // 广告拦截计数（第 26 条）：导航层拦掉的广告跳转数，底部显示。
+  int _blockedCount = 0;
 
   @override
   void initState() {
@@ -63,14 +67,35 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (_) {
           if (mounted) setState(() => _loading = true);
+          // 尽早注入拦截 JS（fetch/XHR 覆盖越早越好；页面还没准备好时会抛错，
+          // 忽略，等 onPageFinished 再注一次）。
+          unawaited(_injectAdblock().catchError((_) {}));
         },
         onPageFinished: (_) async {
           if (!mounted) return;
           setState(() => _loading = false);
+          await _injectAdblock();
           await _sniffVideo();
           // 视频可能是懒加载的：4 秒后再嗅一次。
           await Future.delayed(const Duration(seconds: 4));
           if (mounted) await _sniffVideo();
+        },
+        // 广告拦截第一层（第 26 条）：顶层跳转到广告域名直接不让跳
+        // （弹窗/跳转广告就是这么来的）。第一方（当前站自己的域名）
+        // 永远放行——种子里有 ||xvideos.com^$third-party 这类规则，
+        // 不加第一方豁免会把站本身拦掉。
+        onNavigationRequest: (req) {
+          final url = req.url;
+          if (url.startsWith('about:blank') || url.startsWith('data:')) {
+            return NavigationDecision.navigate;
+          }
+          final firstParty = Uri.tryParse(_currentUrl)?.host ?? '';
+          if (AdblockService.instance
+              .isBlockedUrl(url, firstPartyHost: firstParty)) {
+            if (mounted) setState(() => _blockedCount++);
+            return NavigationDecision.prevent;
+          }
+          return NavigationDecision.navigate;
         },
         onWebResourceError: (error) {
           // 主页面加载失败（断网、被拦、证书错）：是 hanime 镜像就自动切另一个。
@@ -109,6 +134,18 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     if (!mounted) return;
     setState(() => _mirrorNote = '$host 打不开，已自动切到能打开的 $mirrorHost');
     _controller.loadRequest(Uri.parse(mirror));
+  }
+
+  /// 广告拦截第二层（第 26 条）：JS 注入——fetch/XHR 发往广告域名直接 abort、
+  /// window.open 弹窗拦截、按 ## 选择器藏广告元素。规则没准备好时不注。
+  /// 上限见 AdblockService 类注释：webview_flutter 没有 shouldInterceptRequest，
+  /// 首屏 HTML 里内嵌的广告子资源在注入前可能已经发出去了，拦不干净。
+  Future<void> _injectAdblock() async {
+    final svc = AdblockService.instance;
+    if (!svc.isReady) return;
+    try {
+      await _controller.runJavaScript(svc.injectionJs);
+    } catch (_) {}
   }
 
   /// 嗅视频直链：页里 <video> / <source> 的 src。
@@ -232,6 +269,27 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                     const Expanded(
                       child: Text('检测到视频直链', style: TextStyle(color: Colors.white70, fontSize: 13)),
                     ),
+                    // 嗅到的直链直接下（第 27 条）：不用再进播放页解析一次。
+                    IconButton(
+                      icon: const Icon(Icons.download, color: Colors.white),
+                      tooltip: '下载这段视频',
+                      onPressed: () async {
+                        final messenger = ScaffoldMessenger.of(context);
+                        await DownloadManager.instance.startDownloadFromUrl(
+                          id: '${widget.sourceId}-$_currentUrl',
+                          title: _cleanPageTitle,
+                          source: widget.sourceId,
+                          url: _videoUrl,
+                          headers: {
+                            'Referer': _currentUrl,
+                          },
+                        );
+                        if (!mounted) return;
+                        messenger.showSnackBar(
+                          const SnackBar(content: Text('开始下载，去「我的 · 下载管理」看进度')),
+                        );
+                      },
+                    ),
                     ElevatedButton(
                       onPressed: _openInPlayer,
                       child: const Text('用播放器播'),
@@ -244,7 +302,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
               color: Colors.black,
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               child: Text(
-                hasAds ? '站内页面有广告；嗅到的直链播就没有广告。' : '这个站本身没广告；嗅到的直链播也没有广告。',
+                '${hasAds ? '站内页面有广告；嗅到的直链播就没有广告。' : '这个站本身没广告；嗅到的直链播也没有广告。'}'
+                '${_blockedCount > 0 ? '已拦截 $_blockedCount 个广告跳转。' : ''}',
                 style: const TextStyle(color: Colors.white54, fontSize: 12),
               ),
             ),

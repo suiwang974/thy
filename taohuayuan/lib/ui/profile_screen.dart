@@ -2,8 +2,11 @@ import 'package:flutter/material.dart';
 
 import '../data/sources.dart';
 import '../models/video_item.dart';
+import '../services/adblock_service.dart';
+import '../services/downloader.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
+import 'downloads_screen.dart';
 import 'player_screen.dart';
 import 'web_source_browser.dart';
 import 'widgets.dart';
@@ -28,6 +31,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
   List<VideoItem> _followVideos = [];
   bool _followLoading = false;
   bool _followLoaded = false;
+  // 广告拦截更新状态（第 26 条）：点「更新规则」时的进度 + 结果。
+  bool _adblockUpdating = false;
+  String? _adblockResult;
 
   @override
   void initState() {
@@ -80,6 +86,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
     return '$m:${s.toString().padLeft(2, '0')}';
   }
 
+  String _fmtDate(DateTime d) {
+    return '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')} '
+        '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+  }
+
   /// 一区一张卡片：标题 + 说明 + 内容，分区一眼看清。
   Widget _sectionCard({required String title, required String subtitle, required Widget child}) {
     return Card(
@@ -115,6 +126,119 @@ class _ProfileScreenState extends State<ProfileScreen> {
       body: ListView(
         children: [
           const SizedBox(height: 8),
+          // 下载管理（第 27 条定死：「我的」里加下载管理，可以看到下载了什么，
+          // 也能直接点开看）。点卡片进管理页；正在下的在这里也能看到进度。
+          _sectionCard(
+            title: '下载管理',
+            subtitle: '文件存在系统 Downloads/桃花源/ 里',
+            child: ListenableBuilder(
+              listenable: DownloadManager.instance,
+              builder: (_, _) {
+                final m = DownloadManager.instance;
+                final active = m.activeTasks;
+                final done = m.doneTasks;
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '正在下 ${active.length} 个 · 已下完 ${done.length} 个',
+                      style: const TextStyle(color: Colors.white70, fontSize: 13),
+                    ),
+                    if (active.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      ...active.take(3).map((t) => Padding(
+                            padding: const EdgeInsets.only(bottom: 6),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(t.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                const SizedBox(height: 3),
+                                LinearProgressIndicator(
+                                  value: t.progress > 0 ? t.progress : null,
+                                  minHeight: 3,
+                                  backgroundColor: Colors.white24,
+                                  valueColor: const AlwaysStoppedAnimation<Color>(Colors.pinkAccent),
+                                ),
+                                const SizedBox(height: 2),
+                                Text('${t.statusText} ${(t.progress * 100).round()}% · ${t.sizeText}',
+                                    style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                              ],
+                            ),
+                          )),
+                    ],
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                          builder: (_) => DownloadsScreen(
+                            manager: DownloadManager.instance,
+                            store: widget.store,
+                          ),
+                        )),
+                        child: const Text('打开下载管理'),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+          // 广告拦截（第 26 条）：规则来自用户 1DM 备份里的 27 个源（22 个启用）。
+          // 更新按源 URL 现拉；上次更新时间与每源状态写清楚，失败的源不藏着。
+          // 上限如实说：webview_flutter 没有 shouldInterceptRequest，
+          // 弹窗/跳转能拦，页面内嵌的广告子资源拦不干净。
+          _sectionCard(
+            title: '广告拦截',
+            subtitle: '内置浏览器的拦截规则，来自你的 1DM 备份',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  AdblockService.instance.isReady
+                      ? '已加载 ${AdblockService.instance.blockedHostCount} 个拦截域名'
+                          '（种子 ${AdblockService.instance.seedHostCount} 个）'
+                          '${AdblockService.instance.lastUpdated == null ? ' · 还没更新过' : ' · 上次更新 ${_fmtDate(AdblockService.instance.lastUpdated!)}'}'
+                      : '规则还没加载好，稍等再看',
+                  style: const TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '能拦：弹窗、跳转到广告站的链接、页面里的广告位；拦不干净：首屏 HTML 里内嵌的广告图片/脚本（系统限制，见反馈说明）。',
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                if (_adblockResult != null) ...[
+                  const SizedBox(height: 4),
+                  Text(_adblockResult!, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                ],
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: _adblockUpdating
+                        ? null
+                        : () async {
+                            setState(() {
+                              _adblockUpdating = true;
+                              _adblockResult = null;
+                            });
+                            final r = await AdblockService.instance.updateRules();
+                            if (!mounted) return;
+                            setState(() {
+                              _adblockUpdating = false;
+                              _adblockResult = r.ok > 0
+                                  ? '更新完成：${r.ok} 个源成功、${r.failed} 个源失败，新增 ${r.added} 个拦截域名。'
+                                      '${r.failed > 0 ? '失败的源稍后再试。' : ''}'
+                                  : '更新失败：${r.failed} 个源都没拉回来，检查网络再试。';
+                            });
+                          },
+                    child: Text(_adblockUpdating ? '正在更新规则…' : '更新规则'),
+                  ),
+                ),
+              ],
+            ),
+          ),
           _sectionCard(
             title: '启用的源',
             subtitle: '默认全部启用；关掉后搜索不再查它',
@@ -293,7 +417,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           _sectionCard(
             title: '关于',
             subtitle: '桃花源 2.9.0 · 从零重写版',
-            child: const Text('10 个在线源实时搜索，视频均在线播，手机上没有下载过任何视频。',
+            child: const Text('10 个在线源实时搜索，视频均在线播；下载的视频存在系统 Downloads/桃花源/ 里。',
                 style: TextStyle(color: Colors.white54, fontSize: 13)),
           ),
           const SizedBox(height: 24),

@@ -6,9 +6,11 @@ import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_item.dart';
+import '../services/adblock_service.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
+import 'download_button.dart';
 
 /// 短视频页：竖屏上下滑，滑到哪段就真播哪段的视频（不是只放封面图）。
 /// 数据走已启用源的实时热门（没有本地目录）；滑到下一段前先预探它的直链。
@@ -348,6 +350,13 @@ class _ShortPageState extends State<_ShortPage> {
           await Future.delayed(const Duration(seconds: 4));
           if (mounted) await _muteWebVideo(wc);
         }
+        // 广告拦截 JS 注入（第 26 条）：官方播放器页里也有广告。
+        final svc = AdblockService.instance;
+        if (svc.isReady) {
+          try {
+            await wc.runJavaScript(svc.injectionJs);
+          } catch (_) {}
+        }
       },
       onNavigationRequest: (req) {
         final u = req.url;
@@ -625,6 +634,9 @@ class _ShortPageState extends State<_ShortPage> {
                   icon: const Icon(Icons.fullscreen, color: Colors.white, size: 30),
                   onPressed: _fullscreen,
                 ),
+                const SizedBox(height: 8),
+                // 下载入口（第 27 条）：短视频点一下就开始下。
+                DownloadButton(item: widget.item, size: 30),
               ],
             ),
           ),
