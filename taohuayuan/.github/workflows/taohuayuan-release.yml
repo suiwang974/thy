@@ -54,6 +54,24 @@ jobs:
         working-directory: taohuayuan
         run: flutter build apk --release --target-platform android-arm64
 
+      - name: Read version
+        # 第 50 条（应用内更新）：tag 从 pubspec 的 versionCode 来，
+        # 每轮 bump 一次 versionCode 就自动出一个新 tag（taohuayuan-v10），
+        # App 读 GitHub Releases latest、拿 tag 里的数字跟本机 versionCode 比，
+        # 不用再靠固定 tag + 人工改 version.json。
+        # tag 名就是发布号，跟 App 里显示的“v10”同一套。
+        id: ver
+        working-directory: taohuayuan
+        run: |
+          CODE=$(grep '^version:' pubspec.yaml | sed 's/.*+//')
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "tag=taohuayuan-v$CODE" >> "$GITHUB_OUTPUT"
+          {
+            echo 'notes<<EOF'
+            git log -1 --pretty=%B
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Rename APK
         # 只打 arm64 一个包（不 split-per-abi），输出就是 app-release.apk，不是 app-arm64-v8a-release.apk。
         run: mv taohuayuan/build/app/outputs/flutter-apk/app-release.apk taohuayuan-android-arm64-v2.9.0.apk
@@ -61,9 +79,9 @@ jobs:
       - name: Upload Release Asset
         uses: ncipollo/release-action@v1
         with:
-          tag: taohuayuan-v2.9.0
-          name: 桃花源 v2.9.0（重写版）
-          body: "桃花源从零重写版：全新 Flutter 原生，8 个在线源实时搜，中文搜索，短视频真播。"
+          tag: ${{ steps.ver.outputs.tag }}
+          name: 桃花源 v${{ steps.ver.outputs.code }}（重写版）
+          body: "桃花源从零重写版 v${{ steps.ver.outputs.code }}：\n${{ steps.ver.outputs.notes }}"
           allowUpdates: true
           replacesArtifacts: true
           artifacts: taohuayuan-android-arm64-v2.9.0.apk

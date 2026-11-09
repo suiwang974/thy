@@ -398,4 +398,159 @@ setVideoUrlLow('https://xh2-cdn.example.com/video_360p.mp4')
       'fepaciw123',
     );
   });
+
+  // ---------- 第 51 条：xvideos 档位太低 ----------
+  test('第 51 条：xvideos High/Low 同地址只留一档（1440p 标签那条 High=Low=mp4_sd.mp4）', () {
+    // VM 实测：1440p 标签视频 video.omvtbcb4257 的 setVideoUrlHigh/Low 都是
+    // https://gcore-vod.xvideos-cdn.com/videos/mp4_sd.mp4（地址里没分辨率）。
+    const html = r'''
+      setVideoUrlHigh('https://gcore-vod.xvideos-cdn.com/videos/mp4_sd.mp4');
+      setVideoUrlLow('https://gcore-vod.xvideos-cdn.com/videos/mp4_sd.mp4');
+      setVideoHLS('https://gcore-vod.xvideos-cdn.com/videos/hls.m3u8');
+    ''';
+    final variants = StreamResolver.parseXvideosVariants(html);
+    // High/Low 同地址去重后只剩 HLS 自适应 + 一个 mp4 档（地址里没分辨率，
+    // 标签按 fallback 叫“高清”，不是“原画”）。
+    expect(variants.map((v) => v.label).toList(), ['高清', 'HLS 自适应']);
+    expect(variants.where((v) => v.label == '高清').length, 1);
+  });
+
+  test('第 51 条：mergeHlsVariants——master 展开后菜单有 1080p，mp4 优先于同分辨率 HLS 变体', () {
+    // VM 实测：1080p 标签视频 video.upltcpbcb6f 的 master 有 5 档
+    // （1080p/720p/480p/360p/250p），最高 1920x1080。
+    const master = '#EXTM3U\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080\n'
+        'https://gcore-vod.xvideos-cdn.com/videos/hls/1080p.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1280x720\n'
+        'https://gcore-vod.xvideos-cdn.com/videos/hls/720p.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=854x480\n'
+        'https://gcore-vod.xvideos-cdn.com/videos/hls/480p.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=640x360\n'
+        'https://gcore-vod.xvideos-cdn.com/videos/hls/360p.m3u8\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=426x250\n'
+        'https://gcore-vod.xvideos-cdn.com/videos/hls/250p.m3u8\n';
+    final hls = StreamResolver.parseM3u8VariantList(
+        master, 'https://gcore-vod.xvideos-cdn.com/videos/hls.m3u8');
+    expect(hls.map((v) => v.label).toList(), ['1080p', '720p', '480p', '360p', '250p']);
+    const base = [
+      StreamVariant('HLS 自适应', 'https://gcore-vod.xvideos-cdn.com/videos/hls.m3u8'),
+      StreamVariant('360p', 'https://gcore-vod.xvideos-cdn.com/videos/video_360p.mp4'),
+      StreamVariant('240p', 'https://gcore-vod.xvideos-cdn.com/videos/video_240p.mp4'),
+    ];
+    final merged = StreamResolver.mergeHlsVariants(base, hls);
+    // HLS 自适应最前，然后按画质从高到低；360p 只留 mp4 那条（不重复）。
+    expect(merged.map((v) => v.label).toList(),
+        ['HLS 自适应', '1080p', '720p', '480p', '360p', '250p', '240p']);
+    expect(merged[4].url, contains('video_360p.mp4'));
+  });
+
+  // ---------- 第 54 条：详情页附加信息 ----------
+  test('第 54 条：xvideos 视频页——标签 + 点赞率 + 相关视频 JSON', () {
+    // VM 实测真片段：video.upltcpbcb6f/footjob_and_blowjob。
+    const html = r'''
+      <a href="/tags/teen" class="is-keyword">teen</a>
+      <a href="/tags/blowjob" class="is-keyword">blowjob</a>
+      <span class="rating-good-perc">99.0%</span>
+      related=[{"u":"\/video.u4h9mbkf07c\/my_test_video","t":"My Test Video","i":"https:\/\/gcore-vod.xvideos-cdn.com\/thumb.jpg","d":"5 min","r":"99%","n":"187.2k","pn":"Darcy Dark"},{"u":"\/video.u9x1mbkf07d\/second_one","t":"Second One","i":"https:\/\/gcore-vod.xvideos-cdn.com\/thumb2.jpg","d":"12 min","r":"97%","n":"45.6k","pn":""}];
+    ''';
+    final ex = StreamResolver.parseXvideosDetailExtras(html);
+    expect(ex.tags, ['teen', 'blowjob']);
+    expect(ex.likeRate, 99);
+    expect(ex.related.length, 2);
+    expect(ex.related[0].title, 'My Test Video');
+    expect(ex.related[0].durationSec, 300);
+    expect(ex.related[0].views, 187200);
+    expect(ex.related[0].likeRate, 99);
+    expect(ex.related[0].author, 'Darcy Dark');
+    expect(ex.related[1].durationSec, 720);
+    expect(ex.related[1].views, 45600);
+  });
+
+  test('第 54 条：pornhub 标签 + 相关 API（related/topRated/mostViewed）', () {
+    // VM 实测真片段：viewkey=681e308e37c7d 视频页的标签 + 相关 API 首条。
+    const html = '''
+      <a data-label="tag" href="/video/search?search=blonde"><span>blonde</span></a>
+      <a data-label="tag" href="/video/search?search=big+tits"><span>big tits</span></a>
+    ''';
+    expect(StreamResolver.parsePornhubTags(html), ['blonde', 'big tits']);
+    expect(
+      StreamResolver.parsePornhubRelatedApiUrl(
+          '... "player_related_datas?id=468422645" ...'),
+      'https://www.pornhub.com/api/v1/video/player_related_datas?id=468422645',
+    );
+    const api = '''
+      {"related": [["https://ci.phncdn.com/videos/202512/17/468422645/original/(m=eafTGgaaaa)(mh=kE7W7fF4l4xX)/thumb.jpg","Related One","27:21",91,"https://www.pornhub.com/view_video.php?viewkey=abc123",392006,[],"Channel A","https://www.pornhub.com/channels/channel-a",[],[]]],
+      "topRated": [["https://ci.phncdn.com/t2.jpg","Top One","10:00",95,"https://www.pornhub.com/view_video.php?viewkey=def456",1000,[],"","",[],[]]],
+      "mostViewed": []}''';
+    final rel = StreamResolver.parsePornhubRelatedApi(api);
+    expect(rel.length, 2);
+    expect(rel[0].title, 'Related One');
+    expect(rel[0].durationSec, 1641);
+    expect(rel[0].views, 392006);
+    expect(rel[0].likeRate, 91);
+    expect(rel[0].author, 'Channel A');
+    expect(rel[1].title, 'Top One');
+  });
+
+  test('第 54 条：pornhub 页内 relatedVideos JSON 备选（没封面没评分时也收）', () {
+    const html = '''
+      relatedVideos = [{"fields":{"id":468422645,"vkey":"681e308e37c7d","title":"Fallback One","duration":1641,"media_path":""}}];
+    ''';
+    final rel = StreamResolver.parsePornhubRelatedVideosJson(html);
+    expect(rel.length, 1);
+    expect(rel[0].title, 'Fallback One');
+    expect(rel[0].durationSec, 1641);
+    expect(rel[0].likeRate, 0); // 没给就是未知，不编。
+  });
+
+  test('第 54 条：eporner 相关视频卡片（#relateddiv 的 .mb 卡片）', () {
+    // VM 实测真片段：video-3GjtIDYbZjD 视频页 relateddiv 首张卡片原文。
+    const html = '''
+      <div id="relateddiv"><div class="mb hdy" data-id="12365059" id="vf123650596883"><div class="mbimg"><div class="mbcontent"><a href="/video-rkWojtLwqWM/joymii-horny-redhead-loves-some-bdsm-fucking/"><img class="lazyimg" data-src="https://static-ca-cdn.eporner.com/thumbs/static4/1/12/123/12365059/7_240.jpg" alt="JOYMII - Horny Redhead Loves Some BDSM Fucking" /></a></div></div><div class="mbunder"><p class="mbtit"><a href="/video-rkWojtLwqWM/joymii-horny-redhead-loves-some-bdsm-fucking/">JOYMII - Horny Redhead Loves Some BDSM Fucking</a></p><p class="mbstats"><span class="mbtim" title="Duration">12:36</span><span class="mbrate" title="Rating">91%</span><span class="mbvie" title="Views">19,727</span><span class="mb-uploader ischannel"><a href="/channel/joymii/" title="Uploader">JOYMII</a></span></p></div></div></div>
+    ''';
+    final rel = StreamResolver.parseEpornerRelated(html);
+    expect(rel.length, 1);
+    expect(rel[0].title, 'JOYMII - Horny Redhead Loves Some BDSM Fucking');
+    expect(rel[0].durationSec, 756);
+    expect(rel[0].views, 19727);
+    expect(rel[0].likeRate, 91);
+    expect(rel[0].author, 'JOYMII');
+  });
+
+  test('第 54 条：r34 视频页——标签 + 相关视频卡片', () {
+    // VM 实测真片段：video/yukari-maid-movie-jy/ 的标签区 + related-videos 首张卡片。
+    const html = '''
+      <div class=label>Tags</div><div class=wrap><a class=tag_item href=/tag/bedroom/> bedroom </a><a class=tag_item href=/tag/maid/> maid </a></div>
+      <div class="container related-videos"><h2 class=section-title>Related Videos</h2><div class=post-list><div class="post-item card"><a href=/video/yukari-cooking-9a/> <div class=image-container><img alt="Yukari Cooking thumbnail"class=card-img-top data-thumbnails=/media/videos/91065/thumbnails/thumb-53ac0d6cbaad473fa402ca78bfc77fe9.webp,/media/videos/91065/thumbs/thumb_1.webp><span class=duration-badge>1:55</span></div> <div class=card-body><h3 class=card-title>Yukari Cooking</h3><div class=post-info><div class=likes-percentage><img alt="Thumbs Up Icon"class=icon src=/static/icons/thumbs-up-solid.svg> 100% (5)</div><div class=views-count><img alt="Eye Icon"class=icon src=/static/icons/eye-solid.svg> 969</div></div></div> </a></div></div></div>
+    ''';
+    final ex = StreamResolver.parseR34DetailExtras(html);
+    expect(ex.tags, ['bedroom', 'maid']);
+    expect(ex.related.length, 1);
+    expect(ex.related[0].title, 'Yukari Cooking');
+    expect(ex.related[0].durationSec, 115);
+    expect(ex.related[0].views, 969);
+    expect(ex.related[0].likeRate, 100);
+  });
+
+  test('第 54 条：时长/观看数文本解析（"5 min"、"1 h 5 min"、"187.2k"、"19,727"）', () {
+    expect(StreamResolver.parseDurationText('5 min'), 300);
+    expect(StreamResolver.parseDurationText('1 h 5 min'), 3900);
+    expect(StreamResolver.parseDurationText('12:36'), 756);
+    expect(StreamResolver.parseDurationText('1:55'), 115);
+    expect(StreamResolver.parseDurationText(''), 0);
+    expect(StreamResolver.parseCountText('187.2k'), 187200);
+    expect(StreamResolver.parseCountText('469K'), 469000);
+    expect(StreamResolver.parseCountText('19,727'), 19727);
+    expect(StreamResolver.parseCountText('392006'), 392006);
+    expect(StreamResolver.parseCountText('1.2M'), 1200000);
+    expect(StreamResolver.parseCountText(''), 0);
+  });
+
+  test('第 54 条：parseDetailExtras 分发——未知源返回空 extras，不编数据', () {
+    final ex = StreamResolver.parseDetailExtras('<html></html>', 'niacg');
+    expect(ex.tags, isEmpty);
+    expect(ex.likeRate, 0);
+    expect(ex.authorVideoCount, 0);
+    expect(ex.related, isEmpty);
+  });
 }

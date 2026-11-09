@@ -67,6 +67,14 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   final _triedHosts = <String>{};
   // 广告拦截计数（第 26 条）：导航层拦掉的广告跳转数，底部显示。
   int _blockedCount = 0;
+  // 第 53 条：嗅探诊断（上次嗅的结果：查了什么、为什么没嗅到）。
+  SniffDiagnosis _lastDiagnosis = const SniffDiagnosis();
+  // 第 53 条：每 3 秒轮询 performance 攒下来的候选地址——webview_flutter
+  // 没有 onLoadResource 回调，拿不到请求发出的实时通知，轮询是唯一能
+  // “持续监听”新请求的办法。用户点了播放、分片开始拉流后，
+  // 下一次轮询就能把 .m3u8/.ts 攒下来，手动嗅探时直接用，不用等加载时机。
+  Timer? _pollTimer;
+  final _accumulated = <String>{};
 
   @override
   void initState() {
@@ -129,6 +137,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           if (u != null && u.isNotEmpty) {
             _currentUrl = u;
             _sniffed = [];
+            _accumulated.clear();
+            _lastDiagnosis = const SniffDiagnosis();
           }
         },
       ));
@@ -144,6 +154,38 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     } else {
       _controller.loadRequest(Uri.parse(widget.url));
     }
+    // 第 53 条：轮询 performance 攒候选地址（3 秒一次，轻量 JS，不扫 HTML）。
+    _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) => _pollSniff());
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    super.dispose();
+  }
+
+  /// 第 53 条：轮询一次 performance + video 地址，攒进候选集。
+  /// 失败（页面正在跳转/JS 还没准备好）就跳过，不打扰浏览。
+  Future<void> _pollSniff() async {
+    if (!mounted) return;
+    try {
+      final raw = await _controller.runJavaScriptReturningResult(Sniffer.pollJs);
+      final decoded = jsonDecode(raw.toString()) as Map<String, dynamic>;
+      var changed = false;
+      for (final v in (decoded['videos'] as List?) ?? []) {
+        final src = ((v as Map)['src'] ?? '').toString();
+        if (src.isNotEmpty && _accumulated.add(src)) changed = true;
+      }
+      for (final r in (decoded['resources'] as List?) ?? []) {
+        final u = r.toString();
+        if (u.isNotEmpty && _accumulated.add(u)) changed = true;
+      }
+      if (changed && mounted) {
+        // 只攒下来，不在这里跑完整嗅探：完整嗅探要拉播放列表、探大小，
+        // 视频播着的时候每几秒来一次太费流量。攒下来的地址在用户点
+        // 嗅探按钮 / 页面加载嗅探时一起用，不用等加载时机。
+      }
+    } catch (_) {}
   }
 
   /// 撞上验证页/加载失败时切另一个镜像（只切没试过的，两个都试过了就停）。
@@ -171,17 +213,23 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     } catch (_) {}
   }
 
-  /// 嗅视频（第 34 条）：DOM + performance 网络请求 + HTML 正则三路，
-  /// m3u8/blob/ts 都认，不再是只认 mp4。
+  /// 嗅视频（第 34 条 + 第 53 条两段式）：DOM + performance 网络请求 +
+  /// HTML 正则三路，m3u8/blob/ts 都认，不再是只认 mp4。
+  /// 轮询攒下来的候选地址一起传进去（视频播了一会儿才拉流的也能嗅到）。
   /// 顺带看页面标题是不是 Cloudflare 验证页（Just a moment / Attention
   /// Required）：是的话，hanime 镜像自动切另一个。
   Future<void> _sniffVideo() async {
     try {
-      final r = await Sniffer.sniff(_controller, pageUrl: _currentUrl);
+      final r = await Sniffer.sniff(
+        _controller,
+        pageUrl: _currentUrl,
+        extraCandidates: _accumulated.toList(),
+      );
       if (!mounted) return;
       setState(() {
         _pageTitle = r.pageTitle;
         _sniffed = r.items;
+        _lastDiagnosis = r.diagnosis;
       });
       final t = r.pageTitle.toLowerCase();
       if (t.contains('just a moment') || t.contains('attention required')) {
@@ -386,8 +434,10 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                 await _sniffVideo();
               },
             ),
-            // 第 40 条：手动嗅探入口常驻（页里有视频却没出嗅探条时点一下；
-            // 嗅不到就明说本页没有，不要让用户找不到功能）。
+            // 第 40 条 + 第 53 条：手动嗅探入口常驻（页里有视频却没出嗅探条时点一下）。
+            // 嗅不到不再写“列表页没有可播的视频”——这就是视频页，那句话本身是错的；
+            // 改成诊断文案（查了什么、为什么没嗅到）。播放器在跨域 iframe 里时，
+            // 给“打开播放页”动作：直接进 iframe 里的播放页再嗅一次。
             IconButton(
               icon: const Icon(Icons.radar, color: Colors.white),
               tooltip: '嗅探本页视频',
@@ -395,8 +445,21 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                 await _sniffVideo();
                 if (!context.mounted) return;
                 if (_sniffed.isEmpty) {
+                  final playerUrl = _lastDiagnosis.playerIframeUrl;
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('本页没嗅到视频（列表页没有可播的视频，点进视频页再试）')),
+                    SnackBar(
+                      content: Text(_lastDiagnosis.text),
+                      duration: const Duration(seconds: 6),
+                      action: playerUrl == null
+                          ? null
+                          : SnackBarAction(
+                              label: '打开播放页',
+                              onPressed: () async {
+                                _accumulated.clear();
+                                await _controller.loadRequest(Uri.parse(playerUrl));
+                              },
+                            ),
+                    ),
                   );
                 } else {
                   SniffSheet.show(

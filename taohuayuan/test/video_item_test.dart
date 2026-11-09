@@ -35,4 +35,22 @@ void main() {
         pageUrl: 'https://rule34-videos.com/video/x/');
     expect(r34.embedUrl, 'https://rule34-videos.com/video/x/');
   });
+
+  test('第 54 条：likeRate/authorVideoCount（0=未知）进 copyWith/toJson/fromJson', () {
+    const v = VideoItem(id: 'xv-1', title: 't', source: 'xvideos',
+        pageUrl: 'https://www.xvideos.com/video.u1/x/');
+    expect(v.likeRate, 0);
+    expect(v.authorVideoCount, 0);
+    final v2 = v.copyWith(likeRate: 99, authorVideoCount: 90);
+    expect(v2.likeRate, 99);
+    expect(v2.authorVideoCount, 90);
+    final back = VideoItem.fromJson(v2.toJson());
+    expect(back.likeRate, 99);
+    expect(back.authorVideoCount, 90);
+    // 旧缓存里没有这两个键时默认 0（未知），不炸。
+    final old = Map<String, dynamic>.from(v.toJson())
+      ..remove('likeRate')
+      ..remove('authorVideoCount');
+    expect(VideoItem.fromJson(old).likeRate, 0);
+  });
 }

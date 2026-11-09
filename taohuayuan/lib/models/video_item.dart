@@ -20,6 +20,14 @@ class VideoItem {
   final bool needsRelink; // true = 直链待补，暂时播不了（在线源解析失败时用）。
   final int views; // 播放量（源站提供才有；没有就是 0，用于“最多看”排序）。
   final int publishedAtMs; // 发布时间（毫秒时间戳；没有就是 0，用于“最新”排序/新鲜度）。
+  /// 点赞率 0–100（第 54 条：详情页相关视频/主视频的点赞率；0 = 源站没给，
+  /// 显示时写“未知”，不要编一个）。
+  final int likeRate;
+  /// 作者的视频总数（第 54 条：Hanime 详情页作者卡片写“90 个视频”；
+  /// 0 = 视频页/作者页没给这个数，显示时写“视频数未知”，不要编。
+  /// 2026-11-09 实测：xvideos 视频页只有订阅数（58k）、作者主页也没有
+  /// 视频数，pornhub/eporner/r34 视频页同样没有——v10 里全是未知）。
+  final int authorVideoCount;
 
   const VideoItem({
     required this.id,
@@ -38,6 +46,8 @@ class VideoItem {
     this.needsRelink = false,
     this.views = 0,
     this.publishedAtMs = 0,
+    this.likeRate = 0,
+    this.authorVideoCount = 0,
   });
 
   /// 能不能直接播（有直链）。
@@ -99,6 +109,8 @@ class VideoItem {
     List<String>? keywords,
     int? views,
     int? publishedAtMs,
+    int? likeRate,
+    int? authorVideoCount,
   }) =>
       VideoItem(
         id: id,
@@ -117,6 +129,8 @@ class VideoItem {
         needsRelink: needsRelink,
         views: views ?? this.views,
         publishedAtMs: publishedAtMs ?? this.publishedAtMs,
+        likeRate: likeRate ?? this.likeRate,
+        authorVideoCount: authorVideoCount ?? this.authorVideoCount,
       );
 
   /// 是不是 1080p 或以上（画质过滤用；分辨率未知时返回 false，
@@ -186,6 +200,8 @@ class VideoItem {
         'needsRelink': needsRelink,
         'views': views,
         'publishedAtMs': publishedAtMs,
+        'likeRate': likeRate,
+        'authorVideoCount': authorVideoCount,
       };
 
   factory VideoItem.fromJson(Map<String, dynamic> j) => VideoItem(
@@ -207,5 +223,7 @@ class VideoItem {
         needsRelink: (j['needsRelink'] ?? false) as bool,
         views: ((j['views'] ?? 0) as num).toInt(),
         publishedAtMs: ((j['publishedAtMs'] ?? 0) as num).toInt(),
+        likeRate: ((j['likeRate'] ?? 0) as num).toInt(),
+        authorVideoCount: ((j['authorVideoCount'] ?? 0) as num).toInt(),
       );
 }

@@ -292,6 +292,41 @@ class Store {
     await _prefs.setBool(_tsToMp4Key, v);
   }
 
+  // ---- 应用内更新（第 50 条）----
+  // 启动时每天最多自动查一次新版（GitHub 未登录限流 60 次/小时/IP，别每启动都查）；
+  // 用户点了“稍后”就记下这个 tag，同一版不再弹窗；下好的安装包路径也记下来，
+  // 下次打开「我的」直接点“安装”，不用重下。
+  static const _updateCheckKey = 'taohuayuan_update_check_ms';
+  static const _updateSkipKey = 'taohuayuan_update_skip_tag';
+  static const _updateApkPathKey = 'taohuayuan_update_apk_path';
+  static const _updateApkTagKey = 'taohuayuan_update_apk_tag';
+
+  int get lastUpdateCheckMs => _prefs.getInt(_updateCheckKey) ?? 0;
+
+  Future<void> setLastUpdateCheckMs(int ms) async {
+    await _prefs.setInt(_updateCheckKey, ms);
+  }
+
+  String? get skippedUpdateTag => _prefs.getString(_updateSkipKey);
+
+  Future<void> setSkippedUpdateTag(String tag) async {
+    await _prefs.setString(_updateSkipKey, tag);
+  }
+
+  String? get updateApkPath => _prefs.getString(_updateApkPathKey);
+
+  String? get updateApkTag => _prefs.getString(_updateApkTagKey);
+
+  Future<void> setUpdateApk(String tag, String path) async {
+    await _prefs.setString(_updateApkTagKey, tag);
+    await _prefs.setString(_updateApkPathKey, path);
+  }
+
+  Future<void> clearUpdateApk() async {
+    await _prefs.remove(_updateApkTagKey);
+    await _prefs.remove(_updateApkPathKey);
+  }
+
   // ---- 清除口味数据（喜欢/关注/记录/搜过的词/不喜欢），源开关不动 ----
   Future<void> clearTaste() async {
     await _prefs.remove(_likesKey);

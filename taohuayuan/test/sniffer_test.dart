@@ -99,4 +99,66 @@ void main() {
     expect(count, 3);
     expect(Sniffer.parseM3u8Durations('#EXTM3U\n'), (0, 0));
   });
+
+  test('第 53 条：诊断——JS 抛错要如实报，不要装作页面没视频', () {
+    const d = SniffDiagnosis(jsError: 'TypeError: Cannot read properties of null');
+    expect(d.text, contains('嗅探脚本在页面里执行失败'));
+    expect(d.text, contains('TypeError'));
+    expect(d.text, contains('不是页面没有视频'));
+  });
+
+  test('第 53 条：诊断——一个 video 都没找到时写明查了什么，不写“列表页”', () {
+    const d = SniffDiagnosis(
+      videoCount: 0,
+      performanceMediaCount: 0,
+      htmlMediaCount: 0,
+    );
+    expect(d.text, contains('没找到 video 元素'));
+    expect(d.text, contains('网络请求里没有'));
+    expect(d.text, contains('页面源码里也没扫到'));
+    expect(d.text, isNot(contains('列表页')));
+  });
+
+  test('第 53 条：诊断——视频在播但只有 blob:，要写明底层地址没出现', () {
+    const d = SniffDiagnosis(
+      videoCount: 1,
+      playingCount: 1,
+      blobVideoCount: 1,
+      performanceMediaCount: 0,
+      htmlMediaCount: 0,
+    );
+    expect(d.text, contains('1 个正在播'));
+    expect(d.text, contains('blob:'));
+    expect(d.text, contains('MSE 播放器'));
+  });
+
+  test('第 53 条：诊断——跨域 iframe 里的播放器：认出来 + 给打开播放页的地址', () {
+    const d = SniffDiagnosis(
+      videoCount: 0,
+      performanceMediaCount: 0,
+      iframeCount: 2,
+      crossOriginIframeCount: 1,
+      iframeSrcs: ['https://player.example.com/embed/xyz123'],
+      htmlMediaCount: 0,
+    );
+    expect(d.text, contains('1 个跨域 iframe'));
+    expect(d.playerIframeUrl, 'https://player.example.com/embed/xyz123');
+    expect(d.text, contains('打开播放页'));
+  });
+
+  test('第 53 条：诊断——广告 iframe 不当播放器；多个跨域 iframe 时不乱指', () {
+    const ads = SniffDiagnosis(
+      crossOriginIframeCount: 1,
+      iframeSrcs: ['https://googleads.g.doubleclick.net/pagead/html'],
+    );
+    expect(ads.playerIframeUrl, isNull);
+    const multi = SniffDiagnosis(
+      crossOriginIframeCount: 2,
+      iframeSrcs: [
+        'https://widget.example.com/chat',
+        'https://other.example.com/panel',
+      ],
+    );
+    expect(multi.playerIframeUrl, isNull);
+  });
 }

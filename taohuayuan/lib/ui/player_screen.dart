@@ -15,6 +15,7 @@ import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import 'author_screen.dart';
 import 'download_button.dart';
+import 'search_screen.dart' deferred as search_screen;
 import 'sniff_sheet.dart';
 import 'web_source_browser.dart';
 
@@ -68,6 +69,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // 第 34 条：官方播放器 WebView 里嗅到的媒体（和内置浏览器同一套嗅探）。
   List<SniffedMedia> _embedSniffed = [];
   String _embedPageTitle = '';
+  // 第 54 条：详情页附加信息（标签/点赞率/相关视频），打开后异步拉一次；
+  // 拉不到就是空 extras，UI 写“未知”/“暂无”，不编数据。
+  DetailExtras? _extras;
   // 第 43+44 条：全屏控制条自动隐藏（播的时候 3 秒无操作自动藏，点画面再出现）。
   late final FullscreenControls _fsControls;
 
@@ -151,7 +155,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _webBarDismissed = false;
       _webError = null;
       _embedSniffed = [];
+      _extras = null;
     });
+    // 第 54 条：详情页附加信息（标签/相关视频）和直链解析并行拉，不等它播起来。
+    unawaited(_loadExtras(item));
     await _controller?.dispose();
     _controller = null;
     _webController = null;
@@ -402,8 +409,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     } catch (_) {}
   }
 
-  /// 第 40 条：手动嗅探（官方播放器里没出嗅探条时点一下，嗅不到就明说，
-  /// 不让用户找不到入口）。
+  /// 第 40 条 + 第 53 条：手动嗅探（官方播放器里没出嗅探条时点一下）。
+  /// 嗅不到不再写“列表页没有可播的视频”——这就是视频页，那句话本身是错的；
+  /// 改成诊断文案（查了什么、为什么没嗅到）。
   Future<void> _sniffEmbedOnce() async {
     final wc = _webController;
     if (wc == null) return;
@@ -418,9 +426,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
         }
       });
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text(r.items.isEmpty
-              ? '本页没嗅到视频（列表页没有可播的视频，点进视频页再试）'
-              : '嗅到 ${r.items.length} 个视频')));
+          duration: const Duration(seconds: 6),
+          content: Text(r.items.isEmpty ? r.diagnosis.text : '嗅到 ${r.items.length} 个视频')));
     } catch (_) {}
   }
 
@@ -534,10 +541,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
         Expanded(
           child: GestureDetector(
             onTap: () => _openAuthor(author),
-            child: Text(author,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold)),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(author,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold)),
+                // 第 54 条：作者视频数（Hanime 卡片写“90 个视频”）。
+                // 源站视频页没给这个数时写“视频数未知”，不要编。
+                // 2026-11-09 实测：xvideos/pornhub/eporner/r34 视频页都没有，
+                // v10 里全是未知，等以后从作者页/站内接口补。
+                if (_extras != null)
+                  Text(
+                    _current.authorVideoCount > 0
+                        ? '${_current.authorVideoCount} 个视频'
+                        : '视频数未知',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+              ],
+            ),
           ),
         ),
         TextButton(
@@ -560,6 +584,33 @@ class _PlayerScreenState extends State<PlayerScreen> {
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => AuthorScreen(author: author, store: widget.store),
     ));
+  }
+
+  /// 第 54 条：详情页附加信息（标签/相关视频）。切段了就丢弃旧结果，
+  /// 别把上一段的相关视频贴到这一段下面。
+  Future<void> _loadExtras(VideoItem item) async {
+    final ex = await StreamResolver.detailExtras(item);
+    if (!mounted || _current.id != item.id) return;
+    setState(() => _extras = ex);
+  }
+
+  /// 第 54 条：点标签进搜索（搜这个标签；用 pushReplacement 换掉播放页，
+  /// 返回时回到打开播放页之前的地方，不在返回栈里叠播放页）。
+  /// search_screen 和 player_screen 互相引用，用 deferred import 避开循环引用。
+  Future<void> _openTag(String tag) async {
+    await search_screen.loadLibrary();
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(MaterialPageRoute(
+      builder: (_) => search_screen.SearchScreen(
+          store: widget.store, initialQuery: tag),
+    ));
+  }
+
+  /// 观看数格式化：187200 -> 18.7万；969 -> 969；0 -> ''（未知不显示数字）。
+  static String _formatViews(int v) {
+    if (v <= 0) return '';
+    if (v >= 10000) return '${(v / 10000).toStringAsFixed(1)}万次';
+    return '$v次';
   }
 
   /// 备选按钮文案（通用规则）：有广告的站如实说，没广告的直接说官方播放器。
@@ -633,6 +684,24 @@ class _PlayerScreenState extends State<PlayerScreen> {
               actions: [
                 // 下载入口（第 27 条）：详情页点一下就开始下；播本地文件时没有。
                 if (widget.localFilePath == null) DownloadButton(item: _current),
+                // 第 52 条：在内置浏览器打开源站页面（点一下直接进这条视频的源站页，
+                // 不用先切官方播放器再找入口）；播本地文件时没有源站页。
+                if (widget.localFilePath == null &&
+                    (_current.pageUrl ?? '').isNotEmpty)
+                  IconButton(
+                    icon: const Icon(Icons.open_in_browser, color: Colors.white),
+                    tooltip: '在浏览器打开源站页面',
+                    onPressed: () {
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => WebSourceBrowser(
+                          title: _current.title,
+                          url: _current.pageUrl ?? '',
+                          sourceId: _current.source,
+                          store: widget.store,
+                        ),
+                      ));
+                    },
+                  ),
                 IconButton(
                   icon: Icon(_liked ? Icons.favorite : Icons.favorite_border, color: _liked ? Colors.red : Colors.white),
                   onPressed: () async {
@@ -1132,8 +1201,31 @@ class _PlayerScreenState extends State<PlayerScreen> {
               if (_current.batch.isNotEmpty) _chip(_current.batch),
               if (_current.resolution.isNotEmpty) _chip(_current.resolution),
               if (_current.durationText.isNotEmpty) _chip('时长 ${_current.durationText}'),
+              // 第 54 条：主视频点赞率（源站给了才显示，没给不编一个）。
+              if (_current.likeRate > 0) _chip('点赞 ${_current.likeRate}%'),
             ],
           ),
+          // 第 54 条：标签（可点进搜索）。extras 没回来之前先用搜索时带的
+          // keywords（eporner 的 keywords 就是标签）；都拿不到、且 extras
+          // 已回来确认没有，才写“标签未知”。
+          if (_detailTags().isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _detailTags()
+                  .map((t) => ActionChip(
+                        label: Text(t, style: const TextStyle(fontSize: 12)),
+                        backgroundColor: const Color(0xFF2A2A35),
+                        labelStyle: const TextStyle(color: Colors.white70),
+                        onPressed: () => _openTag(t),
+                      ))
+                  .toList(),
+            ),
+          ] else if (_extras != null) ...[
+            const SizedBox(height: 12),
+            const Text('标签未知', style: TextStyle(color: Colors.white54, fontSize: 12)),
+          ],
           const SizedBox(height: 16),
           if (list != null && list.length > 1)
             Row(
@@ -1182,7 +1274,92 @@ class _PlayerScreenState extends State<PlayerScreen> {
             '第 ${idx >= 0 ? idx + 1 : 1} / ${list?.length ?? 1} 段',
             style: const TextStyle(color: Colors.white54, fontSize: 12),
           ),
+          // 第 54 条：相关视频（源站页面有的，详情页也要有；点进详情）。
+          // extras 没回来之前不显示（避免先闪“暂无”再出列表）。
+          if (_extras != null) ...[
+            const SizedBox(height: 20),
+            const Text('相关视频',
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            if (_extras!.related.isEmpty)
+              const Text('暂无相关视频（源站页面没给）',
+                  style: TextStyle(color: Colors.white54, fontSize: 12))
+            else
+              ..._extras!.related.map(_relatedRow),
+          ],
         ],
+      ),
+    );
+  }
+
+  /// 第 54 条：详情页要显示的标签——视频页抠的优先，没有就用搜索时带的
+  /// keywords（eporner 的 keywords 就是标签）；keywords 里混进的时长
+  /// 字符串（r34 搜索把时长写进 keywords）不要。
+  List<String> _detailTags() {
+    final ex = _extras;
+    if (ex != null && ex.tags.isNotEmpty) return ex.tags;
+    return _current.keywords.where((k) {
+      final t = k.trim();
+      return t.isNotEmpty && !RegExp(r'^\d+:\d+$').hasMatch(t);
+    }).toList();
+  }
+
+  /// 第 54 条：相关视频一行（封面 + 标题 + 时长/观看数/点赞率 + 作者，
+  /// 点进详情）。拿不到的字段不显示数字、不编。
+  Widget _relatedRow(VideoItem v) {
+    final meta = <String>[];
+    if (v.durationText.isNotEmpty) meta.add(v.durationText);
+    final views = _formatViews(v.views);
+    if (views.isNotEmpty) meta.add(views);
+    if (v.likeRate > 0) meta.add('点赞 ${v.likeRate}%');
+    return InkWell(
+      onTap: () => _play(v),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 112,
+              height: 63,
+              child: v.poster.isEmpty
+                  ? Container(
+                      color: const Color(0xFF2A2A35),
+                      child: const Icon(Icons.play_arrow, color: Colors.white54),
+                    )
+                  : ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: Image.network(v.poster,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => Container(
+                              color: const Color(0xFF2A2A35),
+                              child: const Icon(Icons.play_arrow, color: Colors.white54))),
+                    ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(v.title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white, fontSize: 13)),
+                  const SizedBox(height: 4),
+                  Text(meta.isEmpty ? '时长/观看数未知' : meta.join(' · '),
+                      style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                  if (v.author.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(v.author,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

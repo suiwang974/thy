@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'services/adblock_service.dart';
 import 'services/downloader.dart';
 import 'services/store.dart';
+import 'ui/app_update_ui.dart';
 import 'ui/author_screen.dart';
 import 'ui/browser_sources_screen.dart';
 import 'ui/home_screen.dart';
@@ -89,6 +90,17 @@ class _HomeShellState extends State<HomeShell> {
   int _index = 0;
   // 第 49 条：底部“短视频”栏的刷新控制器（点栏刷新用）。
   final _shortsRefresh = ShortsRefreshController();
+
+  @override
+  void initState() {
+    super.initState();
+    // 第 50 条：启动时查一次新版（每天最多一次），有新版才弹窗，
+    // 不阻塞启动、不在没网时报错。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(maybeCheckUpdateOnStartup(context, widget.store)
+          .catchError((_) {}));
+    });
+  }
 
   void _openAuthor(String author) {
     Navigator.of(context).push(MaterialPageRoute(

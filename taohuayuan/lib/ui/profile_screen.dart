@@ -6,6 +6,7 @@ import '../services/adblock_service.dart';
 import '../services/downloader.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
+import 'app_update_ui.dart';
 import 'downloads_screen.dart';
 import 'player_screen.dart';
 import 'web_source_browser.dart';
@@ -448,6 +449,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     }).toList(),
                   ),
           ),
+          // 版本更新（第 50 条）：不用删了重装，App 里直接查新版、下载、安装。
+          AppUpdateCard(store: widget.store),
           _sectionCard(
             title: '关于',
             subtitle: '桃花源 2.9.0 · 从零重写版',

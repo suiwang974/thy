@@ -1,10 +1,14 @@
 package dev.akash.skystream
 
 import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.Settings
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -50,6 +54,88 @@ class MainActivity : FlutterActivity() {
                     "resolvePath" -> {
                         val uri = call.argument<String>("uri")?.let { Uri.parse(it) }
                         result.success(uri?.let { resolvePath(it) })
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        // 应用内更新通道（第 50 条）：侧载包没有 Play 商店，in-app update API 用不了，
+        // 自己走 GitHub Releases 查新版 → 多段下 APK → 调系统安装器装。
+        // 版本号直接读 PackageManager，不用再加 package_info_plus 依赖。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "taohuayuan/update")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getVersion" -> {
+                        try {
+                            val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                packageManager.getPackageInfo(
+                                    packageName,
+                                    PackageManager.PackageInfoFlags.of(0),
+                                )
+                            } else {
+                                @Suppress("DEPRECATION")
+                                packageManager.getPackageInfo(packageName, 0)
+                            }
+                            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                pi.longVersionCode
+                            } else {
+                                @Suppress("DEPRECATION")
+                                pi.versionCode.toLong()
+                            }
+                            result.success(mapOf("versionName" to (pi.versionName ?: ""), "versionCode" to code))
+                        } catch (e: Exception) {
+                            result.error("VERSION_FAILED", e.message, null)
+                        }
+                    }
+                    "canInstall" -> {
+                        // Android 8 以下没有未知来源开关，默认能装。
+                        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            packageManager.canRequestPackageInstalls()
+                        } else {
+                            true
+                        }
+                        result.success(ok)
+                    }
+                    "openInstallSettings" -> {
+                        try {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:$packageName"),
+                            ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                            startActivity(intent)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("SETTINGS_FAILED", e.message, null)
+                        }
+                    }
+                    "installApk" -> {
+                        val path = call.argument<String>("path")
+                        if (path == null) {
+                            result.error("BAD_ARGS", "path 缺失", null)
+                            return@setMethodCallHandler
+                        }
+                        try {
+                            val file = File(path)
+                            if (!file.exists()) {
+                                result.error("NOT_FOUND", "安装包不存在，可能被系统清掉了，重新下载", null)
+                                return@setMethodCallHandler
+                            }
+                            // APK 在 App 缓存目录里，别的 App 读不到路径，
+                            // 只能走 FileProvider 给系统安装器一个 content:// URI。
+                            val uri = FileProvider.getUriForFile(
+                                this,
+                                "$packageName.fileprovider",
+                                file,
+                            )
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, "application/vnd.android.package-archive")
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(intent)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("INSTALL_FAILED", e.message, null)
+                        }
                     }
                     else -> result.notImplemented()
                 }

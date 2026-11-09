@@ -61,6 +61,34 @@ class StreamVariant {
   const StreamVariant(this.label, this.url, [this.headers = const {}]);
 }
 
+/// 详情页附加信息（第 54 条）：标签、点赞率、作者视频数、相关视频。
+/// 拿不到的字段是 0/空——UI 写“未知”，不要编。
+class DetailExtras {
+  final List<String> tags;
+  final int likeRate; // 0–100；0 = 未知
+  final int authorVideoCount; // 0 = 未知
+  final List<VideoItem> related;
+  const DetailExtras({
+    this.tags = const [],
+    this.likeRate = 0,
+    this.authorVideoCount = 0,
+    this.related = const [],
+  });
+
+  DetailExtras copyWith({
+    List<String>? tags,
+    int? likeRate,
+    int? authorVideoCount,
+    List<VideoItem>? related,
+  }) =>
+      DetailExtras(
+        tags: tags ?? this.tags,
+        likeRate: likeRate ?? this.likeRate,
+        authorVideoCount: authorVideoCount ?? this.authorVideoCount,
+        related: related ?? this.related,
+      );
+}
+
 class StreamResolver {
   static const _ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -217,15 +245,380 @@ class StreamResolver {
     return a;
   }
 
+  /// 详情页附加信息（第 54 条：详情页向 Hanime 源站页面看齐——标签、
+  /// 作者卡片、相关视频列表）。拿不到的字段是 0/空（显示时写“未知”，不要编）。
+  /// 每个源的字段口径（2026-11-09 VM 实测真页）：
+  /// - xvideos：标签（/tags/ 链接）、点赞率（rating-good-perc）、相关视频
+  ///   （related=[...] JSON：标题/地址/封面/时长/评分/观看数/作者全有）；
+  ///   作者视频数视频页没有（只有订阅数 58k），是未知。
+  /// - pornhub：标签（data-label="tag" 的链接）；相关视频走 related API
+  ///   （/api/v1/video/player_related_datas?id=数字id，VM 验通：mostViewed/
+  ///   topRated/related/more 四组，每条 [封面,标题,时长,评分,地址,观看数,
+  ///   预览,频道,...] 全有）；页内 relatedVideos JSON 是备选（只有标题/
+  ///   时长/viewkey，没封面没评分）；主视频自己的评分/观看数在页里找不到
+  ///   可靠字段，是未知。
+  /// - eporner：标签就是 API 的 keywords（搜索时已进 keywords）；相关视频
+  ///   在 #relateddiv 的 .mb 卡片里（标题/地址/封面/时长/评分/观看数/
+  ///   作者全有）；主视频评分页里没找到可靠字段，是未知。
+  /// - rule34videos：标签（/tag/ 链接）、相关视频（related-videos 容器里
+  ///   的卡片，和搜索页同一结构：标题/地址/封面/时长/点赞率/观看数）；
+  ///   主视频自己的点赞率/观看数在页里无法和相关卡片区分，是未知。
+  /// - niacg/lianzu11/hanime/spankbang/xhamster：VM 下没见过真页（403/
+  ///   Cloudflare），一律未知，不编。
+  static DetailExtras parseDetailExtras(String html, String source) {
+    switch (source) {
+      case 'xvideos':
+        return parseXvideosDetailExtras(html);
+      case 'pornhub':
+        return DetailExtras(
+          tags: parsePornhubTags(html),
+          related: parsePornhubRelatedVideosJson(html),
+        );
+      case 'eporner':
+        return DetailExtras(related: parseEpornerRelated(html));
+      case 'rule34videos':
+        return parseR34DetailExtras(html);
+      default:
+        return const DetailExtras();
+    }
+  }
+
+  /// “5 min” / “1 h 5 min” / “12:36” / “1:55” -> 秒数。
+  static int parseDurationText(String s) {
+    final t = s.trim();
+    if (t.isEmpty) return 0;
+    final clock = RegExp(r'^(\d+):(\d{1,2})(?::(\d{1,2}))?$').firstMatch(t);
+    if (clock != null) {
+      final h = clock.group(3) != null
+          ? int.tryParse(clock.group(1)!) ?? 0
+          : 0;
+      final m = int.tryParse(clock.group(3) != null ? clock.group(2)! : clock.group(1)!) ?? 0;
+      final sec = int.tryParse(clock.group(3) != null ? clock.group(3)! : clock.group(2)!) ?? 0;
+      return h * 3600 + m * 60 + sec;
+    }
+    var total = 0;
+    final h = RegExp(r'(\d+)\s*h').firstMatch(t);
+    if (h != null) total += (int.tryParse(h.group(1)!) ?? 0) * 3600;
+    final m = RegExp(r'(\d+)\s*min').firstMatch(t);
+    if (m != null) total += (int.tryParse(m.group(1)!) ?? 0) * 60;
+    return total;
+  }
+
+  /// “187.2k” / “469K” / “19,727” / “392006” -> 整数。
+  static int parseCountText(String s) {
+    final t = s.trim().replaceAll(',', '').toLowerCase();
+    if (t.isEmpty) return 0;
+    final m = RegExp(r'^([\d.]+)\s*([km]?)$').firstMatch(t);
+    if (m == null) return int.tryParse(t) ?? 0;
+    final n = double.tryParse(m.group(1)!) ?? 0;
+    switch (m.group(2)) {
+      case 'k':
+        return (n * 1000).round();
+      case 'm':
+        return (n * 1000000).round();
+      default:
+        return n.round();
+    }
+  }
+
+  static String _cleanTag(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+  /// xvideos 视频页 -> 标签 + 点赞率 + 相关视频（related JSON）。
+  /// 供单元测试直接验（夹具是真页抠的片段）。
+  static DetailExtras parseXvideosDetailExtras(String html) {
+    final tags = <String>[];
+    for (final m in RegExp(r'''<a href="/tags/[^"]+"[^>]*>([^<]+)</a>''').allMatches(html)) {
+      final t = _cleanTag(m.group(1)!);
+      if (t.isNotEmpty && !tags.contains(t)) tags.add(t);
+      if (tags.length >= 20) break;
+    }
+    var likeRate = 0;
+    final r = RegExp(r'''rating-good-perc[^>]*>(\d+)''').firstMatch(html);
+    if (r != null) likeRate = int.tryParse(r.group(1)!) ?? 0;
+    final related = <VideoItem>[];
+    final raw = extractJsonArray(html, 'related=');
+    if (raw != null) {
+      try {
+        final arr = jsonDecode(raw) as List;
+        for (final e in arr) {
+          if (related.length >= 12) break;
+          final m = e as Map<String, dynamic>;
+          final u = (m['u'] ?? '').toString();
+          if (u.isEmpty) continue;
+          final title = _cleanTag((m['t'] ?? m['tf'] ?? '').toString());
+          if (title.isEmpty) continue;
+          related.add(VideoItem(
+            id: 'xvideos:$u',
+            title: title,
+            author: (m['pn'] ?? '').toString(),
+            durationSec: parseDurationText((m['d'] ?? '').toString()),
+            poster: (m['i'] ?? '').toString().replaceAll(r'\/', '/'),
+            source: 'xvideos',
+            pageUrl: 'https://www.xvideos.com$u',
+            views: parseCountText((m['n'] ?? '').toString()),
+            likeRate: int.tryParse((m['r'] ?? '').toString().replaceAll('%', '')) ?? 0,
+          ));
+        }
+      } catch (_) {}
+    }
+    return DetailExtras(tags: tags, likeRate: likeRate, related: related);
+  }
+
+  /// pornhub 视频页 Tags 区 -> 标签（data-label="tag" 的链接文字）。
+  static List<String> parsePornhubTags(String html) {
+    final tags = <String>[];
+    for (final m in RegExp(
+            r'''<a[^>]*data-label="tag"[^>]*><span>([^<]+)</span></a>''')
+        .allMatches(html)) {
+      final t = _cleanTag(m.group(1)!);
+      if (t.isNotEmpty && !tags.contains(t)) tags.add(t);
+      if (tags.length >= 20) break;
+    }
+    return tags;
+  }
+
+  /// pornhub 视频页 -> 相关视频 API 的数字 id（flashvars 里的 related_url）。
+  static String? parsePornhubRelatedApiUrl(String html) {
+    final m = RegExp(r'player_related_datas\?id=(\d+)').firstMatch(html);
+    if (m == null) return null;
+    return 'https://www.pornhub.com/api/v1/video/player_related_datas?id=${m.group(1)}';
+  }
+
+  /// pornhub 相关视频 API 的 JSON -> 条目（related/topRated/mostViewed，
+  /// 每条是 [封面,标题,时长,评分,地址,观看数,预览,频道,...]）。
+  /// 供单元测试直接验（夹具是真接口返回的第一条原文）。
+  static List<VideoItem> parsePornhubRelatedApi(String body) {
+    final out = <VideoItem>[];
+    try {
+      final json = jsonDecode(body) as Map<String, dynamic>;
+      final seen = <String>{};
+      for (final section in ['related', 'topRated', 'mostViewed']) {
+        final arr = (json[section] as List?) ?? [];
+        for (final e in arr) {
+          if (out.length >= 12) break;
+          final a = e as List;
+          if (a.length < 8) continue;
+          final pageUrl = (a[4] ?? '').toString();
+          if (pageUrl.isEmpty || !seen.add(pageUrl)) continue;
+          final title = _cleanTag((a[1] ?? '').toString());
+          if (title.isEmpty) continue;
+          final viewkey =
+              RegExp(r'viewkey=([A-Za-z0-9]+)').firstMatch(pageUrl)?.group(1) ?? pageUrl;
+          out.add(VideoItem(
+            id: 'pornhub-$viewkey',
+            title: title,
+            author: (a[7] ?? '').toString(),
+            durationSec: parseDurationText((a[2] ?? '').toString()),
+            poster: (a[0] ?? '').toString(),
+            source: 'pornhub',
+            pageUrl: pageUrl,
+            views: (a[5] as num?)?.toInt() ?? 0,
+            likeRate: (a[3] as num?)?.toInt() ?? 0,
+          ));
+        }
+        if (out.length >= 12) break;
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  /// pornhub 页内 relatedVideos JSON -> 条目（备选：API 拿不到时用，
+  /// 只有标题/时长/viewkey，没封面没评分没观看数）。
+  static List<VideoItem> parsePornhubRelatedVideosJson(String html) {
+    final out = <VideoItem>[];
+    final raw = extractJsonArray(html, 'relatedVideos');
+    if (raw == null) return out;
+    try {
+      final arr = jsonDecode(raw) as List;
+      for (final e in arr) {
+        if (out.length >= 12) break;
+        final f = (e as Map<String, dynamic>)['fields'] as Map<String, dynamic>?;
+        if (f == null) continue;
+        final vkey = (f['vkey'] ?? '').toString();
+        final title = _cleanTag((f['title'] ?? '').toString());
+        if (vkey.isEmpty || title.isEmpty) continue;
+        out.add(VideoItem(
+          id: 'pornhub-$vkey',
+          title: title,
+          durationSec: (f['duration'] as num?)?.toInt() ?? 0,
+          source: 'pornhub',
+          pageUrl: 'https://www.pornhub.com/view_video.php?viewkey=$vkey',
+        ));
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  /// eporner 视频页 #relateddiv -> 相关视频卡片（标题/地址/封面/时长/
+  /// 评分/观看数/作者全有）。供单元测试直接验（夹具是真页抠的卡片原文）。
+  static List<VideoItem> parseEpornerRelated(String html) {
+    final out = <VideoItem>[];
+    final start = html.indexOf('relateddiv');
+    if (start < 0) return out;
+    final frag = html.substring(start);
+    final chunks = frag.split('<div class="mb hdy"');
+    for (var i = 1; i < chunks.length; i++) {
+      if (out.length >= 12) break;
+      final c = chunks[i];
+      final href = RegExp(r'''<a href="(/video-[^"]+)"''').firstMatch(c)?.group(1);
+      if (href == null) continue;
+      final vid = RegExp(r'/video-([A-Za-z0-9]+)/').firstMatch(href)?.group(1) ?? href;
+      final title = _cleanTag(
+          RegExp(r'''<p class="mbtit"><a[^>]*>([^<]+)</a>''').firstMatch(c)?.group(1) ?? '');
+      if (title.isEmpty) continue;
+      final thumb =
+          RegExp(r'''data-src="([^"]+)"''').firstMatch(c)?.group(1) ?? '';
+      final dur = RegExp(r'''<span class="mbtim"[^>]*>([^<]+)</span>''')
+              .firstMatch(c)
+              ?.group(1) ??
+          '';
+      final rate = RegExp(r'''<span class="mbrate"[^>]*>([\d.]+)%</span>''')
+              .firstMatch(c)
+              ?.group(1) ??
+          '';
+      final views = RegExp(r'''<span class="mbvie"[^>]*>([\d,]+)</span>''')
+              .firstMatch(c)
+              ?.group(1) ??
+          '';
+      final author = _cleanTag(RegExp(
+                  r'''<span class="mb-uploader[^>]*><a[^>]*>([^<]+)</a>''')
+              .firstMatch(c)
+              ?.group(1) ??
+          '');
+      out.add(VideoItem(
+        id: 'eporner-$vid',
+        title: title,
+        author: author,
+        durationSec: parseDurationText(dur),
+        poster: thumb,
+        source: 'eporner',
+        pageUrl: 'https://www.eporner.com$href',
+        views: parseCountText(views),
+        likeRate: int.tryParse(rate) ?? 0,
+      ));
+    }
+    return out;
+  }
+
+  /// rule34videos 视频页 -> 标签（/tag/ 链接）+ 相关视频（related-videos
+  /// 容器里的卡片，和搜索页同一结构）。供单元测试直接验。
+  static DetailExtras parseR34DetailExtras(String html) {
+    final tags = <String>[];
+    // 真页：<a class=tag_item href=/tag/bedroom/> bedroom </a>——class 在前、
+    // href 无引号、文字前后带空格（_cleanTag 会 trim）。
+    for (final m in RegExp(r'''<a[^>]*href=["']?/tag/([^"' >]+)["']?[^>]*>([^<]+)</a>''')
+        .allMatches(html)) {
+      final t = _cleanTag(m.group(2)!);
+      if (t.isNotEmpty && !tags.contains(t)) tags.add(t);
+      if (tags.length >= 20) break;
+    }
+    final related = <VideoItem>[];
+    final start = html.indexOf('related-videos');
+    if (start >= 0) {
+      final frag = html.substring(start);
+      final chunks = frag.split('<a href=/video/');
+      for (var i = 1; i < chunks.length; i++) {
+        if (related.length >= 12) break;
+        final c = chunks[i];
+        final hrefEnd = c.indexOf(RegExp(r'[ >]'));
+        if (hrefEnd < 0) continue;
+        final slug = c.substring(0, hrefEnd).replaceAll('"', '').replaceAll("'", '');
+        if (slug.isEmpty) continue;
+        final alt = RegExp(r'''alt="([^"]+?) thumbnail"''').firstMatch(c)?.group(1);
+        final title = _cleanTag(alt ?? '');
+        if (title.isEmpty) continue;
+        final thumbs = RegExp(r'data-thumbnails=([^ >]+)').firstMatch(c)?.group(1);
+        var poster = '';
+        if (thumbs != null) {
+          final t = thumbs.split(',').first.replaceAll('"', '').replaceAll("'", '');
+          poster = t.startsWith('http') ? t : 'https://rule34-videos.com$t';
+        }
+        final dur = RegExp(r'''<span class=duration-badge>([^<]+)</span>''')
+                .firstMatch(c)
+                ?.group(1) ??
+            '';
+        final rate = RegExp(r'''likes-percentage[^>]*>.*?(\d+)%''', dotAll: true)
+                .firstMatch(c)
+                ?.group(1) ??
+            '';
+        final views = RegExp(r'''views-count[^>]*>.*?(\d+)''', dotAll: true)
+                .firstMatch(c)
+                ?.group(1) ??
+            '';
+        related.add(VideoItem(
+          id: 'r34-/video/$slug',
+          title: title,
+          durationSec: parseDurationText(dur),
+          poster: poster,
+          source: 'rule34videos',
+          pageUrl: 'https://rule34-videos.com/video/$slug',
+          views: parseCountText(views),
+          likeRate: int.tryParse(rate) ?? 0,
+        ));
+      }
+    }
+    return DetailExtras(tags: tags, related: related);
+  }
+
+  static final Map<String, DetailExtras> _detailExtrasCache = {};
+
+  /// 详情页附加信息（第 54 条）：标签 + 相关视频。先读缓存，没有就拉视频页
+  /// 现算（pornhub 再调一次相关视频 API）；拉不到返回空 extras，
+  /// UI 写“未知”/“暂无”，不编数据。
+  static Future<DetailExtras> detailExtras(VideoItem item) async {
+    final cached = _detailExtrasCache[item.id];
+    if (cached != null) return cached;
+    var extras = const DetailExtras();
+    final page = item.pageUrl;
+    if (page != null && page.isNotEmpty) {
+      try {
+        final res = await http
+            .get(Uri.parse(page), headers: {'User-Agent': _ua})
+            .timeout(const Duration(seconds: 15));
+        if (res.statusCode == 200) {
+          final html = utf8.decode(res.bodyBytes);
+          extras = parseDetailExtras(html, item.source);
+          if (item.source == 'pornhub') {
+            final apiUrl = parsePornhubRelatedApiUrl(html);
+            if (apiUrl != null) {
+              try {
+                final ares = await http
+                    .get(Uri.parse(apiUrl), headers: {'User-Agent': _ua})
+                    .timeout(const Duration(seconds: 10));
+                if (ares.statusCode == 200) {
+                  final apiRelated =
+                      parsePornhubRelatedApi(utf8.decode(ares.bodyBytes));
+                  if (apiRelated.isNotEmpty) {
+                    extras = extras.copyWith(related: apiRelated);
+                  }
+                }
+              } catch (_) {}
+            }
+          }
+        }
+      } catch (_) {}
+    }
+    if (_detailExtrasCache.length > 50) _detailExtrasCache.clear();
+    _detailExtrasCache[item.id] = extras;
+    return extras;
+  }
+
   /// 从详情页 HTML 里补封面/时长（只补缺的：没封面才补封面、没时长才补时长）。
   /// 第 42 条：顺带补作者（视频页找发布者；搜索时没抠到的这里补上）。
+  /// 第 54 条：顺带补标签（搜索时没给关键词的，这里从视频页抠）和点赞率。
   static void _enrichFromDetail(VideoItem item, String html) {
     final poster = item.poster.isEmpty ? parseOgImage(html) : null;
     final duration = item.durationSec <= 0 ? parseOgDuration(html) : null;
     final author = item.author.isEmpty ? parseVideoAuthor(html, item.source) : null;
+    // 第 54 条：顺带补标签（搜索时没给关键词的，从视频页抠）和点赞率。
+    final extras = parseDetailExtras(html, item.source);
+    final tags = item.keywords.isEmpty && extras.tags.isNotEmpty ? extras.tags : null;
+    final likeRate = item.likeRate <= 0 && extras.likeRate > 0 ? extras.likeRate : null;
     if (poster == null &&
         duration == null &&
-        (author == null || author.author.isEmpty)) {
+        (author == null || author.author.isEmpty) &&
+        tags == null &&
+        likeRate == null) {
       return;
     }
     if (_enriched.length > 100) {
@@ -238,6 +631,8 @@ class StreamResolver {
       authorAvatar: (author != null && author.authorAvatar.isNotEmpty)
           ? author.authorAvatar
           : item.authorAvatar,
+      keywords: tags ?? item.keywords,
+      likeRate: likeRate ?? item.likeRate,
     );
   }
 
@@ -659,6 +1054,8 @@ class StreamResolver {
 
   /// xvideos 详情页 HTML -> 全部画质档位（全屏分辨率菜单用）。
   /// 标签从地址里抠真实分辨率（video_360p.mp4 -> 360p）；抠不出来才用站方叫法。
+  /// 第 51 条：High 和 Low 可能是同一个地址（1440p 标签那条两个都是
+  /// mp4_sd.mp4），同地址只留一档，别在菜单里摆两行一样的。
   static List<StreamVariant> parseXvideosVariants(String html) {
     final out = <StreamVariant>[];
     String label(String url, String fallback) {
@@ -671,7 +1068,32 @@ class StreamResolver {
     final hls = RegExp(r"""setVideoHLS\(['"]([^'"]+)['"]\)""").firstMatch(html)?.group(1);
     if (hls != null && hls.isNotEmpty) out.add(StreamVariant('HLS 自适应', hls));
     final low = RegExp(r"""setVideoUrlLow\(['"]([^'"]+)['"]\)""").firstMatch(html)?.group(1);
-    if (low != null && low.isNotEmpty) out.add(StreamVariant(label(low, '标清'), low));
+    if (low != null && low.isNotEmpty && low != high) {
+      out.add(StreamVariant(label(low, '标清'), low));
+    }
+    return out;
+  }
+
+  /// HLS 变体合并进档位表（第 51 条，纯函数，单元测试直接验）：
+  /// 同分辨率只留一条（mp4 优先于 HLS 变体——mp4 是单个文件，
+  /// 下载/拖进度都更稳）；'HLS 自适应'（主播放列表）一直保留在最前；
+  /// 按画质从高到低排。
+  static List<StreamVariant> mergeHlsVariants(
+      List<StreamVariant> base, List<StreamVariant> hlsVariants) {
+    final seenRes = <int>{};
+    for (final v in base) {
+      final m = RegExp(r'(\d+)p').firstMatch(v.label);
+      if (m != null) seenRes.add(int.parse(m.group(1)!));
+    }
+    final out = [...base];
+    for (final v in hlsVariants) {
+      final m = RegExp(r'(\d+)p').firstMatch(v.label);
+      final res = m == null ? null : int.parse(m.group(1)!);
+      if (res != null && seenRes.contains(res)) continue;
+      if (res != null) seenRes.add(res);
+      out.add(v);
+    }
+    out.sort((a, b) => _qualityRank(b.label).compareTo(_qualityRank(a.label)));
     return out;
   }
 
@@ -879,7 +1301,29 @@ class StreamResolver {
           final res = await http
               .get(Uri.parse(page), headers: {'User-Agent': _ua})
               .timeout(const Duration(seconds: 15));
-          out.addAll(parseXvideosVariants(utf8.decode(res.bodyBytes)));
+          final base = parseXvideosVariants(utf8.decode(res.bodyBytes));
+          // 第 51 条：mp4 的 High 档只有 360p（2026-11-09 实测：1080p 标签的
+          // 视频 setVideoUrlHigh 是 video_360p.mp4；1440p 标签那条 High/Low
+          // 都是 mp4_sd.mp4），真正的最高档在 HLS 主播放列表里
+          // （实测变体 1080p/720p/480p/360p/250p；1440p 标签那条最高 1080p，
+          // 标签是站方标的，实际最高档以播放列表为准）。
+          // 把 HLS 变体展开成单独档位（能直接切到最高档），和 mp4 同分辨率
+          // 的去重（留 mp4）；主播放列表拉不到就保持原来三档，不报错。
+          var variants = base;
+          final hls = base.where((v) => v.url.contains('.m3u8')).firstOrNull;
+          if (hls != null) {
+            try {
+              final mres = await http
+                  .get(Uri.parse(hls.url), headers: {'User-Agent': _ua})
+                  .timeout(const Duration(seconds: 8));
+              final hlsVariants = parseM3u8VariantList(
+                  utf8.decode(mres.bodyBytes), hls.url);
+              if (hlsVariants.isNotEmpty) {
+                variants = mergeHlsVariants(base, hlsVariants);
+              }
+            } catch (_) {}
+          }
+          out.addAll(variants);
         }
       } else if (item.source == 'rule34videos') {
         final resolved = await resolve(item);

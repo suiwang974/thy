@@ -1,5 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 应用内更新（第 50 条）：侧载包调系统安装器装 APK 要这个权限；
+         没有 Play 商店，不用 in-app update API。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 只给 Android 9 及以下：老系统直接写公共 Downloads 要这个权限；
          Android 10+ 走 MediaStore，不需要它。 -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
@@ -34,6 +37,17 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- 应用内更新（第 50 条）：APK 下在 App 缓存目录里，系统安装器读不到文件路径，
+             走 FileProvider 给它一个 content:// URI。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="dev.akash.skystream.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

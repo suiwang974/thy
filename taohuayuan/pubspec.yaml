@@ -1,7 +1,7 @@
 name: taohuayuan
 description: "桃花源 - 视频 App（从零重写，不套 SkyStream；8 个在线源实时搜）"
 publish_to: 'none'
-version: 2.9.0+1
+version: 2.9.0+10
 
 environment:
   sdk: ^3.13.5

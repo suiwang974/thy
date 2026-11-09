@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用内更新（第 50 条）：APK 下在 App 缓存目录 update/ 里，
+     FileProvider 只开放这个子目录给系统安装器，别的不给。 -->
+<paths>
+    <cache-path name="update" path="update/" />
+</paths>
