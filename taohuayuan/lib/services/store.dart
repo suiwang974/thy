@@ -137,11 +137,62 @@ class Store {
     if (t.isEmpty) return;
     final tags = likedTags..add(t);
     await _prefs.setStringList(_likedTagsKey, tags.toList());
+    // 第 63 条：手动加回来 = 明确想要，之前 × 掉的排除要撤掉，
+    // 不然加了也不会显示、也不会进画像。
+    await unexcludeLikedTag(t);
   }
 
   Future<void> removeLikedTag(String tag) async {
     final tags = likedTags..remove(tag.trim().toLowerCase());
     await _prefs.setStringList(_likedTagsKey, tags.toList());
+  }
+
+  // ---- 点 ♥ 的视频贡献的喜欢标签（第 63 条）----
+  // 画像实际用的喜欢标签 = 点 ♥ 视频的关键词 + 手动加的 likedTags，
+  // 再减去用户在“我的口味”里 × 掉的排除标签。排除只针对视频关键词，
+  // 手动加的直接删（removeLikedTag）；× 一枚芯片时两步都做——
+  // 手动加的删掉、视频贡献的记排除——芯片才会真从画像里消失。
+  static const _excludedLikedTagsKey = 'taohuayuan_excluded_liked_tags';
+
+  /// 点 ♥ 的视频贡献的关键词（小写、去重），未减排除。
+  Set<String> get likedVideoKeywords {
+    final out = <String>{};
+    for (final item in likedItems()) {
+      for (final k in item.keywords) {
+        final t = k.trim().toLowerCase();
+        if (t.isNotEmpty) out.add(t);
+      }
+    }
+    return out;
+  }
+
+  Set<String> get excludedLikedTags => _strList(_excludedLikedTagsKey).toSet();
+
+  /// 画像实际用的喜欢标签：视频关键词 + 手动加的，再减去排除的。
+  Set<String> get effectiveLikedTags {
+    final tags = {...likedVideoKeywords, ...likedTags}
+      ..removeAll(excludedLikedTags);
+    return tags;
+  }
+
+  /// 把一个视频贡献的标签记排除：组装画像时跳过它。
+  Future<void> excludeLikedTag(String tag) async {
+    final t = tag.trim().toLowerCase();
+    if (t.isEmpty) return;
+    final tags = excludedLikedTags..add(t);
+    await _prefs.setStringList(_excludedLikedTagsKey, tags.toList());
+  }
+
+  Future<void> unexcludeLikedTag(String tag) async {
+    final tags = excludedLikedTags..remove(tag.trim().toLowerCase());
+    await _prefs.setStringList(_excludedLikedTagsKey, tags.toList());
+  }
+
+  /// “我的口味”里 × 掉一枚喜欢标签：手动加的直接删，视频贡献的记排除——
+  /// 两步都做，芯片才真从画像里消失。
+  Future<void> removeLikedTagFromProfile(String tag) async {
+    await removeLikedTag(tag);
+    await excludeLikedTag(tag);
   }
 
   // ---- 不喜欢的标签（点“不喜欢”就降权这类推荐）----
@@ -391,6 +442,7 @@ class Store {
     }
     await _prefs.remove(_dislikedItemsKey);
     await _prefs.remove(_likedTagsKey);
+    await _prefs.remove(_excludedLikedTagsKey);
     await _prefs.remove(_manualDislikedTagsKey);
     await _prefs.remove(_likesKey);
     await _prefs.remove(_followsKey);

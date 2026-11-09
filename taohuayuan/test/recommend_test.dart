@@ -147,4 +147,18 @@ void main() {
     expect(TasteProfile.fromStore(store).tags, isNot(contains('cosplay')));
   });
 
+  test('第 63 条：画像里的喜欢标签跳过 × 掉的排除', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    final item = VideoItem(
+        id: 'v1', title: 't', source: 'eporner', keywords: ['footjob', 'asian']);
+    await store.toggleLike(item);
+    expect(TasteProfile.fromStore(store).tags, contains('footjob'));
+    // × 掉视频贡献的 footjob：画像里没了，asian 还在。
+    await store.removeLikedTagFromProfile('footjob');
+    final profile = TasteProfile.fromStore(store);
+    expect(profile.tags, isNot(contains('footjob')));
+    expect(profile.tags, contains('asian'));
+  });
+
 }

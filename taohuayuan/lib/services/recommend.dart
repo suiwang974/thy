@@ -45,12 +45,9 @@ class TasteProfile {
 
   /// 从本地 Store 拼出画像；什么都没有时用冷启动默认口味。
   factory TasteProfile.fromStore(Store store) {
-    final tags = <String>{};
-    for (final item in store.likedItems()) {
-      tags.addAll(item.keywords.map((k) => k.toLowerCase()));
-    }
-    // 第 60 条：用户在“我的口味”里手动加的喜欢标签，立刻进推荐画像。
-    tags.addAll(store.likedTags);
+    // 第 63 条：喜欢的标签 = 点 ♥ 视频的关键词 + 手动加的，再减去用户
+    // 在“我的口味”里 × 掉的排除标签——三者一起才是画像实际用的。
+    final tags = Set<String>.of(store.effectiveLikedTags);
     for (final term in store.searchTerms) {
       // 原词（中文标题能命中）+ 映射后的英文词（英文标题/标签能命中）都进画像。
       tags.add(term.toLowerCase());

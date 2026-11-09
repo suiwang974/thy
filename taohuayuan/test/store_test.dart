@@ -136,4 +136,33 @@ void main() {
     expect(store.dislikedTags, isEmpty);
     expect(store.dislikedItemIds, isEmpty);
   });
+
+  test('第 63 条：喜欢的标签 = 点 ♥ 视频的关键词 + 手动加的，× 掉就排除', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = await Store.load();
+    final item = VideoItem(
+        id: 'v1', title: 't', source: 'eporner', keywords: ['FootJob', 'asian']);
+    await store.toggleLike(item);
+    await store.addLikedTag('cosplay');
+    expect(store.likedVideoKeywords, {'footjob', 'asian'});
+    expect(store.effectiveLikedTags, {'footjob', 'asian', 'cosplay'});
+    // × 掉视频贡献的 footjob：从画像里消失，asian 还在。
+    await store.removeLikedTagFromProfile('footjob');
+    expect(store.effectiveLikedTags, {'asian', 'cosplay'});
+    expect(store.excludedLikedTags, contains('footjob'));
+    // 手动加回来：排除撤掉，重新出现。
+    await store.addLikedTag('footjob');
+    expect(store.effectiveLikedTags, contains('footjob'));
+    expect(store.excludedLikedTags, isNot(contains('footjob')));
+    // × 掉手动加的 cosplay：直接删掉。
+    await store.removeLikedTagFromProfile('cosplay');
+    expect(store.effectiveLikedTags, isNot(contains('cosplay')));
+    // 取消喜欢：视频贡献的 asian 掉出，手动加的 footjob 还在。
+    await store.toggleLike(item);
+    expect(store.effectiveLikedTags, {'footjob'});
+    // 清除口味数据：手动标签和排除都清掉。
+    await store.clearTaste();
+    expect(store.effectiveLikedTags, isEmpty);
+    expect(store.excludedLikedTags, isEmpty);
+  });
 }

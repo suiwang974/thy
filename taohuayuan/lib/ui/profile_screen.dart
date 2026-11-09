@@ -525,10 +525,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 const SizedBox(height: 12),
                 _tasteGroup(
                   label: '喜欢的标签',
-                  emptyHint: '还没手动加；点 ♥ 的视频关键词会自动进画像',
-                  tags: widget.store.likedTags.toList()..sort(),
+                  emptyHint: '还没有；点 ♥ 的视频关键词会自动进画像，也可以在下面手动加',
+                  tags: widget.store.effectiveLikedTags.toList()..sort(),
                   chipColor: Colors.pinkAccent,
-                  onDeleted: (t) => widget.store.removeLikedTag(t),
+                  onDeleted: (t) => widget.store.removeLikedTagFromProfile(t),
                 ),
                 _tasteGroup(
                   label: '不喜欢的标签',
