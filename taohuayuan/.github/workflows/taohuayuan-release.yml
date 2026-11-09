@@ -1,0 +1,71 @@
+# 桃花源 Release：新工程（taohuayuan/ 目录，从零重写版）的打包。
+# 提速：迭代打包只打 arm64 release 一个包（用户手机就是 arm64），
+# 不要 split-per-abi 全套 + universal + debug 一起打；最终版再打全套。
+# Pub + Gradle 全开缓存，第二次以后不用每次重新下载依赖。
+name: Taohuayuan Release
+
+on:
+  workflow_dispatch:
+  # workflow_dispatch 在新分支上首次跑之前 API 会 404（workflow 未注册），
+  # 所以同时接受 tag 推送触发：打 tag 即打包。
+  push:
+    tags:
+      - 'taohuayuan-v*'
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: 3.47.7
+
+jobs:
+  android:
+    name: Android arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Cache Pub Dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('taohuayuan/pubspec.lock') }}
+          restore-keys: ${{ runner.os }}-pub-
+
+      - name: Install Dependencies
+        working-directory: taohuayuan
+        run: flutter pub get
+
+      - name: Build arm64 Release APK
+        working-directory: taohuayuan
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Rename APK
+        # 只打 arm64 一个包（不 split-per-abi），输出就是 app-release.apk，不是 app-arm64-v8a-release.apk。
+        run: mv taohuayuan/build/app/outputs/flutter-apk/app-release.apk taohuayuan-android-arm64-v2.9.0.apk
+
+      - name: Upload Release Asset
+        uses: ncipollo/release-action@v1
+        with:
+          tag: taohuayuan-v2.9.0
+          name: 桃花源 v2.9.0（重写版）
+          body: "桃花源从零重写版：全新 Flutter 原生，8 个在线源实时搜，中文搜索，短视频真播。"
+          allowUpdates: true
+          replacesArtifacts: true
+          artifacts: taohuayuan-android-arm64-v2.9.0.apk
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true

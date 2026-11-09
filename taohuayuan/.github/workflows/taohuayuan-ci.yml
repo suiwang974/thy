@@ -1,0 +1,105 @@
+# 桃花源 CI：新工程（taohuayuan/ 目录，从零重写版）的门禁。
+# 只跑在 taohuayuan 分支上；旧壳 app/ 的 CI 不受影响。
+# 提速：Pub + Gradle 全开缓存；单独的 Emulator Smoke Test 不跑，
+# 启动验证用下面 KVM 模拟器里的 integration test（上轮 CI 里已跑通过的那种）。
+name: Taohuayuan CI
+
+on:
+  push:
+    branches: [taohuayuan]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: 3.47.7
+
+jobs:
+  analyze-test:
+    name: Analyze + Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Cache Pub Dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('taohuayuan/pubspec.lock') }}
+          restore-keys: ${{ runner.os }}-pub-
+
+      - name: Install Dependencies
+        working-directory: taohuayuan
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: taohuayuan
+        run: flutter analyze
+
+      - name: Test
+        working-directory: taohuayuan
+        run: flutter test
+
+  android-smoke:
+    name: Android Smoke (KVM emulator)
+    needs: analyze-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Cache Pub Dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('taohuayuan/pubspec.lock') }}
+          restore-keys: ${{ runner.os }}-pub-
+
+      - name: Install Dependencies
+        working-directory: taohuayuan
+        run: flutter pub get
+
+      # KVM，没有它模拟器回退到软渲染会超时。
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Smoke Test Android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: cd taohuayuan && flutter test integration_test/app_launch_test.dart
