@@ -50,6 +50,19 @@ jobs:
         working-directory: taohuayuan
         run: flutter pub get
 
+      - name: Decode release keystore
+        # 第 62 条：固定发布签名。keystore 以 base64 存在 GitHub Secrets，
+        # 这里解码写出 android/app/release.keystore 与 android/key.properties，
+        # 两者都不进 Git（android/.gitignore 已覆盖 key.properties / *.keystore）。
+        run: |
+          echo "${{ secrets.TAOHUAYUAN_KEYSTORE_BASE64 }}" | base64 -d > taohuayuan/android/app/release.keystore
+          cat > taohuayuan/android/key.properties <<EOF
+          storeFile=release.keystore
+          storePassword=${{ secrets.TAOHUAYUAN_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.TAOHUAYUAN_KEY_ALIAS }}
+          keyPassword=${{ secrets.TAOHUAYUAN_KEY_PASSWORD }}
+          EOF
+
       - name: Build arm64 Release APK
         working-directory: taohuayuan
         run: flutter build apk --release --target-platform android-arm64
