@@ -55,11 +55,15 @@ class AppUpdateService {
 
   static const _channel = MethodChannel('taohuayuan/update');
 
-  /// GitHub Releases latest：公开仓库，不用登录就能读。
+  /// GitHub Releases 列表（取前 20 个）：公开仓库，不用登录就能读。
   /// 未登录限流 60 次/小时/IP——App 每天最多自动查一次 + 用户手动点，
   /// 够用了；超了就当检查失败，不拿“没新版”骗人。
-  static const releasesLatestUrl =
-      'https://api.github.com/repos/suiwang974/thy/releases/latest';
+  /// 注意：不要用 releases/latest——GitHub 的 latest 是按 created_at 排的，
+  /// 2026-11-09 实测：v10 release 的 created_at（11-08）比旧固定 tag 的
+  /// release（11-09）还早，latest 指向旧 tag，App 查不到新版。
+  /// 所以拉列表、按 tag 里的发布号取最大的那一个，不依赖 GitHub 的排序。
+  static const releasesListUrl =
+      'https://api.github.com/repos/suiwang974/thy/releases?per_page=20';
 
   AppVersion? _cachedLocal;
 
@@ -72,7 +76,7 @@ class AppUpdateService {
     return int.tryParse(m.group(1)!);
   }
 
-  /// releases/latest 的 JSON 里挑 APK 附件。
+  /// release JSON 里挑 APK 附件，拼成更新信息。
   /// 没有 APK 附件（只有源码 zip 之类）返回 null，不拿源码包当更新。
   static AppUpdateInfo? parseLatestRelease(Map<String, dynamic> json) {
     final tag = json['tag_name'] as String?;
@@ -139,20 +143,29 @@ class AppUpdateService {
     }
   }
 
-  /// 查最新版。返回 null = 查不到（没网、GitHub 限流、解析失败），
+  /// 查最新版：拉 releases 列表，取 tag 里发布号最大的那一个
+  /// （不依赖 GitHub latest 的 created_at 排序，见 releasesListUrl 注释）。
+  /// 返回 null = 查不到（没网、GitHub 限流、解析失败），
   /// 调用方显示“检查失败”，别写成“已是最新”。
   Future<AppUpdateInfo?> checkLatest({http.Client? client}) async {
     final c = client ?? http.Client();
     final owned = client == null;
     try {
       final res = await c
-          .get(Uri.parse(releasesLatestUrl),
+          .get(Uri.parse(releasesListUrl),
               headers: {'Accept': 'application/vnd.github+json'})
           .timeout(const Duration(seconds: 10));
       if (res.statusCode != 200) return null;
       final decoded = jsonDecode(res.body);
-      if (decoded is! Map<String, dynamic>) return null;
-      return parseLatestRelease(decoded);
+      if (decoded is! List) return null;
+      AppUpdateInfo? best;
+      for (final item in decoded) {
+        if (item is! Map<String, dynamic>) continue;
+        final info = parseLatestRelease(item);
+        if (info == null) continue;
+        if (best == null || info.remoteCode > best.remoteCode) best = info;
+      }
+      return best;
     } catch (_) {
       return null;
     } finally {

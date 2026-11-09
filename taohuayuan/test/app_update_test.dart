@@ -102,19 +102,21 @@ void main() {
 
   test('第 50 条：checkLatest——200 正常、404/500/坏 JSON 都返回 null（检查失败，不是“没新版”）',
       () async {
-    final okBody = jsonEncode({
-      'tag_name': 'taohuayuan-v11',
-      'name': '桃花源 v11',
-      'body': 'notes',
-      'published_at': '2026-11-09T08:00:00Z',
-      'assets': [
-        {
-          'name': 'taohuayuan-android-arm64-v2.9.0.apk',
-          'size': 21553447,
-          'browser_download_url': 'https://example.com/a.apk',
-        }
-      ],
-    });
+    final okBody = jsonEncode([
+      {
+        'tag_name': 'taohuayuan-v11',
+        'name': '桃花源 v11',
+        'body': 'notes',
+        'published_at': '2026-11-09T08:00:00Z',
+        'assets': [
+          {
+            'name': 'taohuayuan-android-arm64-v2.9.0.apk',
+            'size': 21553447,
+            'browser_download_url': 'https://example.com/a.apk',
+          }
+        ],
+      }
+    ]);
     Future<http.Client> clientFor(http.Response res) async =>
         MockClient((_) async => res);
 
@@ -135,6 +137,55 @@ void main() {
 
     c = await clientFor(http.Response('not json', 200));
     expect(await AppUpdateService.instance.checkLatest(client: c), isNull);
+  });
+
+  test('第 50 条：checkLatest——列表里 latest 是旧 tag 时，仍取发布号最大的那个（2026-11-09 实测回归）',
+      () async {
+    // 实测：v10 release 的 created_at（11-08）比旧固定 tag 的 release（11-09）
+    // 还早，releases/latest 指向旧 tag；列表里两个都在，取最大的 v10。
+    final body = jsonEncode([
+      {
+        'tag_name': 'taohuayuan-v2.9.0',
+        'name': '桃花源 v2.9.0（重写版）',
+        'body': 'old',
+        'published_at': '2026-11-08T14:57:50Z',
+        'assets': [
+          {
+            'name': 'taohuayuan-android-arm64-v2.9.0.apk',
+            'size': 21685103,
+            'browser_download_url': 'https://example.com/old.apk',
+          }
+        ],
+      },
+      {
+        'tag_name': 'taohuayuan-v10',
+        'name': '桃花源 v10（重写版）',
+        'body': 'new',
+        'published_at': '2026-11-09T08:29:51Z',
+        'assets': [
+          {
+            'name': 'taohuayuan-android-arm64-v2.9.0.apk',
+            'size': 21685103,
+            'browser_download_url': 'https://example.com/v10.apk',
+          }
+        ],
+      },
+      {
+        'tag_name': 'v2.9.0',
+        'name': 'v2.9.0',
+        'body': 'shell',
+        'published_at': '2026-11-08T05:04:14Z',
+        'assets': [],
+      },
+    ]);
+    final c = MockClient((_) async => http.Response.bytes(
+          utf8.encode(body),
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        ));
+    final info = await AppUpdateService.instance.checkLatest(client: c);
+    expect(info?.remoteCode, 10);
+    expect(info?.downloadUrl, 'https://example.com/v10.apk');
   });
 
   test('第 50 条：同版 APK 已下完直接复用，不重复下载（不走网络）', () async {
