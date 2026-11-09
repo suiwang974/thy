@@ -6,9 +6,11 @@ import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_item.dart';
+import '../services/adblock_service.dart';
 import '../services/search_service.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
+import 'download_button.dart';
 
 /// 短视频页：竖屏上下滑，滑到哪段就真播哪段的视频（不是只放封面图）。
 /// 数据走已启用源的实时热门（没有本地目录）；滑到下一段前先预探它的直链。
@@ -219,6 +221,12 @@ class _ShortPageState extends State<_ShortPage> {
     await widget.store.setShortsMuted(m);
   }
 
+  String _fmt(Duration d) {
+    final m = d.inMinutes;
+    final s = d.inSeconds % 60;
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
   @override
   void dispose() {
     widget.currentPage.removeListener(_onPageChanged);
@@ -341,6 +349,13 @@ class _ShortPageState extends State<_ShortPage> {
           await _muteWebVideo(wc);
           await Future.delayed(const Duration(seconds: 4));
           if (mounted) await _muteWebVideo(wc);
+        }
+        // 广告拦截 JS 注入（第 26 条）：官方播放器页里也有广告。
+        final svc = AdblockService.instance;
+        if (svc.isReady) {
+          try {
+            await wc.runJavaScript(svc.injectionJs);
+          } catch (_) {}
         }
       },
       onNavigationRequest: (req) {
@@ -502,8 +517,86 @@ class _ShortPageState extends State<_ShortPage> {
             ),
           if (c != null && !c.value.isPlaying && _webController == null)
             const Center(child: Icon(Icons.play_circle_fill, color: Colors.white70, size: 80)),
+          // 竖屏控制条（2026-11-09 用户反馈：竖屏也要进度条、倍速、分辨率，
+          // 之前只有全屏才有）：进度条可拖、时间、倍速、分辨率菜单。
+          // 只在直链原生播时显示；官方播放器（WebView）时不显示（控不了站内播放器）。
+          // AnimatedBuilder 跟着播放器状态重建，时间和播放/暂停图标才实时更新。
+          if (c != null && c.value.isInitialized && _webController == null)
+            Positioned(
+              left: 12, right: 12, bottom: 8,
+              child: AnimatedBuilder(
+                animation: c,
+                builder: (_, _) => Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter,
+                        colors: [Colors.transparent, Colors.black87]),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      VideoProgressIndicator(c, allowScrubbing: true,
+                          colors: const VideoProgressColors(
+                              playedColor: Colors.pinkAccent,
+                              bufferedColor: Colors.white30,
+                              backgroundColor: Colors.white24)),
+                      Row(
+                        children: [
+                          IconButton(
+                            icon: Icon(c.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
+                            onPressed: () {
+                              if (c.value.isPlaying) {
+                                c.pause();
+                              } else {
+                                c.play();
+                              }
+                            },
+                          ),
+                          Text('${_fmt(c.value.position)} / ${_fmt(c.value.duration)}',
+                              style: const TextStyle(color: Colors.white, fontSize: 12)),
+                          const Spacer(),
+                          PopupMenuButton<double>(
+                            tooltip: '倍速',
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 8),
+                              child: Text('${_speed}x', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                            ),
+                            onSelected: (v) async {
+                              setState(() => _speed = v);
+                              await _controller?.setPlaybackSpeed(v);
+                            },
+                            itemBuilder: (_) => [0.5, 1.0, 1.25, 1.5, 2.0]
+                                .map((s) => PopupMenuItem<double>(
+                                    value: s, child: Text('${s}x${s == _speed ? ' ✓' : ''}')))
+                                .toList(),
+                          ),
+                          if (_variants.length > 1)
+                            PopupMenuButton<StreamVariant>(
+                              tooltip: '分辨率',
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 8),
+                                child: Text(_variantLabel ?? '画质',
+                                    style: const TextStyle(color: Colors.white, fontSize: 13)),
+                              ),
+                              onSelected: (v) async {
+                                setState(() => _variantLabel = v.label);
+                                await _switchVariant(v);
+                              },
+                              itemBuilder: (_) => _variants
+                                  .map((v) => PopupMenuItem<StreamVariant>(
+                                      value: v,
+                                      child: Text('${v.label}${v.label == _variantLabel ? ' ✓' : ''}')))
+                                  .toList(),
+                            ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           Positioned(
-            left: 12, right: 70, bottom: 24,
+            left: 12, right: 70, bottom: 76,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -517,7 +610,7 @@ class _ShortPageState extends State<_ShortPage> {
             ),
           ),
           Positioned(
-            right: 12, bottom: 24,
+            right: 12, bottom: 76,
             child: Column(
               children: [
                 IconButton(
@@ -541,6 +634,9 @@ class _ShortPageState extends State<_ShortPage> {
                   icon: const Icon(Icons.fullscreen, color: Colors.white, size: 30),
                   onPressed: _fullscreen,
                 ),
+                const SizedBox(height: 8),
+                // 下载入口（第 27 条）：短视频点一下就开始下。
+                DownloadButton(item: widget.item, size: 30),
               ],
             ),
           ),

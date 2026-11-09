@@ -32,6 +32,7 @@ class TasteProfile {
   final Map<String, int> sourceLikes; // 每个源被点赞的次数
   final Set<String> dislikedTags; // 点过“不喜欢”的标签
   final Set<String> watchedIds; // 已看完的视频 id
+  final Set<String> seenIds; // 看过一半以上的视频 id（没看完也降权，别反复置顶）
 
   const TasteProfile({
     this.tags = const {},
@@ -39,6 +40,7 @@ class TasteProfile {
     this.sourceLikes = const {},
     this.dislikedTags = const {},
     this.watchedIds = const {},
+    this.seenIds = const {},
   });
 
   /// 从本地 Store 拼出画像；什么都没有时用冷启动默认口味。
@@ -58,8 +60,11 @@ class TasteProfile {
       sourceLikes[item.source] = (sourceLikes[item.source] ?? 0) + 1;
     }
     final watchedIds = <String>{};
+    final seenIds = <String>{};
     for (final item in store.historyItems()) {
-      if (store.watchRatio(item.id) >= 0.9) watchedIds.add(item.id);
+      final ratio = store.watchRatio(item.id);
+      if (ratio >= 0.9) watchedIds.add(item.id);
+      if (ratio > 0) seenIds.add(item.id);
     }
     if (tags.isEmpty) tags.addAll(kColdStartTags);
     return TasteProfile(
@@ -68,6 +73,7 @@ class TasteProfile {
       sourceLikes: sourceLikes,
       dislikedTags: store.dislikedTags,
       watchedIds: watchedIds,
+      seenIds: seenIds,
     );
   }
 }
@@ -94,10 +100,14 @@ List<ScoredItem> rankRecommendations(
           sourceLikes: profile0.sourceLikes,
           dislikedTags: profile0.dislikedTags,
           watchedIds: profile0.watchedIds,
+          seenIds: profile0.seenIds,
         )
       : profile0;
+  // 去重：同一条（同 id）只留第一次出现，别在推荐流里反复出现。
+  final seenIds = <String>{};
+  final unique = items.where((v) => seenIds.add(v.id)).toList();
   final scored = <ScoredItem>[];
-  for (final item in items) {
+  for (final item in unique) {
     if (profile.watchedIds.contains(item.id)) continue; // 已看完的不再推
     final hay = '${item.title.toLowerCase()} ${item.keywords.join(' ').toLowerCase()}';
     var score = 0.0;
@@ -153,6 +163,8 @@ List<ScoredItem> rankRecommendations(
     for (final tag in profile.dislikedTags) {
       if (tag.isNotEmpty && hay.contains(tag)) score -= 10;
     }
+    // 看过但没看完的：降权 -4，别反复置顶（已看完的上面已经直接去掉了）。
+    if (profile.seenIds.contains(item.id)) score -= 4;
     scored.add(ScoredItem(item, score, reason));
   }
 
@@ -188,7 +200,8 @@ List<ScoredItem> rankRecommendations(
     final tagHit = profile.tags.any((t) => t.isNotEmpty && hay.contains(t));
     final authorHit = s.item.author.isNotEmpty && profile.authors.contains(s.item.author);
     final sourceHit = (profile.sourceLikes[s.item.source] ?? 0) > 0;
-    return !tagHit && !authorHit && !sourceHit;
+    // 看过的也不当“试新”推，别把看过的又顶上来。
+    return !tagHit && !authorHit && !sourceHit && !profile.seenIds.contains(s.item.id);
   }).toList();
   if (novel.isEmpty) return ranked;
   novel.sort((a, b) {

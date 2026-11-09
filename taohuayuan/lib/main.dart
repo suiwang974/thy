@@ -1,5 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
+import 'services/adblock_service.dart';
+import 'services/downloader.dart';
 import 'services/store.dart';
 import 'ui/author_screen.dart';
 import 'ui/browser_sources_screen.dart';
@@ -15,7 +19,42 @@ import 'ui/shorts_screen.dart';
 ///  搜索放推荐页顶部，不占一栏）。
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 全局兜底：任何 widget 构建/布局出错时，Flutter 在 release 下默认只画一块
+  // 静默灰框（RenderErrorBox，0xF0C0C0C0），用户看不到任何提示、也没法操作——
+  // 2026-11-09 详情页灰框就是这么来的（音频照常播、控制条全没了）。
+  // 改成带文字的深色卡片：写明出问题了、把异常第一行打出来（截图就能定位）、
+  // 并提示返回重进。Directionality 自带，免得首屏还没建好就再抛错。
+  ErrorWidget.builder = (FlutterErrorDetails details) {
+    final msg = details.exception.toString().replaceAll(RegExp(r'\s+'), ' ');
+    final short = msg.length > 90 ? '${msg.substring(0, 90)}…' : msg;
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Container(
+        color: const Color(0xFF2A2A35),
+        padding: const EdgeInsets.all(16),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.error_outline, color: Colors.orange, size: 28),
+              const SizedBox(height: 8),
+              const Text('这里加载出问题了，返回重进试试',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white, fontSize: 14)),
+              const SizedBox(height: 6),
+              Text(short,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white54, fontSize: 12)),
+            ],
+          ),
+        ),
+      ),
+    );
+  };
   final store = await Store.load();
+  // 广告拦截 + 下载管理后台初始化（不阻塞启动；规则 7 天没更新就后台拉一次）。
+  unawaited(AdblockService.instance.init().catchError((_) {}));
+  unawaited(DownloadManager.instance.init().catchError((_) {}));
   runApp(TaohuayuanApp(store: store));
 }
 

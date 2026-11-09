@@ -53,9 +53,18 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
     setState(() => _refreshing = true);
+    // 下拉刷新要真换一批：轮换计数 +1 再取（换词、换页取新结果），
+    // 不是重取同一批最热；计数存本地，下次打开接着轮。
+    final rotation = forceRefresh
+        ? widget.store.feedRotation + 1
+        : widget.store.feedRotation;
+    if (forceRefresh) {
+      await widget.store.setFeedRotation(rotation);
+    }
     final svc = SearchService(disabledSources: widget.store.disabledSources);
     var gotAny = false;
     final feed = await svc.homeFeed(
+      rotation: rotation,
       onResult: (partial) {
         if (!mounted) return;
         gotAny = true;

@@ -16,6 +16,7 @@ class Store {
   static const _dislikedTagsKey = 'taohuayuan_disliked_tags';
   static const _feedCacheKey = 'taohuayuan_feed_cache';
   static const _feedCacheTimeKey = 'taohuayuan_feed_cache_time';
+  static const _feedRotationKey = 'taohuayuan_feed_rotation';
 
   /// 首页缓存有效期：30 分钟。过期后后台刷新。
   static const feedCacheTtl = Duration(minutes: 30);
@@ -240,6 +241,14 @@ class Store {
 
   Future<void> setShortsMuted(bool muted) async {
     await _prefs.setBool(_shortsMutedKey, muted);
+  }
+
+  // ---- 推荐轮换计数（2026-11-09 用户反馈：推荐页同一批反复出现）----
+  // 下拉刷新就 +1，homeFeed 按它换词、换页取新一批；存在本地，重启也不丢。
+  int get feedRotation => _prefs.getInt(_feedRotationKey) ?? 0;
+
+  Future<void> setFeedRotation(int value) async {
+    await _prefs.setInt(_feedRotationKey, value);
   }
 
   // ---- 清除口味数据（喜欢/关注/记录/搜过的词/不喜欢），源开关不动 ----

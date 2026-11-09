@@ -39,7 +39,7 @@ abstract class Source {
   String get webHomeUrl => '';
 
   Future<SourceResult> search(String query);
-  Future<SourceResult> home();
+  Future<SourceResult> home({int page = 1});
 
   /// 分页搜第 page 页（搜索分页加载用）。默认实现：只有第 1 页走 search，
   /// 第 2 页起返回空；各源按需重写成真正的单页抓取。
@@ -241,10 +241,10 @@ class EpornerSource implements Source {
   }
 
   @override
-  Future<SourceResult> home() async {
+  Future<SourceResult> home({int page = 1}) async {
     try {
       final uri = Uri.parse('https://www.eporner.com/api/v2/video/search/'
-          '?query=&per_page=100&page=1&order=most-popular&format=json');
+          '?query=&per_page=100&page=$page&order=most-popular&format=json');
       final res = await http.get(uri, headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 20));
       final json = jsonDecode(_decodeBody(res)) as Map<String, dynamic>;
       final vids = (json['videos'] ?? []) as List;
@@ -336,7 +336,7 @@ class Rule34VideosSource implements Source {
   }
 
   @override
-  Future<SourceResult> home() async {
+  Future<SourceResult> home({int page = 1}) async {
     try {
       final res = await http.get(Uri.parse('$_base/'), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
       if (res.statusCode != 200) {
@@ -431,7 +431,7 @@ class NiacgSource implements Source {
   }
 
   @override
-  Future<SourceResult> home() async => const SourceResult(sourceId: 'niacg', sourceName: 'Niacg');
+  Future<SourceResult> home({int page = 1}) async => const SourceResult(sourceId: 'niacg', sourceName: 'Niacg');
 }
 
 /// ---------- 4. Lianzu11：WordPress 站，?s= 搜索，详情页有直链 mp4 ----------
@@ -517,7 +517,7 @@ class Lianzu11Source implements Source {
   }
 
   @override
-  Future<SourceResult> home() async {
+  Future<SourceResult> home({int page = 1}) async {
     // WordPress 首页就是最新文章列表，同一套解析能用。
     try {
       final res = await http.get(Uri.parse('https://lianzu11.com/'), headers: {'User-Agent': _ua}).timeout(const Duration(seconds: 25));
@@ -669,7 +669,7 @@ class HtmlSearchSource implements Source {
   }
 
   @override
-  Future<SourceResult> home() async => SourceResult(sourceId: id, sourceName: name);
+  Future<SourceResult> home({int page = 1}) async => SourceResult(sourceId: id, sourceName: name);
 }
 
 /// ---------- 6. XHamster：搜索页嵌着 JSON（videoThumbProps），直接解析它 ----------
@@ -758,7 +758,7 @@ class XhamsterSource implements Source {
   }
 
   @override
-  Future<SourceResult> home() async => SourceResult(sourceId: id, sourceName: name);
+  Future<SourceResult> home({int page = 1}) async => SourceResult(sourceId: id, sourceName: name);
 }
 
 /// 成人动漫源 Hanime1 / HanimeOne（hanime1.me / hanimeone.me，互为镜像）。
@@ -821,7 +821,7 @@ class HanimeSource implements Source {
       _fetch(webSearchUrl(query, page));
 
   @override
-  Future<SourceResult> home() async => _fetch(webHomeUrl);
+  Future<SourceResult> home({int page = 1}) async => _fetch(webHomeUrl);
 
   Future<SourceResult> _fetch(String url) async {
     try {

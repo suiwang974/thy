@@ -96,4 +96,37 @@ void main() {
     expect(ranked.length, 1);
     expect(ranked.first.reason.isNotEmpty, isTrue);
   });
+
+  test('去重：同一条（同 id）只留一次，不反复出现', () {
+    const profile = TasteProfile();
+    final ranked = rankRecommendations([
+      item(id: 'a', title: 'footjob one', keywords: ['footjob']),
+      item(id: 'a', title: 'footjob one', keywords: ['footjob']),
+      item(id: 'b', title: '3d one', keywords: ['3d']),
+    ], profile);
+    expect(ranked.length, 2);
+    expect(ranked.map((s) => s.item.id).toSet(), {'a', 'b'});
+  });
+
+  test('看过但没看完的降权：同分时排在没看过的后面', () {
+    const profile = TasteProfile(seenIds: {'a'});
+    final ranked = rankRecommendations([
+      item(id: 'a', title: 'footjob one', keywords: ['footjob']),
+      item(id: 'b', title: 'footjob two', keywords: ['footjob']),
+    ], profile);
+    expect(ranked.first.item.id, 'b');
+    expect(ranked.last.item.id, 'a');
+  });
+
+  test('看过的不当“试新”推', () {
+    const profile = TasteProfile(seenIds: {'n1'});
+    final ranked = rankRecommendations([
+      item(id: 't0', title: 'footjob 0', keywords: ['footjob']),
+      item(id: 'n1', title: 'cosplay dance', keywords: ['cosplay'], views: 9999),
+      item(id: 'n2', title: 'cooking show', keywords: ['cooking'], views: 8888),
+    ], profile);
+    final explore = ranked.where((s) => s.reason.startsWith('试试新口味')).toList();
+    expect(explore.map((s) => s.item.id), isNot(contains('n1')));
+  });
+
 }

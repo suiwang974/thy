@@ -33,7 +33,7 @@ class FakeSource implements Source {
   }
 
   @override
-  Future<SourceResult> home() async => search('');
+  Future<SourceResult> home({int page = 1}) async => search('');
 
   @override
   Future<SourceResult> searchPage(String query, int page) async {
@@ -214,6 +214,61 @@ void main() {
     expect(real.sources.map((s) => s.id), isNot(contains('niacg')));
     expect(real.sources.map((s) => s.id), isNot(contains('hanime1')));
   }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('homeFeed 去重：两个源返回同一条只留一次（第 24 条）', () async {
+    final svc = SearchService(sources: [
+      FakeSource('s1', items: [v('a', title: 'one'), v('b', title: 'two')]),
+      FakeSource('s2', items: [v('a', title: 'one'), v('c', title: 'three')]),
+    ]);
+    final feed = await svc.homeFeed();
+    expect(feed.length, 3);
+    expect(feed.map((i) => i.id).toSet(), {'a', 'b', 'c'});
+  });
+
+  test('homeFeed 轮换：rotation 换词、换页，同一批不反复出现（第 24 条）', () async {
+    final svc = SearchService(sources: [QueryFakeSource('q')]);
+    // rotation 0：走 home() 第 1 页。
+    expect((await svc.homeFeed(rotation: 0)).map((i) => i.id), ['home-1-a']);
+    // rotation 1：换词 3d、第 1 页走 searchPage。
+    expect((await svc.homeFeed(rotation: 1)).map((i) => i.id), ['3d-1-a', '3d-1-b']);
+    // rotation 2：换词 asian、第 1 页。
+    expect((await svc.homeFeed(rotation: 2)).map((i) => i.id), ['asian-1-a', 'asian-1-b']);
+    // rotation 6：词 3d、翻第 2 页——fake 的 searchPage 第 2 页为空，
+    // 回落 home(page: 2)，照样是新一批，不是第 1 页那批。
+    expect((await svc.homeFeed(rotation: 6)).map((i) => i.id), ['home-2-a']);
+  });
+}
+
+/// 按词/页返回不同条目的假源：验 homeFeed 轮换是不是真换了批。
+class QueryFakeSource implements Source {
+  final String _id;
+  const QueryFakeSource(this._id);
+
+  @override
+  String get id => _id;
+  @override
+  String get name => _id;
+  @override
+  bool get webViewOnly => false;
+  @override
+  String webSearchUrl(String query) => '';
+  @override
+  String get webHomeUrl => '';
+
+  @override
+  Future<SourceResult> search(String query) async => SourceResult(
+      sourceId: _id, sourceName: _id, items: [v('search-$query-a'), v('search-$query-b')]);
+
+  @override
+  Future<SourceResult> searchPage(String query, int page) async {
+    if (page > 1) return SourceResult(sourceId: _id, sourceName: _id);
+    return SourceResult(
+        sourceId: _id, sourceName: _id, items: [v('$query-$page-a'), v('$query-$page-b')]);
+  }
+
+  @override
+  Future<SourceResult> home({int page = 1}) async => SourceResult(
+      sourceId: _id, sourceName: _id, items: [v('home-$page-a')]);
 }
 
 /// 第一次调用超时（拖 9 秒），之后每次都立刻成功：模拟“慢的源后台再试成功”。
@@ -253,5 +308,5 @@ class FlakySource implements Source {
   }
 
   @override
-  Future<SourceResult> home() async => search('');
+  Future<SourceResult> home({int page = 1}) async => search('');
 }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,8 +7,10 @@ import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_item.dart';
+import '../services/adblock_service.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
+import 'download_button.dart';
 
 /// 播放页：点开直接在线播。
 /// - 播放一律走直链、原生播（ExoPlayer，HLS/mp4 都行；niacg 的链带 Referer 头）；
@@ -25,7 +28,10 @@ class PlayerScreen extends StatefulWidget {
   final VideoItem item;
   final List<VideoItem>? playlist; // 同一批的段列表（有就显示上一段/下一段）
   final Store store;
-  const PlayerScreen({super.key, required this.item, this.playlist, required this.store});
+  // 本地文件路径（下载管理里点开已下载的视频）：有它就直接播本地文件，
+  // 不解析直链、不走官方播放器、不显示画质/下载按钮。
+  final String? localFilePath;
+  const PlayerScreen({super.key, required this.item, this.playlist, required this.store, this.localFilePath});
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -55,9 +61,44 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _current = widget.item;
     _liked = widget.store.likedIds.contains(_current.id);
     _disliked = widget.store.isDisliked(_current);
-    _play(_current);
-    widget.store.addHistory(_current);
-    _prefetchNeighbors();
+    if (widget.localFilePath != null) {
+      _playLocal();
+    } else {
+      _play(_current);
+      widget.store.addHistory(_current);
+      _prefetchNeighbors();
+    }
+  }
+
+  /// 播本地已下载的文件（下载管理点开）：直接 VideoPlayerController.file，
+  /// 不解析直链、不核时长、不嵌官方播放器。
+  Future<void> _playLocal() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final c = VideoPlayerController.file(File(widget.localFilePath!));
+      await c.initialize();
+      if (!mounted) return;
+      setState(() {
+        _controller = c;
+        _loading = false;
+      });
+      final resume = widget.store.watchPosition(_current.id);
+      final total = c.value.duration.inSeconds;
+      if (resume > 10 && total - resume > 10) {
+        await c.seekTo(Duration(seconds: resume));
+      }
+      await c.setPlaybackSpeed(_speed);
+      await c.play();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = '本地文件打不开了，可能已被删掉：${_shortReason(e)}';
+      });
+    }
   }
 
   void _prefetchNeighbors() {
@@ -141,10 +182,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
       await c.setPlaybackSpeed(_speed);
       await c.play();
-      // 无画面看门狗 + 画质档位：播起来之后 3 秒再看一眼——
-      // 声音在放、但视频轨道一直没给尺寸（宽/高为 0），说明画面纹理没出帧
-      // （用户 2026-11-09 截图：灰框只有声音没画面），别让用户对着灰框干等，
-      // 自动切 App 内嵌官方播放器；控制条里也常驻“官方播放器”按钮，一点就切。
+      // 看门狗 + 画质档位：播起来之后 5 秒再看一眼。
+      // 注意：灰框的真根因是视频区 widget 在真机上抛错（release 下只剩灰框，
+      // 见 main.dart 的 ErrorWidget 兜底注释），不是没尺寸——尺寸在
+      // initialize 时就从轨道元数据里拿到了，有灰框时尺寸也是正常的，
+      // 所以光查尺寸查不出灰框。看门狗只抓真正能从播放器状态看出来的卡死：
+      // 报错、没尺寸、或者 play() 叫了 5 秒还停在 0 秒、没在播、也没在缓冲。
+      // 灰框的自救靠两处：视频区结构改回 v3 验证过的写法 + 标题下面的常驻
+      // “没画面？用官方播放器”按钮（视频区控制条没了也能点）。
+      _userPaused = false;
       _startWatchdog(c);
       unawaited(_loadVariants());
     } catch (e) {
@@ -153,16 +199,27 @@ class _PlayerScreenState extends State<PlayerScreen> {
     }
   }
 
-  /// 无画面看门狗：播起来 3 秒后检查一次——视频轨道没尺寸（宽/高为 0）
-  /// 或报了错，说明画面出不来，自动切官方播放器。
-  /// 正常视频 initialize 完就有尺寸，不会误判。
+  /// 看门狗：播起来 5 秒后检查一次，只抓播放器状态能看出来的真卡死——
+  /// 报错、视频轨道没尺寸、或者 play() 叫了 5 秒还停在 0 秒、没在播、
+  /// 也没在缓冲（不是用户自己点的暂停）。满足任一就自动切官方播放器。
+  /// 灰框（widget 抛错）查不出来，靠结构回退 + 常驻逃生按钮自救。
+  bool _userPaused = false; // 用户自己点的暂停：看门狗不许把“用户暂停”当卡死。
+
   void _startWatchdog(VideoPlayerController c) {
     _watchdog?.cancel();
-    _watchdog = Timer(const Duration(seconds: 3), () {
+    _watchdog = Timer(const Duration(seconds: 5), () {
       if (!mounted || _controller != c || _webController != null) return;
       final v = c.value;
       if (v.hasError || v.size.width <= 0 || v.size.height <= 0) {
         _embedOfficial('原生播放器出不来画面（只有声音），已切官方播放器');
+        return;
+      }
+      if (!_userPaused &&
+          !v.isPlaying &&
+          !v.isBuffering &&
+          v.position.inSeconds == 0 &&
+          v.duration.inSeconds > 0) {
+        _embedOfficial('直链播了 5 秒还没动静，已切官方播放器');
       }
     });
   }
@@ -229,35 +286,50 @@ class _PlayerScreenState extends State<PlayerScreen> {
       });
       return;
     }
-    final wc = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setNavigationDelegate(NavigationDelegate(
-        onNavigationRequest: (req) {
-          // 官方播放器页内跳转放行；点到站外广告/下载链接时拦住，别把人带走。
-          final u = req.url;
-          if (u.contains('eporner.com') ||
-              u.contains('rule34-videos.com') ||
-              u.contains('niacg.com') ||
-              u.contains('lianzu11.com') ||
-              u.contains('hanime1.me') ||
-              u.contains('hanimeone.me') ||
-              u.contains('xvideos.com') ||
-              u.contains('xhamster.com') ||
-              u.contains('pornhub.com') ||
-              u.contains('spankbang.com') ||
-              u.startsWith('about:blank') ||
-              u.startsWith('data:')) {
-            return NavigationDecision.navigate;
-          }
-          return NavigationDecision.prevent;
-        },
-      ))
-      ..loadRequest(Uri.parse(embed));
+    // 控制器先声明出来，再挂回调：回调里要调 _injectAdblock(wc)，
+    // 写成级联 (..setNavigationDelegate) 会在声明完成前引用 wc，编译不过。
+    final wc = WebViewController();
+    wc.setJavaScriptMode(JavaScriptMode.unrestricted);
+    wc.setNavigationDelegate(NavigationDelegate(
+      onPageFinished: (_) async {
+        await _injectAdblock(wc);
+      },
+      onNavigationRequest: (req) {
+        // 官方播放器页内跳转放行；点到站外广告/下载链接时拦住，别把人带走。
+        final u = req.url;
+        if (u.contains('eporner.com') ||
+            u.contains('rule34-videos.com') ||
+            u.contains('niacg.com') ||
+            u.contains('lianzu11.com') ||
+            u.contains('hanime1.me') ||
+            u.contains('hanimeone.me') ||
+            u.contains('xvideos.com') ||
+            u.contains('xhamster.com') ||
+            u.contains('pornhub.com') ||
+            u.contains('spankbang.com') ||
+            u.startsWith('about:blank') ||
+            u.startsWith('data:')) {
+          return NavigationDecision.navigate;
+        }
+        return NavigationDecision.prevent;
+      },
+    ));
+    wc.loadRequest(Uri.parse(embed));
     _webController = wc;
     setState(() {
       _loading = false;
       _error = reason;
     });
+  }
+
+  /// 广告拦截 JS 注入（第 26 条）：官方播放器页里也有广告，加载完注一次
+  /// （fetch/XHR 覆盖 + 藏广告元素；导航层已有白名单在拦站外跳转）。
+  Future<void> _injectAdblock(WebViewController wc) async {
+    final svc = AdblockService.instance;
+    if (!svc.isReady) return;
+    try {
+      await wc.runJavaScript(svc.injectionJs);
+    } catch (_) {}
   }
 
   /// 重试直链：清掉解析缓存（直链地址可能已过期），关掉官方播放器，重新解析播。
@@ -338,9 +410,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
           : AppBar(
               backgroundColor: Colors.black,
               iconTheme: const IconThemeData(color: Colors.white),
-              title: Text(_current.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+              title: Text(_current.title, maxLines: 2, overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Colors.white, fontSize: 15)),
               actions: [
+                // 下载入口（第 27 条）：详情页点一下就开始下；播本地文件时没有。
+                if (widget.localFilePath == null) DownloadButton(item: _current),
                 IconButton(
                   icon: Icon(_liked ? Icons.favorite : Icons.favorite_border, color: _liked ? Colors.red : Colors.white),
                   onPressed: () async {
@@ -373,9 +447,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
             aspectRatio: _isFullscreen ? 16 / 9 : 16 / 9,
             child: Container(
               color: Colors.black,
-              // 报错内容超高时裁掉，不许溢出画到下面的标题上（v3 截图里
-              // “在源站看”按钮就压在标题文字上了，就是这里没裁剪）。
-              clipBehavior: Clip.hardEdge,
+              // 注意：这里不要加 Clip.hardEdge——v3 没加时在这台手机上播得好好的，
+              // v4 加上它之后详情页开始出灰框（灰框真根因见 main.dart 注释：
+              // 视频区 widget 抛错、release 下只剩灰框）。报错区已经收紧到能
+              // 塞进 16:9 框里，不用裁剪兜底。
               child: _buildVideoArea(c),
             ),
           ),
@@ -481,20 +556,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (c == null || !c.value.isInitialized) {
       return const Center(child: Text('播放器还没准备好', style: TextStyle(color: Colors.white54)));
     }
+    // 尺寸异常时不建 Stack：宽/高为 0 或非法时，VideoPlayer/AspectRatio
+    // 在真机布局里可能炸掉整块视频区（灰框的根因就是视频区 widget 抛错），
+    // 直接显示“还没准备好”，等下一帧状态正常了再建。
+    if (c.value.size.width <= 0 || c.value.size.height <= 0) {
+      return const Center(child: Text('播放器还没准备好', style: TextStyle(color: Colors.white54)));
+    }
+    final ar = c.value.aspectRatio;
+    final safeAr = ar.isFinite && ar > 0 ? ar : 16 / 9;
     return Stack(
-      fit: StackFit.expand,
       alignment: Alignment.center,
       children: [
-        // 画面：按视频比例居中适配（contain），不撑大外框。
-        // 之前内层 AspectRatio 直接当 Stack 的尺寸锚：竖屏/4:3 视频会把
-        // Stack 撑出 16:9 的框，底部控制条被 Clip.hardEdge 裁到框外——
-        // 用户截图就是灰框 + 一个控制键都没有。现在控制条是 Stack 的直接子项，
-        // 钉在 16:9 框的底部，跟视频比例无关，裁不掉。
-        Center(
-          child: AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c)),
-        ),
+        // 画面：v3 在这台手机上能播的结构——AspectRatio 直接当第一个子项，
+        // 不包 Center、不设 StackFit.expand（v5 那套没修好灰框，反而是
+        // v3 这套在真机上验证过）。竖屏视频按比例居中，左右留黑边；
+        // 控制条是 Stack 的直接子项，钉在 16:9 框底部。
+        AspectRatio(aspectRatio: safeAr, child: VideoPlayer(c)),
         GestureDetector(
-          onTap: () => setState(() => c.value.isPlaying ? c.pause() : c.play()),
+          onTap: () => setState(() {
+            if (c.value.isPlaying) {
+              _userPaused = true;
+              c.pause();
+            } else {
+              _userPaused = false;
+              c.play();
+            }
+          }),
           child: Container(color: Colors.transparent),
         ),
         if (!c.value.isPlaying)
@@ -515,7 +602,15 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   children: [
                     IconButton(
                       icon: Icon(c.value.isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
-                      onPressed: () => setState(() => c.value.isPlaying ? c.pause() : c.play()),
+                      onPressed: () => setState(() {
+                        if (c.value.isPlaying) {
+                          _userPaused = true;
+                          c.pause();
+                        } else {
+                          _userPaused = false;
+                          c.play();
+                        }
+                      }),
                     ),
                     Text(
                       '${_fmt(c.value.position)} / ${_fmt(c.value.duration)}',
@@ -525,14 +620,16 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     // 画质：多档才显示，当前档标 ✓。切档不断流重进（记位置、倍速）。
                     if (_variants.length > 1) _qualityButton(),
                     // 画面出不来时一键切官方播放器（灰框自救，不用退出重进）。
-                    TextButton(
-                      onPressed: () => _embedOfficial('已切换到源站官方播放器'),
-                      style: TextButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(horizontal: 6),
-                          minimumSize: Size.zero,
-                          tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                      child: const Text('官方播', style: TextStyle(color: Colors.white, fontSize: 12)),
-                    ),
+                    // 播本地文件时没有官方播放器可切。
+                    if (widget.localFilePath == null)
+                      TextButton(
+                        onPressed: () => _embedOfficial('已切换到源站官方播放器'),
+                        style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 6),
+                            minimumSize: Size.zero,
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                        child: const Text('官方播', style: TextStyle(color: Colors.white, fontSize: 12)),
+                      ),
                     _speedButton(),
                     IconButton(
                       icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),
@@ -619,18 +716,28 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 ),
               ],
             ),
-          // 备选只在加载中出现：报错时视频区里已经有 [重试] [用官方播放器看]
-          // 两个按钮，这里再放一个同样的按钮纯属重复（v3 里两个“在源站看”
-          // 上下叠着，上面那个还压住了标题）。
-          // 点开是在 App 里嵌官方播放器，不踢出到外部浏览器。
-          if (_error == null && _current.embedUrl.isNotEmpty && _controller == null && _webController == null) ...[
+          // 常驻逃生口：原生播出灰框/没画面时，视频区里的控制条也可能一起没了，
+          // 用户在视频区点不到任何按钮——这里（标题下面）永远有一排“官方播放器 /
+          // 重试直链”，一点就切，不用退出重进。点开是在 App 里嵌官方播放器，
+          // 不踢出到外部浏览器。已经在官方播放器里时不重复显示（视频区里已有按钮）。
+          if (_current.embedUrl.isNotEmpty && _webController == null) ...[
             const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton(
-                onPressed: () => _embedOfficial('已切换到源站官方播放器'),
-                child: Text(_fallbackButtonLabel),
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => _embedOfficial('已切换到源站官方播放器'),
+                    child: const Text('没画面？用官方播放器'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: _retryDirect,
+                    child: const Text('重试直链'),
+                  ),
+                ),
+              ],
             ),
           ],
           const SizedBox(height: 8),

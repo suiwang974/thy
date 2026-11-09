@@ -249,9 +249,47 @@ class SearchService {
   /// 默认词按源的站内偏好分（3D 站搜 3d、综合站搜足控/亚洲），冷启动口味一致。
   /// 每当某个源回结果就调一次 onResult，先回来的先显示；单个源 8 秒超时跳过。
   /// 慢的源后台再试：没回结果的源 2 秒后再试一次，成功了通过 onRetried 把新条目补回来。
+  /// 按 id 去重（同一条不要在推荐流里出现两次）：保留第一次出现的位置。
+  static List<VideoItem> dedupeById(List<VideoItem> items) {
+    final seen = <String>{};
+    return items.where((v) => seen.add(v.id)).toList();
+  }
+
+  /// 轮换用的词：每次刷新按 rotation 换词、换页，别每次都拿同一批最热。
+  /// rotation 1–5 换词（第 1 页），6–10 同批词翻第 2 页，11–15 第 3 页，
+  /// 之后循环。eporner 的 home(page) 直接翻最热页，其他源走 searchPage。
+  static const _rotationQueries = ['footjob', '3d', 'asian', 'foot', 'femdom'];
+  static String _rotationQuery(int rotation) =>
+      _rotationQueries[rotation % _rotationQueries.length];
+  static int _rotationPage(int rotation) =>
+      1 + (rotation ~/ _rotationQueries.length) % 3;
+
+  /// 某个源的一次推荐取数：rotation 0 走老路（home + 默认词兜底）；
+  /// rotation > 0 走轮换（换词翻页搜，空了回落 home(page)，再空回落默认词）。
+  Future<SourceResult> _fetchHome(Source s, int rotation) async {
+    if (rotation <= 0) {
+      var r = await s.home().timeout(_timeoutFor(s));
+      if (r.items.isEmpty) {
+        r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(_timeoutFor(s));
+      }
+      return r;
+    }
+    var r = await s
+        .searchPage(mapSearchQuery(_rotationQuery(rotation)), _rotationPage(rotation))
+        .timeout(_timeoutFor(s));
+    if (r.items.isEmpty) {
+      r = await s.home(page: _rotationPage(rotation)).timeout(_timeoutFor(s));
+    }
+    if (r.items.isEmpty) {
+      r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(_timeoutFor(s));
+    }
+    return r;
+  }
+
   Future<List<VideoItem>> homeFeed({
     void Function(List<VideoItem> partial)? onResult,
     void Function(List<VideoItem> extra)? onRetried,
+    int rotation = 0,
   }) async {
     final items = <VideoItem>[];
     final failed = <Source>[];
@@ -259,10 +297,7 @@ class SearchService {
       final sw = Stopwatch()..start();
       SourceResult r;
       try {
-        r = await s.home().timeout(_timeoutFor(s));
-        if (r.items.isEmpty) {
-          r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(_timeoutFor(s));
-        }
+        r = await _fetchHome(s, rotation);
       } catch (_) {
         r = SourceResult(sourceId: s.id, sourceName: s.name);
       }
@@ -270,32 +305,30 @@ class SearchService {
       lastLatencies[s.id] = sw.elapsedMilliseconds;
       if (r.items.isNotEmpty) {
         items.addAll(r.items);
-        onResult?.call(List.of(items));
+        onResult?.call(dedupeById(List.of(items)));
       } else {
         failed.add(s);
       }
     }));
     if (onRetried != null) {
       for (final s in failed) {
-        unawaited(_retryHome(s, onRetried));
+        unawaited(_retryHome(s, onRetried, rotation));
       }
     }
-    return items;
+    return dedupeById(items);
   }
 
-  Future<void> _retryHome(Source s, void Function(List<VideoItem>) onRetried) async {
+  Future<void> _retryHome(
+      Source s, void Function(List<VideoItem>) onRetried, int rotation) async {
     for (var attempt = 0; attempt < maxRetries; attempt++) {
       await Future.delayed(_retryDelays[attempt]);
       try {
         final sw = Stopwatch()..start();
-        var r = await s.home().timeout(_timeoutFor(s));
-        if (r.items.isEmpty) {
-          r = await s.search(mapSearchQuery(_defaultQueryFor(s.id))).timeout(_timeoutFor(s));
-        }
+        final r = await _fetchHome(s, rotation);
         sw.stop();
         lastLatencies[s.id] = sw.elapsedMilliseconds;
         if (r.items.isNotEmpty) {
-          onRetried(r.items);
+          onRetried(dedupeById(r.items));
           return;
         }
       } catch (_) {
