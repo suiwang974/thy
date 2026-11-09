@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,10 +6,8 @@ import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../models/video_item.dart';
-import '../services/adblock_service.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
-import 'download_button.dart';
 
 /// 播放页：点开直接在线播。
 /// - 播放一律走直链、原生播（ExoPlayer，HLS/mp4 都行；niacg 的链带 Referer 头）；
@@ -28,10 +25,7 @@ class PlayerScreen extends StatefulWidget {
   final VideoItem item;
   final List<VideoItem>? playlist; // 同一批的段列表（有就显示上一段/下一段）
   final Store store;
-  // 本地文件路径（下载管理里点开已下载的视频）：有它就直接播本地文件，
-  // 不解析直链、不走官方播放器、不显示画质/下载按钮。
-  final String? localFilePath;
-  const PlayerScreen({super.key, required this.item, this.playlist, required this.store, this.localFilePath});
+  const PlayerScreen({super.key, required this.item, this.playlist, required this.store});
 
   @override
   State<PlayerScreen> createState() => _PlayerScreenState();
@@ -61,44 +55,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
     _current = widget.item;
     _liked = widget.store.likedIds.contains(_current.id);
     _disliked = widget.store.isDisliked(_current);
-    if (widget.localFilePath != null) {
-      _playLocal();
-    } else {
-      _play(_current);
-      widget.store.addHistory(_current);
-      _prefetchNeighbors();
-    }
-  }
-
-  /// 播本地已下载的文件（下载管理点开）：直接 VideoPlayerController.file，
-  /// 不解析直链、不核时长、不嵌官方播放器。
-  Future<void> _playLocal() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final c = VideoPlayerController.file(File(widget.localFilePath!));
-      await c.initialize();
-      if (!mounted) return;
-      setState(() {
-        _controller = c;
-        _loading = false;
-      });
-      final resume = widget.store.watchPosition(_current.id);
-      final total = c.value.duration.inSeconds;
-      if (resume > 10 && total - resume > 10) {
-        await c.seekTo(Duration(seconds: resume));
-      }
-      await c.setPlaybackSpeed(_speed);
-      await c.play();
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _error = '本地文件打不开了，可能已被删掉：${_shortReason(e)}';
-      });
-    }
+    _play(_current);
+    widget.store.addHistory(_current);
+    _prefetchNeighbors();
   }
 
   void _prefetchNeighbors() {
@@ -286,50 +245,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
       });
       return;
     }
-    // 控制器先声明出来，再挂回调：回调里要调 _injectAdblock(wc)，
-    // 写成级联 (..setNavigationDelegate) 会在声明完成前引用 wc，编译不过。
-    final wc = WebViewController();
-    wc.setJavaScriptMode(JavaScriptMode.unrestricted);
-    wc.setNavigationDelegate(NavigationDelegate(
-      onPageFinished: (_) async {
-        await _injectAdblock(wc);
-      },
-      onNavigationRequest: (req) {
-        // 官方播放器页内跳转放行；点到站外广告/下载链接时拦住，别把人带走。
-        final u = req.url;
-        if (u.contains('eporner.com') ||
-            u.contains('rule34-videos.com') ||
-            u.contains('niacg.com') ||
-            u.contains('lianzu11.com') ||
-            u.contains('hanime1.me') ||
-            u.contains('hanimeone.me') ||
-            u.contains('xvideos.com') ||
-            u.contains('xhamster.com') ||
-            u.contains('pornhub.com') ||
-            u.contains('spankbang.com') ||
-            u.startsWith('about:blank') ||
-            u.startsWith('data:')) {
-          return NavigationDecision.navigate;
-        }
-        return NavigationDecision.prevent;
-      },
-    ));
-    wc.loadRequest(Uri.parse(embed));
+    final wc = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(
+        onNavigationRequest: (req) {
+          // 官方播放器页内跳转放行；点到站外广告/下载链接时拦住，别把人带走。
+          final u = req.url;
+          if (u.contains('eporner.com') ||
+              u.contains('rule34-videos.com') ||
+              u.contains('niacg.com') ||
+              u.contains('lianzu11.com') ||
+              u.contains('hanime1.me') ||
+              u.contains('hanimeone.me') ||
+              u.contains('xvideos.com') ||
+              u.contains('xhamster.com') ||
+              u.contains('pornhub.com') ||
+              u.contains('spankbang.com') ||
+              u.startsWith('about:blank') ||
+              u.startsWith('data:')) {
+            return NavigationDecision.navigate;
+          }
+          return NavigationDecision.prevent;
+        },
+      ))
+      ..loadRequest(Uri.parse(embed));
     _webController = wc;
     setState(() {
       _loading = false;
       _error = reason;
     });
-  }
-
-  /// 广告拦截 JS 注入（第 26 条）：官方播放器页里也有广告，加载完注一次
-  /// （fetch/XHR 覆盖 + 藏广告元素；导航层已有白名单在拦站外跳转）。
-  Future<void> _injectAdblock(WebViewController wc) async {
-    final svc = AdblockService.instance;
-    if (!svc.isReady) return;
-    try {
-      await wc.runJavaScript(svc.injectionJs);
-    } catch (_) {}
   }
 
   /// 重试直链：清掉解析缓存（直链地址可能已过期），关掉官方播放器，重新解析播。
@@ -413,8 +357,6 @@ class _PlayerScreenState extends State<PlayerScreen> {
               title: Text(_current.title, maxLines: 2, overflow: TextOverflow.ellipsis,
                   style: const TextStyle(color: Colors.white, fontSize: 15)),
               actions: [
-                // 下载入口（第 27 条）：详情页点一下就开始下；播本地文件时没有。
-                if (widget.localFilePath == null) DownloadButton(item: _current),
                 IconButton(
                   icon: Icon(_liked ? Icons.favorite : Icons.favorite_border, color: _liked ? Colors.red : Colors.white),
                   onPressed: () async {
@@ -620,16 +562,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     // 画质：多档才显示，当前档标 ✓。切档不断流重进（记位置、倍速）。
                     if (_variants.length > 1) _qualityButton(),
                     // 画面出不来时一键切官方播放器（灰框自救，不用退出重进）。
-                    // 播本地文件时没有官方播放器可切。
-                    if (widget.localFilePath == null)
-                      TextButton(
-                        onPressed: () => _embedOfficial('已切换到源站官方播放器'),
-                        style: TextButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(horizontal: 6),
-                            minimumSize: Size.zero,
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                        child: const Text('官方播', style: TextStyle(color: Colors.white, fontSize: 12)),
-                      ),
+                    TextButton(
+                      onPressed: () => _embedOfficial('已切换到源站官方播放器'),
+                      style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 6),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                      child: const Text('官方播', style: TextStyle(color: Colors.white, fontSize: 12)),
+                    ),
                     _speedButton(),
                     IconButton(
                       icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white),

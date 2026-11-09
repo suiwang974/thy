@@ -1,9 +1,5 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 
-import 'services/adblock_service.dart';
-import 'services/downloader.dart';
 import 'services/store.dart';
 import 'ui/author_screen.dart';
 import 'ui/browser_sources_screen.dart';
@@ -52,9 +48,6 @@ void main() async {
     );
   };
   final store = await Store.load();
-  // 广告拦截 + 下载管理后台初始化（不阻塞启动；规则 7 天没更新就后台拉一次）。
-  unawaited(AdblockService.instance.init().catchError((_) {}));
-  unawaited(DownloadManager.instance.init().catchError((_) {}));
   runApp(TaohuayuanApp(store: store));
 }
 

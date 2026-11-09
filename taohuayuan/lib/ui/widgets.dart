@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../models/video_item.dart';
-import 'download_button.dart';
 
 /// 封面图：网络图；没有封面就显示文字卡（标题 + 来源 + 时长），绝不丢掉这条。
 class PosterThumb extends StatelessWidget {
@@ -91,16 +90,6 @@ class VideoCard extends StatelessWidget {
                       child: Text(item.durationText, style: const TextStyle(color: Colors.white, fontSize: 11)),
                     ),
                   ),
-                // 下载入口（第 27 条：每个视频都要有，点一下就开始下；
-                // 点它不进播放页——IconButton 的手势赢了外层卡片的 onTap）。
-                Positioned(
-                  left: 6, bottom: 6,
-                  child: Container(
-                    decoration: const BoxDecoration(color: Colors.black87, shape: BoxShape.circle),
-                    padding: const EdgeInsets.all(2),
-                    child: DownloadButton(item: item, size: 18),
-                  ),
-                ),
               ],
             ),
           ),
