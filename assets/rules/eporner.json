@@ -1,0 +1,20 @@
+{
+  "id": "eporner",
+  "displayName": "Eporner",
+  "hosts": [
+    "eporner.com",
+    "www.eporner.com"
+  ],
+  "searchMode": "http",
+  "entryUrl": "https://www.eporner.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "eporner-v1"
+}

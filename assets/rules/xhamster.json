@@ -1,0 +1,20 @@
+{
+  "id": "xhamster",
+  "displayName": "XHamster",
+  "hosts": [
+    "xhamster.com",
+    "www.xhamster.com"
+  ],
+  "searchMode": "both",
+  "entryUrl": "https://xhamster.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "xhamster-v1"
+}

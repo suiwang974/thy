@@ -1,0 +1,20 @@
+{
+  "id": "niacg",
+  "displayName": "Niacg",
+  "hosts": [
+    "niacg.com",
+    "www.niacg.com"
+  ],
+  "searchMode": "sniffOnly",
+  "entryUrl": "https://www.niacg.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "niacg-v1"
+}

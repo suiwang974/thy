@@ -1,0 +1,20 @@
+{
+  "id": "lianzu11",
+  "displayName": "Lianzu11",
+  "hosts": [
+    "lianzu11.com",
+    "www.lianzu11.com"
+  ],
+  "searchMode": "sniffOnly",
+  "entryUrl": "https://lianzu11.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "lianzu11-v1"
+}

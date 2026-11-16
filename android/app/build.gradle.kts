@@ -1,24 +1,43 @@
-import java.util.Properties
 import java.io.FileInputStream
+import java.util.Properties
 
 plugins {
     id("com.android.application")
-    id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// 发布签名（第 62 条）：固定 release keystore，keystore 本身绝不进 Git，
+// 由 CI 从 GitHub Secrets 解码写出。本地没有 key.properties 时回落 debug，
+// 保证 `flutter run --release` 还能跑。
+// key.properties（android/key.properties）内容：
+//   storeFile=release.keystore
+//   storePassword=...
+//   keyAlias=taohuayuan
+//   keyPassword=...
+val keystoreProperties = Properties()
+val keystorePropertiesFile = rootProject.file("key.properties")
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace = "dev.akash.skystream"
-    compileSdkVersion(rootProject.extra["projectCompileSdk"] as String)
-    // See the projectNdk comment in the root build.gradle.kts for why this is
-    // pinned instead of following flutter.ndkVersion.
-    ndkVersion = rootProject.extra["projectNdk"] as String
+    compileSdk = 37
+    ndkVersion = flutter.ndkVersion
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-        isCoreLibraryDesugaringEnabled = true
+    }
+
+    signingConfigs {
+        create("release") {
+            keyAlias = keystoreProperties["keyAlias"] as String?
+            keyPassword = keystoreProperties["keyPassword"] as String?
+            storeFile = (keystoreProperties["storeFile"] as String?)?.let { file(it) }
+            storePassword = keystoreProperties["storePassword"] as String?
+        }
     }
 
     defaultConfig {
@@ -27,109 +46,41 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
-        targetSdk = rootProject.extra["projectTargetSdk"] as Int
+        targetSdk = 37
+        // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
+        // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
+        // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`
+        // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
-    val keystoreProperties = Properties()
-    val keystorePropertiesFile = rootProject.file("key.properties")
-    if (keystorePropertiesFile.exists()) {
-        keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-    }
-
-    signingConfigs {
-        create("release") {
-            keyAlias = keystoreProperties.getProperty("keyAlias")
-            keyPassword = keystoreProperties.getProperty("keyPassword")
-            storeFile = if (keystoreProperties.getProperty("storeFile") != null) file(keystoreProperties.getProperty("storeFile")) else null
-            storePassword = keystoreProperties.getProperty("storePassword")
-        }
-    }
-
     buildTypes {
         release {
-            // Require a real signing keystore for release. Falling back to
-            // the debug key would silently ship an unsigned-for-Play APK
-            // (audit H13). For CI/local debug-without-keystore use
-            // `flutter run --debug` or `flutter build apk --debug`.
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            // 有 key.properties 就用固定发布签名，没有就回落 debug（本地开发）。
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
             } else {
-                // Build still runs (so `flutter build apk --release` works
-                // during local exploration without a key.properties) but the
-                // resulting APK is debug-signed — never publish it.
-                println("WARN: Release build is using DEBUG signing — " +
-                        "key.properties not found. This APK MUST NOT be " +
-                        "distributed publicly.")
-                signingConfig = signingConfigs.getByName("debug")
+                signingConfigs.getByName("debug")
             }
-
-            // Code & resource shrinking (audit B8). Skip the bundled
-            // proguard-android-optimize.txt rules and rely on the
-            // Flutter-provided rules plus our own proguard-rules.pro for
-            // plugin-specific keep rules.
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro",
-            )
-        }
-    }
-
-    testOptions {
-        unitTests {
-            // Robolectric's Android 16 sets up file descriptors through the
-            // JDK's internal access, which JDK 17+ closes to it by default.
-            // The app's own resources are left out: the tests here need none,
-            // and including them would package Flutter's assets into a task
-            // that does not wait for them.
-            all { it.jvmArgs("--add-opens=java.base/jdk.internal.access=ALL-UNNAMED") }
-        }
-    }
-
-    packaging {
-        jniLibs {
-            useLegacyPackaging = true
-        }
-        // Duplicate metadata from CloudStream's library dependencies.
-        resources {
-            excludes += setOf(
-                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
-                "META-INF/DEPENDENCIES",
-                "META-INF/LICENSE*",
-                "META-INF/NOTICE*",
-            )
         }
     }
 }
 
+// 捕获层依赖（重构实现 2）：androidx.webkit 提供 document-start 全帧脚本注册
+// （WebViewCompat.addDocumentStartJavaScript，1.17.1 已对实物 AAR 核过 API）；
+// kotlinx-coroutines 提供 Sniffer 接口的 Flow/StateFlow。
+dependencies {
+    implementation("androidx.webkit:webkit:1.17.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
 
 flutter {
     source = "../.."
-}
-
-configurations.configureEach {
-    // background_downloader declares `androidx.test:monitor` as a plain
-    // `implementation` (its android/build.gradle:49), so a test-instrumentation
-    // library ends up in the release runtime classpath and ships in the APK.
-    // Nothing in its main sources references it - no androidx.test import, no
-    // InstrumentationRegistry - so it is dead weight, and it is exactly the
-    // reflection-heavy kind of artifact that AGP 9's strictFullModeForKeepRules
-    // will complain about. If a build ever fails resolving an androidx.test
-    // symbol, the package started using it and this exclude must go.
-    //
-    // Only from the app's own classpaths, which are what ship. The unit
-    // tests' classpaths extend them, so excluding everywhere took it from the
-    // tests too, and Robolectric's runner cannot start without it.
-    if (name.contains("Test") || !name.endsWith("Classpath")) return@configureEach
-    exclude(group = "androidx.test", module = "monitor")
-}
-
-dependencies {
-    implementation("androidx.tvprovider:tvprovider:1.0.0")
-    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
-    testImplementation("junit:junit:4.13.2")
-    testImplementation("org.robolectric:robolectric:4.17")
 }

@@ -1,0 +1,20 @@
+{
+  "id": "rule34videos",
+  "displayName": "Rule34Video",
+  "hosts": [
+    "rule34-videos.com",
+    "www.rule34-videos.com"
+  ],
+  "searchMode": "both",
+  "entryUrl": "https://rule34-videos.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "rule34videos-v1"
+}

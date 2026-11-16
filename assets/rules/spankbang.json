@@ -1,0 +1,20 @@
+{
+  "id": "spankbang",
+  "displayName": "SpankBang",
+  "hosts": [
+    "spankbang.com",
+    "www.spankbang.com"
+  ],
+  "searchMode": "http",
+  "entryUrl": "https://spankbang.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "spankbang-v1"
+}
