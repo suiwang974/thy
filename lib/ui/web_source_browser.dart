@@ -14,6 +14,7 @@ import '../services/sniffer.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import '../services/translator.dart';
+import '../services/page_translator.dart';
 import '../sniffer/native_sniffer_bridge.dart';
 import '../source/source_registry.dart';
 import '../source/source_session_policy.dart';
@@ -62,9 +63,10 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   String _mirrorNote = '';
   // 第 35 条：翻译开关（默认开，跟着 Store 走；AppBar 按钮可随时切回原文）。
   bool _translateOn = true;
-  // 翻译前原文地址（切回原文用）；已翻过的地址（防 onPageFinished 重复翻）。
-  String _originalUrl = '';
-  String _lastTranslatedFor = '';
+  // 页内翻译尝试记录：同一地址翻成功或失败后不再自动重翻，手动点翻译按钮才重试。
+  final _translationTracker = TranslationAttemptTracker();
+  // 正在翻页中（防 onPageFinished 重复触发并发翻译）。
+  bool _translating = false;
   // 退出按钮按下的标记：PopScope 平时拦住所有返回（让系统返回键走 WebView 历史），
   // 只有退出按钮按下时才放行、直接退出。
   bool _forceExit = false;
@@ -133,11 +135,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           // 视频可能是懒加载的：4 秒后再嗅一次。
           await Future.delayed(const Duration(seconds: 4));
           if (mounted) await _sniffVideo();
-          // 第 35 条：默认翻译成中文（翻译页加载失败自动回落原文 + toast）。
+          // 第 35 条：默认翻译成中文（页内翻译；失败不重翻、不跳转）。
           if (mounted) await _maybeTranslate();
-          // 第 39 条：翻译页加载完看内容判断（Google 的错误页是 HTTP 200，
-          // 不触发 onWebResourceError，不看内容就回落不了）。
-          if (mounted) await _checkTranslation();
         },
         // 广告拦截第一层（第 26 条）：顶层跳转到广告域名直接不让跳
         // （弹窗/跳转广告就是这么来的）。第一方（当前站自己的域名）
@@ -157,13 +156,6 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           return NavigationDecision.navigate;
         },
         onWebResourceError: (error) {
-          // 翻译页加载失败：按回落链走（Google -> Bing -> 原文，第 39 条），不假装翻译可用。
-          if (error.isForMainFrame == true &&
-              (Translator.isTranslatedUrl(error.url ?? '') ||
-                  Translator.isBingTranslatedUrl(error.url ?? ''))) {
-            _fallbackFromTranslated(error.url!);
-            return;
-          }
           // 实现 5：搜索页打不开，按首选引擎顺序换下一个；全部打不开就降级——
           // 打开首条历史地址 + 显示“搜索不可用”横幅（带重试）。
           if (error.isForMainFrame == true &&
@@ -571,107 +563,102 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     return h == -1 ? l : l.substring(0, h);
   }
 
-  /// 第 35 条：翻译开关开着、当前页还没翻过，就加载 translate.goog 代理页。
-  /// 翻译页加载失败（主框报错）时自动回落原文 + toast，不假装可用。
+  /// 第 35 条：页内翻译（2026-11-17 改）：开关开着、当前页还没翻过，
+  /// 就在当前页里把可见文字翻成中文，不经过整页代理。
+  /// 之前走 translate.goog 代理：XHamster 直接回 "Can't translate this page"，
+  /// Bing 代理也失败，回原文后 onPageFinished 又自动重翻，死循环。
+  /// 现在同一地址翻成功或失败后都不再自动重翻，手动点翻译按钮才重试。
   Future<void> _maybeTranslate() async {
     if (!_translateOn) return;
-    if (!Translator.isTranslatableUrl(_currentUrl)) return;
-    if (_currentUrl == _lastTranslatedFor) return;
-    _lastTranslatedFor = _currentUrl;
-    _originalUrl = _currentUrl;
-    await _controller.loadRequest(Uri.parse(Translator.toTranslatedUrl(_currentUrl)));
-  }
+    if (_translating) return;
+    final url = _currentUrl;
+    if (url.isEmpty || !Translator.isTranslatableUrl(url)) return;
+    if (!_translationTracker.shouldAttempt(url)) return;
+    void snack(String m) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+    }
 
-  /// 第 39 条：翻译页打不开/翻不了时的回落链：Google -> Bing -> 原文。
-  /// onWebResourceError（主框报错）和 _checkTranslation（内容是错误页）都走这里。
-  void _fallbackFromTranslated(String failedUrl) {
-    var back = _originalUrl.isNotEmpty
-        ? _originalUrl
-        : Translator.originalUrlFromTranslated(failedUrl);
-    // Google 翻不了就试 Bing（国内一般能直接打开）；Bing 也不行就回原文。
-    if (Translator.isTranslatedUrl(failedUrl)) {
-      final bing = Translator.toBingTranslatedUrl(back);
-      if (bing != back) {
-        _lastTranslatedFor = back;
-        _controller.loadRequest(Uri.parse(bing));
+    _translating = true;
+    try {
+      final raw =
+          await _controller.runJavaScriptReturningResult(PageTranslator.collectJs);
+      final nodes = _parseCollectedNodes(raw.toString());
+      if (nodes.isEmpty) {
+        _translationTracker.markDone(url);
         return;
       }
-    }
-    // 原文地址拿不到（理论上不会发生：_maybeTranslate 一定先记了原文），
-    // 就不乱跳，只提示。
-    if (back.isEmpty ||
-        Translator.isTranslatedUrl(back) ||
-        Translator.isBingTranslatedUrl(back)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('翻译服务不通，已切回原文')),
-        );
+      final texts = <String>[];
+      final seen = <String>{};
+      for (final n in nodes) {
+        if (seen.add(n.$2)) texts.add(n.$2);
       }
-      return;
+      final translated = await PageTranslator.translateTexts(texts);
+      final byText = <String, String>{};
+      for (var i = 0; i < texts.length && i < translated.length; i++) {
+        final t = translated[i];
+        if (t.isNotEmpty) byText[texts[i]] = t;
+      }
+      final writes = <String, String>{};
+      for (final n in nodes) {
+        final t = byText[n.$2];
+        if (t != null && t.isNotEmpty) writes[n.$1] = t;
+      }
+      if (writes.isEmpty) {
+        _translationTracker.markDone(url);
+        return;
+      }
+      await _controller.runJavaScript(PageTranslator.applyJs(writes));
+      _translationTracker.markDone(url);
+    } on PageTranslationException catch (e) {
+      _translationTracker.markFailed(url);
+      snack('翻译失败：${e.message}，已保留原文');
+    } catch (_) {
+      _translationTracker.markFailed(url);
+      snack('翻译失败，已保留原文');
+    } finally {
+      _translating = false;
     }
-    _lastTranslatedFor = '';
-    _originalUrl = '';
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('翻译服务不通（Google/Bing 都打不开），已切回原文')),
-      );
-    }
-    _controller.loadRequest(Uri.parse(back));
   }
 
-  /// 第 39 条：翻译页加载完看内容判断——Google 的 "Can't translate this page"
-  /// 是 HTTP 200 正常页，不触发 onWebResourceError，不看内容就永远回落不了，
-  /// 用户直接看到英文错误页。读不到内容就不判断，别把好页当坏页切走。
-  Future<void> _checkTranslation() async {
-    if (!Translator.isTranslatedUrl(_currentUrl) &&
-        !Translator.isBingTranslatedUrl(_currentUrl)) {
-      return;
-    }
-    String title = '';
-    String body = '';
+  /// 解析 collectJs 的返回：JSON 字符串 -> (id, text) 记录列表。
+  /// runJavaScriptReturningResult 的返回可能是 JSON 编码过的字符串，
+  /// 先解一次，解出来还是字符串就再解一次；任何一步失败返回空列表。
+  List<(String, String)> _parseCollectedNodes(String raw) {
     try {
-      final t = await _controller.runJavaScriptReturningResult('document.title');
-      try {
-        final d = jsonDecode(t.toString());
-        if (d is String) title = d;
-      } catch (_) {
-        title = t.toString();
+      Object? data = jsonDecode(raw);
+      if (data is String) data = jsonDecode(data);
+      if (data is! List) return const [];
+      final out = <(String, String)>[];
+      for (final e in data) {
+        if (e is! Map) continue;
+        final id = e['id'];
+        final text = e['text'];
+        if (id is String &&
+            text is String &&
+            id.isNotEmpty &&
+            text.isNotEmpty) {
+          out.add((id, text));
+        }
       }
-      final b = await _controller.runJavaScriptReturningResult(
-        "document.body ? document.body.innerText.slice(0, 500) : ''",
-      );
-      try {
-        final d = jsonDecode(b.toString());
-        if (d is String) body = d;
-      } catch (_) {
-        body = b.toString();
-      }
+      return out;
     } catch (_) {
-      return;
+      return const [];
     }
-    if (!Translator.isTranslationFailurePage(title, body)) return;
-    _fallbackFromTranslated(_currentUrl);
   }
 
   /// AppBar 翻译按钮：开/关翻译（选择持久保存到 Store）。
-  /// 关：回到翻译前的原文地址（翻不回去就反向映射当前地址）。
+  /// 开：清掉当前地址的尝试记录，马上翻一次；关：刷新回原文（页内翻译不改地址）。
   Future<void> _toggleTranslate() async {
     final on = !_translateOn;
     setState(() => _translateOn = on);
     await widget.store.setTranslateEnabled(on);
     if (!mounted) return;
+    _translationTracker.clear(_currentUrl);
     if (on) {
-      _lastTranslatedFor = '';
       await _maybeTranslate();
     } else {
-      final back = _originalUrl.isNotEmpty
-          ? _originalUrl
-          : Translator.originalUrlFromTranslated(_currentUrl);
-      _lastTranslatedFor = '';
-      _originalUrl = '';
-      if (back != _currentUrl) {
-        await _controller.loadRequest(Uri.parse(back));
-      }
+      await _controller.reload();
     }
   }
 
