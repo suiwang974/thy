@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../transfer/hls_playlist.dart';
 import 'downloader.dart';
 
 /// 网页嗅探（第 34 条，2026-11-09 用户纠正：不是“太弱”，是根本就没有；
@@ -65,6 +66,9 @@ class SniffedMedia {
   final int segmentCount; // m3u8 分片数；ts 分组时是该组分片数
   final bool playableOnly; // 只有 blob：浏览器内播放，拿不到地址
   final String? note; // 下不了的原因（写明，不只说“下不了”）
+  final String? resolution; // 如 "1920x1080"，无则 null
+  final int? bandwidth; // bps，无则 null
+  final int? estimatedSizeBytes; // 预估大小字节数，无则 null
 
   const SniffedMedia({
     required this.url,
@@ -74,16 +78,77 @@ class SniffedMedia {
     this.segmentCount = 0,
     this.playableOnly = false,
     this.note,
+    this.resolution,
+    this.bandwidth,
+    this.estimatedSizeBytes,
   });
+
+  SniffedMedia copyWith({
+    String? url,
+    String? kind,
+    int? sizeBytes,
+    int? durationSec,
+    int? segmentCount,
+    bool? playableOnly,
+    String? note,
+    String? resolution,
+    int? bandwidth,
+    int? estimatedSizeBytes,
+  }) {
+    return SniffedMedia(
+      url: url ?? this.url,
+      kind: kind ?? this.kind,
+      sizeBytes: sizeBytes ?? this.sizeBytes,
+      durationSec: durationSec ?? this.durationSec,
+      segmentCount: segmentCount ?? this.segmentCount,
+      playableOnly: playableOnly ?? this.playableOnly,
+      note: note ?? this.note,
+      resolution: resolution ?? this.resolution,
+      bandwidth: bandwidth ?? this.bandwidth,
+      estimatedSizeBytes: estimatedSizeBytes ?? this.estimatedSizeBytes,
+    );
+  }
 
   /// 能不能下：blob 下不了；m3u8 播放列表拉不到也下不了（不知道分片地址）。
   bool get downloadable => !playableOnly && note == null;
+
+  /// 分辨率像素数（宽×高），没有分辨率时为 0，供质量比较用。
+  int get qualityPixels {
+    final r = resolution;
+    if (r == null || r.isEmpty) return 0;
+    final parts = r.toLowerCase().split('x');
+    if (parts.length != 2) return 0;
+    final w = int.tryParse(parts[0].trim());
+    final h = int.tryParse(parts[1].trim());
+    if (w == null || h == null || w <= 0 || h <= 0) return 0;
+    return w * h;
+  }
+
+  /// 如 "1920x1080" -> "1080p"；无分辨率返回 ''。
+  String get resolutionText {
+    final r = resolution;
+    if (r == null || r.isEmpty) return '';
+    final parts = r.toLowerCase().split('x');
+    if (parts.length != 2) return '';
+    final h = int.tryParse(parts[1].trim());
+    if (h == null || h <= 0) return '';
+    return '${h}p';
+  }
 
   String get sizeText {
     final n = sizeBytes;
     if (n == null || n <= 0) return '';
     if (n >= 1024 * 1024) return '${(n / (1024 * 1024)).toStringAsFixed(1)} MB';
     return '${(n / 1024).toStringAsFixed(0)} KB';
+  }
+
+  String get estimatedSizeText {
+    final n = estimatedSizeBytes;
+    if (n == null || n <= 0) return '';
+    if (n >= 1024 * 1024) {
+      return '约 ${(n / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '约 ${(n / 1024).toStringAsFixed(0)} KB';
   }
 
   String get durationText {
@@ -94,15 +159,79 @@ class SniffedMedia {
     return '$m:${r.toString().padLeft(2, '0')}';
   }
 
-  /// 清单里的一行说明：大小 · 时长 · 分片数（有的才写）。
+  /// 清单里的一行说明：分辨率 · 大小/预估大小 · 时长 · 分片数（有的才写）。
+  /// m3u8 啥都没有时显示“时长未知 · 分辨率未知”。
   String get detailLine {
+    final res = resolutionText;
+    final sz = sizeText;
+    final est = estimatedSizeText;
+    final dur = durationText;
+    final d = durationSec;
+    final r = resolution;
+    final noDuration = d == null || d <= 0;
+    final noResolution = r == null || r.isEmpty;
+    if (kind == 'm3u8' &&
+        noDuration &&
+        noResolution &&
+        sz.isEmpty &&
+        est.isEmpty) {
+      final parts = <String>['时长未知', '分辨率未知'];
+      if (segmentCount > 0) parts.add('$segmentCount 个分片');
+      if (note != null) parts.add(note!);
+      return parts.join(' · ');
+    }
     final parts = <String>[];
-    if (sizeText.isNotEmpty) parts.add(sizeText);
-    if (durationText.isNotEmpty) parts.add(durationText);
+    if (res.isNotEmpty) parts.add(res);
+    if (sz.isNotEmpty) {
+      parts.add(sz);
+    } else if (est.isNotEmpty) {
+      parts.add(est);
+    }
+    if (dur.isNotEmpty) parts.add(dur);
     if (segmentCount > 0) parts.add('$segmentCount 个分片');
     if (kind == 'ts') parts.add('分段视频');
     if (note != null) parts.add(note!);
     return parts.join(' · ');
+  }
+
+  static int _kindRank(String kind) {
+    switch (kind) {
+      case 'mp4':
+      case 'webm':
+        return 0;
+      case 'm3u8':
+        return 1;
+      case 'ts':
+        return 2;
+      case 'blob':
+        return 3;
+      default:
+        return 4;
+    }
+  }
+
+  /// 质量比较（最好在前）：分辨率像素降序 → 码率降序 → 大小降序 → 类型优先级。
+  /// 返回负数表示 a 排在 b 前面。
+  static int compareQuality(SniffedMedia a, SniffedMedia b) {
+    final byPixels = b.qualityPixels.compareTo(a.qualityPixels);
+    if (byPixels != 0) return byPixels;
+    final byBandwidth = (b.bandwidth ?? 0).compareTo(a.bandwidth ?? 0);
+    if (byBandwidth != 0) return byBandwidth;
+    final bySize = (b.sizeBytes ?? 0).compareTo(a.sizeBytes ?? 0);
+    if (bySize != 0) return bySize;
+    return _kindRank(a.kind).compareTo(_kindRank(b.kind));
+  }
+
+  /// 可下条目里质量最好的一条；没有可下的返回 null。
+  static SniffedMedia? bestOf(Iterable<SniffedMedia> items) {
+    SniffedMedia? best;
+    for (final item in items) {
+      if (!item.downloadable) continue;
+      if (best == null || compareQuality(item, best) < 0) {
+        best = item;
+      }
+    }
+    return best;
   }
 }
 
@@ -208,8 +337,12 @@ class SniffResult {
   final String author;
   /// 第 53 条：嗅不到时的诊断（查了什么、为什么没嗅到）。
   final SniffDiagnosis diagnosis;
+  /// 页面封面地址（video poster / og:image / twitter:image，拿不到就是 ''）。
+  final String pagePoster;
   const SniffResult(this.items, this.pageTitle,
-      [this.author = '', this.diagnosis = const SniffDiagnosis()]);
+      [this.author = '',
+      this.diagnosis = const SniffDiagnosis(),
+      this.pagePoster = '']);
 }
 
 class Sniffer {
@@ -249,6 +382,7 @@ class Sniffer {
   }) async {
     var title = '';
     var pageAuthor = '';
+    var pagePoster = '';
     var candidates = <String>[];
     var domDurations = <String, double>{};
     var diagnosis = const SniffDiagnosis();
@@ -296,6 +430,17 @@ class Sniffer {
       }
       title = (decoded['title'] ?? '').toString();
       pageAuthor = (decoded['author'] ?? '').toString().trim();
+      pagePoster = (decoded['poster'] ?? '').toString().trim();
+      if (pagePoster.startsWith('//')) {
+        pagePoster = 'https:$pagePoster';
+      }
+      if (pagePoster.isNotEmpty && !pagePoster.startsWith('http')) {
+        try {
+          pagePoster = Uri.parse(pageUrl).resolve(pagePoster).toString();
+        } catch (_) {
+          pagePoster = '';
+        }
+      }
       final videos = (decoded['videos'] as List?) ?? [];
       var videoCount = 0;
       var playingCount = 0;
@@ -355,7 +500,7 @@ class Sniffer {
       domDurations: domDurations,
       pageUrl: pageUrl,
     );
-    return SniffResult(items, title, pageAuthor, diagnosis);
+    return SniffResult(items, title, pageAuthor, diagnosis, pagePoster);
   }
 
   static String _shortError(Object e) {
@@ -402,9 +547,9 @@ class Sniffer {
 
   /// 第二段 JS：收集（主文档 + 同源 iframe；跨域 iframe 只记 src）。
   /// 返回 {videos:[{src,duration,paused,currentTime}],resources,links,html,
-  /// title,author,iframes,crossOrigin,iframeSrcs,error}。
+  /// title,author,poster,iframes,crossOrigin,iframeSrcs,error}。
   static const _collectJs = "(function(){"
-      "var out={videos:[],resources:[],links:[],html:'',title:document.title,author:'',"
+      "var out={videos:[],resources:[],links:[],html:'',title:document.title,author:'',poster:'',"
       "iframes:0,crossOrigin:0,iframeSrcs:[],error:''};"
       "try{"
       "function collectDoc(doc){"
@@ -431,6 +576,13 @@ class Sniffer {
       "catch(e){out.crossOrigin++;if(f.src)out.iframeSrcs.push(f.src);}});"
       "var h=document.documentElement?document.documentElement.outerHTML:'';"
       "out.html=h.slice(0,400000);"
+      "try{var _pv=document.querySelector('video[poster]');"
+      "if(_pv&&_pv.getAttribute('poster')){out.poster=_pv.getAttribute('poster');}"
+      "if(!out.poster){var _og=document.querySelector('meta[property=\"og:image\"]');"
+      "if(_og&&_og.getAttribute('content')){out.poster=_og.getAttribute('content');}}"
+      "if(!out.poster){var _tw=document.querySelector('meta[name=\"twitter:image\"]');"
+      "if(_tw&&_tw.getAttribute('content')){out.poster=_tw.getAttribute('content');}}"
+      "if(out.poster){out.poster=out.poster.trim();}}catch(e){}"
       "try{var author='';"
       "var lds=document.querySelectorAll('script[type=\"application/ld+json\"]');"
       "for(var i=0;i<lds.length&&!author;i++){try{var j=JSON.parse(lds[i].textContent);"
@@ -537,20 +689,36 @@ class Sniffer {
       }
     }
     final out = <SniffedMedia>[];
-    // 3) m3u8：拉播放列表算总时长/分片数（主播放列表先挑最高变体）。
+    // 3) m3u8：拉播放列表算总时长/分片数（主播放列表先挑最高变体，
+    // 记下选中变体的分辨率/码率，再按码率×时长估大小）。
     for (final u in m3u8s) {
       try {
         var body = await fetch(u);
+        String? resolution;
+        int? bandwidth;
         if (body.contains('#EXT-X-STREAM-INF')) {
-          final variant = DownloadManager.pickHlsVariant(body, u);
-          if (variant != null) body = await fetch(variant);
+          final variants = HlsPlaylist.parseMaster(body, u);
+          final variant = HlsPlaylist.pickVariant(variants);
+          if (variant != null) {
+            resolution = variant.resolution.isEmpty ? null : variant.resolution;
+            bandwidth = variant.bandwidth <= 0 ? null : variant.bandwidth;
+            body = await fetch(variant.url);
+          }
         }
         final (dur, count) = parseM3u8Durations(body);
+        final durationSec = dur > 0 ? dur : _domDuration(domDurations, u);
+        final estimatedSizeBytes =
+            (bandwidth != null && durationSec != null && durationSec > 0)
+                ? bandwidth ~/ 8 * durationSec
+                : null;
         out.add(SniffedMedia(
           url: u,
           kind: 'm3u8',
-          durationSec: dur > 0 ? dur : _domDuration(domDurations, u),
+          durationSec: durationSec,
           segmentCount: count,
+          resolution: resolution,
+          bandwidth: bandwidth,
+          estimatedSizeBytes: estimatedSizeBytes,
         ));
       } catch (_) {
         out.add(SniffedMedia(

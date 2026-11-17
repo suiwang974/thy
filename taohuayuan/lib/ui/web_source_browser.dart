@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../data/sources.dart';
@@ -11,6 +12,7 @@ import '../search/search_history.dart';
 import '../services/adblock_service.dart';
 import '../services/downloader.dart';
 import '../services/sniffer.dart';
+import '../transfer/hls_playlist.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import '../services/translator.dart';
@@ -56,6 +58,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   late final WebViewController _controller;
   String _currentUrl = '';
   String _pageTitle = '';
+  String _pagePoster = '';
   // 第 34 条：嗅到的媒体清单（DOM + performance + HTML 三路），
   // 不再是只认 mp4 的单个地址。
   List<SniffedMedia> _sniffed = [];
@@ -103,6 +106,11 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   final _bridge = NativeSnifferBridge();
   // 原生候选转成的展示条目（与旧嗅探的 _sniffed 合并展示，原生在前）。
   List<SniffedMedia> _nativeSniffed = [];
+  // 已拉过播放列表富化的原生 m3u8 地址（按去 # 后的地址记，只富化一次）。
+  final _enrichedNativeUrls = <String>{};
+  // 拉播放列表用的 UA（与 Sniffer._ua 一致）。
+  static const _ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   // 上次发给原生会话的地址（去 # 后比较，防同一页反复 navigate）。
   String _nativeUrl = '';
 
@@ -185,6 +193,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           if (u != null && u.isNotEmpty) {
             _currentUrl = u;
             _sniffed = [];
+            _pagePoster = '';
             _accumulated.clear();
             _lastDiagnosis = const SniffDiagnosis();
             // 地址栏跟随当前地址（正在输入时不抢）。
@@ -229,6 +238,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
               if (stripped != _nativeUrl) {
                 _nativeUrl = stripped;
                 _nativeSniffed = [];
+                _enrichedNativeUrls.clear();
                 unawaited(_bridge.navigateTo(u, binding));
               }
             }
@@ -300,6 +310,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       await _bridge.pollCandidates();
       if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
     }
+    unawaited(_enrichNativeHls());
   }
 
   /// 撞上验证页/加载失败时切另一个镜像（只切没试过的，两个都试过了就停）。
@@ -529,6 +540,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       if (!mounted) return;
       setState(() {
         _pageTitle = r.pageTitle;
+        _pagePoster = r.pagePoster;
         _sniffed = r.items;
         _lastDiagnosis = r.diagnosis;
       });
@@ -543,13 +555,137 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       await _bridge.pollCandidates();
       if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
     }
+    unawaited(_enrichNativeHls());
+  }
+
+  /// 原生 m3u8 缺元数据时富化：先抄同地址 Dart 条目的元数据（不联网），
+  /// 还没有就拉一次播放列表解析后填上。按地址缓存，只富化一次；
+  /// 失败就留空（显示“未知”），不抛错、不挡展示。
+  Future<void> _enrichNativeHls() async {
+    try {
+      if (_nativeSniffed.isEmpty) return;
+      final dartByUrl = <String, SniffedMedia>{};
+      for (final d in _sniffed) {
+        dartByUrl[_stripFragment(d.url)] = d;
+      }
+      final next = <SniffedMedia>[];
+      var changed = false;
+      for (final m in _nativeSniffed) {
+        if (m.kind != 'm3u8' || m.resolution != null || m.durationSec != null) {
+          next.add(m);
+          continue;
+        }
+        final key = _stripFragment(m.url);
+        final dart = dartByUrl[key];
+        if (dart != null &&
+            (dart.resolution != null || dart.durationSec != null)) {
+          next.add(m.copyWith(
+            resolution: dart.resolution ?? m.resolution,
+            bandwidth: dart.bandwidth ?? m.bandwidth,
+            estimatedSizeBytes: dart.estimatedSizeBytes ?? m.estimatedSizeBytes,
+            durationSec: dart.durationSec ?? m.durationSec,
+            segmentCount:
+                dart.segmentCount > 0 ? dart.segmentCount : m.segmentCount,
+          ));
+          changed = true;
+          continue;
+        }
+        if (_enrichedNativeUrls.contains(key)) {
+          next.add(m);
+          continue;
+        }
+        _enrichedNativeUrls.add(key);
+        final fetched = await _fetchHlsMeta(m);
+        if (fetched != null) {
+          next.add(fetched);
+          changed = true;
+        } else {
+          next.add(m);
+        }
+      }
+      if (changed && mounted) {
+        setState(() => _nativeSniffed = next);
+      }
+    } catch (_) {
+      // 富化失败静默忽略，不影响展示。
+    }
+  }
+
+  /// 拉一次播放列表，解析出分辨率/码率/时长/预估大小；拿不到返回 null。
+  Future<SniffedMedia?> _fetchHlsMeta(SniffedMedia m) async {
+    try {
+      final headers = {'User-Agent': _ua, 'Referer': _currentUrl};
+      final res = await http
+          .get(Uri.parse(m.url), headers: headers)
+          .timeout(const Duration(seconds: 8));
+      if (res.statusCode != 200) return null;
+      var body = utf8.decode(res.bodyBytes);
+      String? resolution;
+      int? bandwidth;
+      if (body.contains('#EXT-X-STREAM-INF')) {
+        final variants = HlsPlaylist.parseMaster(body, m.url);
+        final picked = HlsPlaylist.pickVariant(variants);
+        if (picked == null) return null;
+        resolution = picked.resolution.isEmpty ? null : picked.resolution;
+        bandwidth = picked.bandwidth <= 0 ? null : picked.bandwidth;
+        final vres = await http
+            .get(Uri.parse(picked.url), headers: headers)
+            .timeout(const Duration(seconds: 8));
+        if (vres.statusCode != 200) return null;
+        body = utf8.decode(vres.bodyBytes);
+      }
+      final (dur, count) = Sniffer.parseM3u8Durations(body);
+      final durationSec = dur > 0 ? dur : m.durationSec;
+      final estimatedSizeBytes =
+          (bandwidth != null && durationSec != null && durationSec > 0)
+              ? bandwidth ~/ 8 * durationSec
+              : null;
+      return m.copyWith(
+        resolution: resolution ?? m.resolution,
+        bandwidth: bandwidth ?? m.bandwidth,
+        estimatedSizeBytes: estimatedSizeBytes ?? m.estimatedSizeBytes,
+        durationSec: durationSec,
+        segmentCount: count > 0 ? count : m.segmentCount,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 合并展示：原生候选在前（有真实请求头、六路全开），旧嗅探去重后在后。
   /// 按地址去重（小写、去 # 后缀），同一地址只留原生那条。
+  /// 原生 m3u8 缺元数据时，用同地址 Dart 条目的元数据补全（copyWith）。
   List<SniffedMedia> _mergedSniffed() {
-    final out = <SniffedMedia>[..._nativeSniffed];
-    final nativeUrls = _nativeSniffed.map((m) => _stripFragment(m.url)).toSet();
+    final out = <SniffedMedia>[];
+    final nativeUrls = <String>{};
+    for (final m in _nativeSniffed) {
+      final key = _stripFragment(m.url);
+      nativeUrls.add(key);
+      if (m.kind == 'm3u8' && m.resolution == null && m.durationSec == null) {
+        SniffedMedia? dartMeta;
+        for (final d in _sniffed) {
+          if (_stripFragment(d.url) == key &&
+              (d.resolution != null || d.durationSec != null)) {
+            dartMeta = d;
+            break;
+          }
+        }
+        if (dartMeta != null) {
+          out.add(m.copyWith(
+            resolution: dartMeta.resolution ?? m.resolution,
+            bandwidth: dartMeta.bandwidth ?? m.bandwidth,
+            estimatedSizeBytes:
+                dartMeta.estimatedSizeBytes ?? m.estimatedSizeBytes,
+            durationSec: dartMeta.durationSec ?? m.durationSec,
+            segmentCount: dartMeta.segmentCount > 0
+                ? dartMeta.segmentCount
+                : m.segmentCount,
+          ));
+          continue;
+        }
+      }
+      out.add(m);
+    }
     for (final m in _sniffed) {
       if (!nativeUrls.contains(_stripFragment(m.url))) out.add(m);
     }
@@ -688,20 +824,10 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     ));
   }
 
-  /// 嗅到的清单里最适合播/下的那条：mp4 优先，其次 m3u8；blob 和下不了的不要。
+  /// 嗅到的清单里质量最好的那条（分辨率/码率/大小优先）；blob 和下不了的不要。
   /// 走合并清单（原生候选在前）。
   SniffedMedia? _bestSniffed() {
-    final items = _mergedSniffed();
-    for (final m in items) {
-      if (m.kind == 'mp4' && m.downloadable) return m;
-    }
-    for (final m in items) {
-      if (m.kind == 'm3u8' && m.downloadable) return m;
-    }
-    for (final m in items) {
-      if (m.downloadable) return m;
-    }
-    return null;
+    return SniffedMedia.bestOf(_mergedSniffed());
   }
 
   /// 某条目的下载请求头：原生候选走原生侧记到的真实请求头
@@ -798,6 +924,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                     sourceId: _sourceId,
                     pageUrl: _currentUrl,
                     store: widget.store,
+                    pagePoster: _pagePoster,
                     headersFor: _headersFor,
                   );
                 }
@@ -1019,6 +1146,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                         sourceId: _sourceId,
                         pageUrl: _currentUrl,
                         store: widget.store,
+                        pagePoster: _pagePoster,
                         headersFor: _headersFor,
                       ),
                       child: const Text('查看'),
@@ -1041,6 +1169,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                             source: _sourceId,
                             url: best.url,
                             headers: _headersFor(best.url),
+                            poster: _pagePoster,
                             durationSec: best.durationSec ?? 0,
                           );
                           if (!mounted) return;

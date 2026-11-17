@@ -20,13 +20,17 @@ class SniffSheet {
     required String sourceId,
     required String pageUrl,
     required Store store,
+    // 页面封面地址（嗅探时从 video poster / og:image 收到，下载时存进任务里）。
+    String pagePoster = '',
     // 集成：某条目的下载请求头（原生候选有原生侧记到的真实请求头时用它；
     // 不传或查不到时沿用 {'Referer': pageUrl}）。
     Map<String, String> Function(String url)? headersFor,
   }) async {
     if (items.isEmpty) return;
-    final selected = <String>{for (final m in items) if (m.downloadable) m.url};
-    var sortMode = 0; // 0 按大小 · 1 按时长 · 2 按地址
+    // 默认只选质量最好的一条可下条目（没有可下的就全不选）。
+    final best = SniffedMedia.bestOf(items);
+    final selected = <String>{if (best != null) best.url};
+    var sortMode = 0; // 0 按质量 · 1 按大小 · 2 按时长 · 3 按地址
     var tsToMp4 = store.tsToMp4;
     await showModalBottomSheet<void>(
       context: context,
@@ -40,16 +44,19 @@ class SniffSheet {
           final sorted = [...items];
           switch (sortMode) {
             case 0:
-              sorted.sort((a, b) => (b.sizeBytes ?? 0).compareTo(a.sizeBytes ?? 0));
+              sorted.sort(SniffedMedia.compareQuality);
               break;
             case 1:
-              sorted.sort((a, b) => (b.durationSec ?? 0).compareTo(a.durationSec ?? 0));
+              sorted.sort((a, b) => (b.sizeBytes ?? 0).compareTo(a.sizeBytes ?? 0));
               break;
             case 2:
+              sorted.sort((a, b) => (b.durationSec ?? 0).compareTo(a.durationSec ?? 0));
+              break;
+            case 3:
               sorted.sort((a, b) => a.url.compareTo(b.url));
               break;
           }
-          final sortLabel = ['按大小', '按时长', '按地址'][sortMode];
+          final sortLabel = ['按质量', '按大小', '按时长', '按地址'][sortMode];
           final downloadable = items.where((m) => m.downloadable).toList();
           final allSelected =
               downloadable.isNotEmpty && selected.length == downloadable.length;
@@ -79,7 +86,7 @@ class SniffSheet {
                         child: Text(allSelected ? '取消全选' : '全选'),
                       ),
                       TextButton(
-                        onPressed: () => setState(() => sortMode = (sortMode + 1) % 3),
+                        onPressed: () => setState(() => sortMode = (sortMode + 1) % 4),
                         child: Text('排序：$sortLabel'),
                       ),
                     ],
@@ -176,6 +183,7 @@ class SniffSheet {
                                     source: sourceId,
                                     url: url,
                                     headers: headersFor?.call(url) ?? {'Referer': pageUrl},
+                                    poster: pagePoster,
                                     durationSec: m.durationSec ?? 0,
                                   );
                                   if (t != null) started++;

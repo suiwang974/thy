@@ -37,6 +37,19 @@ class PosterThumb extends StatelessWidget {
   }
 
   Widget _textCard(BuildContext context) {
+    // 小尺寸（如下載管理 54px 高）只放一个居中图标：标题/来源那两行字
+    // 在 54px 里塞不下，硬塞会溢出；标题本来就在列表项里另有显示。
+    if ((height ?? double.infinity) < 80) {
+      return Container(
+        width: width,
+        height: height,
+        color: const Color(0xFF2A2A35),
+        child: const Center(
+          child: Icon(Icons.play_circle_outline,
+              color: Colors.white38, size: 20),
+        ),
+      );
+    }
     return Container(
       width: width,
       height: height,
@@ -46,8 +59,9 @@ class PosterThumb extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          // 没封面的标清楚：不是图挂了，是源站没给封面，标题照样能看。
-          const Text('无封面', style: TextStyle(color: Colors.white38, fontSize: 10)),
+          // 没封面时显示中性占位（视频图标）。
+          const Icon(Icons.play_circle_outline,
+              color: Colors.white38, size: 20),
           const SizedBox(height: 4),
           Text(item.title, maxLines: 3, overflow: TextOverflow.ellipsis,
               style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
