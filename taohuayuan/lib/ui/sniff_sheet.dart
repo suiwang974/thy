@@ -20,6 +20,9 @@ class SniffSheet {
     required String sourceId,
     required String pageUrl,
     required Store store,
+    // 集成：某条目的下载请求头（原生候选有原生侧记到的真实请求头时用它；
+    // 不传或查不到时沿用 {'Referer': pageUrl}）。
+    Map<String, String> Function(String url)? headersFor,
   }) async {
     if (items.isEmpty) return;
     final selected = <String>{for (final m in items) if (m.downloadable) m.url};
@@ -172,7 +175,7 @@ class SniffSheet {
                                     title: pageTitle.isEmpty ? '嗅到的视频' : pageTitle,
                                     source: sourceId,
                                     url: url,
-                                    headers: {'Referer': pageUrl},
+                                    headers: headersFor?.call(url) ?? {'Referer': pageUrl},
                                     durationSec: m.durationSec ?? 0,
                                   );
                                   if (t != null) started++;

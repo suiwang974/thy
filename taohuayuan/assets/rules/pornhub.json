@@ -1,0 +1,20 @@
+{
+  "id": "pornhub",
+  "displayName": "Pornhub",
+  "hosts": [
+    "pornhub.com",
+    "www.pornhub.com"
+  ],
+  "searchMode": "http",
+  "entryUrl": "https://www.pornhub.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "pornhub-v1"
+}

@@ -6,12 +6,18 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../data/sources.dart';
 import '../models/video_item.dart';
+import '../search/global_search.dart';
+import '../search/search_history.dart';
 import '../services/adblock_service.dart';
 import '../services/downloader.dart';
 import '../services/sniffer.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import '../services/translator.dart';
+import '../services/page_translator.dart';
+import '../sniffer/native_sniffer_bridge.dart';
+import '../source/source_registry.dart';
+import '../source/source_session_policy.dart';
 import 'player_screen.dart';
 import 'sniff_sheet.dart';
 
@@ -57,9 +63,10 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   String _mirrorNote = '';
   // 第 35 条：翻译开关（默认开，跟着 Store 走；AppBar 按钮可随时切回原文）。
   bool _translateOn = true;
-  // 翻译前原文地址（切回原文用）；已翻过的地址（防 onPageFinished 重复翻）。
-  String _originalUrl = '';
-  String _lastTranslatedFor = '';
+  // 页内翻译尝试记录：同一地址翻成功或失败后不再自动重翻，手动点翻译按钮才重试。
+  final _translationTracker = TranslationAttemptTracker();
+  // 正在翻页中（防 onPageFinished 重复触发并发翻译）。
+  bool _translating = false;
   // 退出按钮按下的标记：PopScope 平时拦住所有返回（让系统返回键走 WebView 历史），
   // 只有退出按钮按下时才放行、直接退出。
   bool _forceExit = false;
@@ -75,12 +82,42 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   // 下一次轮询就能把 .m3u8/.ts 攒下来，手动嗅探时直接用，不用等加载时机。
   Timer? _pollTimer;
   final _accumulated = <String>{};
+  // 实现 5 全局搜索：地址栏 + 引擎切换 + 历史 + 引擎打不开时的回退。
+  final _addressController = TextEditingController();
+  final _addressFocus = FocusNode();
+  SearchHistory? _history;
+  late SearchEngine _engine;
+  // 当前正在尝试的搜索（引擎回退状态）；不在搜索页时为 null。
+  SearchEngineFallback? _searchFallback;
+  // 正在加载的搜索页地址（回退时判断本次报错是不是该页的依据）。
+  String? _searchUrl;
+  // 最近一次搜索词（全部引擎打不开时“重试”用）。
+  String? _lastSearchQuery;
+  // 全部引擎都打不开时显示“搜索不可用”横幅。
+  bool _searchUnavailable = false;
+  // 当前页的源身份：已知源用绑定 id，未知站记 'web'（下载任务的来源标签）。
+  late String _sourceId;
+  // 实现 6 回滚开关：当前源整源下线时为 true，嗅探停掉、只当浏览器用。
+  bool _sniffDisabled = false;
+  // 集成：原生无头会话的桥（可见浏览器不动，旧 Dart 嗅探当保底）。
+  final _bridge = NativeSnifferBridge();
+  // 原生候选转成的展示条目（与旧嗅探的 _sniffed 合并展示，原生在前）。
+  List<SniffedMedia> _nativeSniffed = [];
+  // 上次发给原生会话的地址（去 # 后比较，防同一页反复 navigate）。
+  String _nativeUrl = '';
 
   @override
   void initState() {
     super.initState();
     _currentUrl = widget.url;
     _translateOn = widget.store.translateEnabled;
+    _sourceId = widget.sourceId;
+    _engine = widget.store.preferredSearchEngine;
+    _addressController.text = widget.url;
+    // 搜索历史异步加载（读本地存储；没加载完之前提交照常导航，记历史时跳过）。
+    SearchHistory.load().then((h) {
+      if (mounted) setState(() => _history = h);
+    });
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(NavigationDelegate(
@@ -98,11 +135,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           // 视频可能是懒加载的：4 秒后再嗅一次。
           await Future.delayed(const Duration(seconds: 4));
           if (mounted) await _sniffVideo();
-          // 第 35 条：默认翻译成中文（翻译页加载失败自动回落原文 + toast）。
+          // 第 35 条：默认翻译成中文（页内翻译；失败不重翻、不跳转）。
           if (mounted) await _maybeTranslate();
-          // 第 39 条：翻译页加载完看内容判断（Google 的错误页是 HTTP 200，
-          // 不触发 onWebResourceError，不看内容就回落不了）。
-          if (mounted) await _checkTranslation();
         },
         // 广告拦截第一层（第 26 条）：顶层跳转到广告域名直接不让跳
         // （弹窗/跳转广告就是这么来的）。第一方（当前站自己的域名）
@@ -122,11 +156,25 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           return NavigationDecision.navigate;
         },
         onWebResourceError: (error) {
-          // 翻译页加载失败：按回落链走（Google -> Bing -> 原文，第 39 条），不假装翻译可用。
+          // 实现 5：搜索页打不开，按首选引擎顺序换下一个；全部打不开就降级——
+          // 打开首条历史地址 + 显示“搜索不可用”横幅（带重试）。
           if (error.isForMainFrame == true &&
-              (Translator.isTranslatedUrl(error.url ?? '') ||
-                  Translator.isBingTranslatedUrl(error.url ?? ''))) {
-            _fallbackFromTranslated(error.url!);
+              _searchFallback != null &&
+              error.url != null &&
+              error.url == _searchUrl) {
+            final next = _searchFallback!.advance();
+            if (next != null) {
+              _searchUrl = next;
+              _controller.loadRequest(Uri.parse(next));
+              return;
+            }
+            _searchFallback = null;
+            _searchUrl = null;
+            if (mounted) setState(() => _searchUnavailable = true);
+            final first = _history?.firstUrl;
+            if (first != null && first != _currentUrl) {
+              _controller.loadRequest(Uri.parse(first));
+            }
             return;
           }
           // 主页面加载失败（断网、被拦、证书错）：是 hanime 镜像就自动切另一个。
@@ -139,6 +187,51 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
             _sniffed = [];
             _accumulated.clear();
             _lastDiagnosis = const SniffDiagnosis();
+            // 地址栏跟随当前地址（正在输入时不抢）。
+            if (!_addressFocus.hasFocus && _addressController.text != u) {
+              _addressController.text = u;
+            }
+            // 离开搜索引擎结果页：搜索回退状态清掉，横幅收起。
+            if (!_isSearchEngineUrl(u)) {
+              _searchFallback = null;
+              _searchUrl = null;
+              _lastSearchQuery = null;
+              if (_searchUnavailable) _searchUnavailable = false;
+            }
+            // 当前页的源身份：已知源用绑定 id；翻译代理页不改身份；未知站记 'web'。
+            final host = Uri.tryParse(u)?.host ?? '';
+            final binding = SourceRegistry.bindingForHost(host);
+            if (binding != null) {
+              _sourceId = binding.id;
+            } else if (!Translator.isTranslatedUrl(u) &&
+                !Translator.isBingTranslatedUrl(u)) {
+              _sourceId = 'web';
+            }
+            // 实现 6 回滚开关：整源下线就不嗅探（会话启动/每次导航时热读取）。
+            final disabled = !sniffEnabledFor(binding);
+            if (disabled != _sniffDisabled && mounted) {
+              setState(() {
+                _sniffDisabled = disabled;
+                if (disabled) {
+                  _sniffed = [];
+                  _nativeSniffed = [];
+                  _accumulated.clear();
+                }
+              });
+            } else {
+              _sniffDisabled = disabled;
+            }
+            // 集成：跟导航走原生会话（翻译代理页不跟，原生会话留在原文页继续收候选；
+            // 回滚停用时 navigateTo 内部会停会话；同一地址去 # 后相同就不反复发）。
+            if (!Translator.isTranslatedUrl(u) &&
+                !Translator.isBingTranslatedUrl(u)) {
+              final stripped = _stripFragment(u);
+              if (stripped != _nativeUrl) {
+                _nativeUrl = stripped;
+                _nativeSniffed = [];
+                unawaited(_bridge.navigateTo(u, binding));
+              }
+            }
           }
         },
       ));
@@ -146,14 +239,24 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     // 不让用户对着验证页发懵；hanimeone.me 打不开时 _tryMirror 再切回来。
     final initialHost = Uri.tryParse(widget.url)?.host ?? '';
     _triedHosts.add(initialHost);
+    final initialLoadUrl =
+        initialHost == 'hanime1.me' ? HanimeSource.mirrorUrl(widget.url) : widget.url;
     if (initialHost == 'hanime1.me') {
-      final mirror = HanimeSource.mirrorUrl(widget.url);
+      final mirror = initialLoadUrl;
       _triedHosts.add(Uri.parse(mirror).host);
       _mirrorNote = 'hanime1.me 常被验证拦住，已自动切到能打开的 hanimeone.me';
       _controller.loadRequest(Uri.parse(mirror));
     } else {
       _controller.loadRequest(Uri.parse(widget.url));
     }
+    // 集成：原生无头会话并行跑同一地址（可见浏览器不动，旧嗅探当保底）。
+    // 会话起不来也不炸浏览器（桥内部吞错）；翻译代理页不跟（onUrlChange 里拦）。
+    _nativeUrl = _stripFragment(initialLoadUrl);
+    unawaited(_bridge.startSession(
+      initialLoadUrl,
+      SourceRegistry.bindingForHost(
+          Uri.tryParse(initialLoadUrl)?.host ?? ''),
+    ));
     // 第 53 条：轮询 performance 攒候选地址（3 秒一次，轻量 JS，不扫 HTML）。
     _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) => _pollSniff());
   }
@@ -161,13 +264,20 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   @override
   void dispose() {
     _pollTimer?.cancel();
+    // 集成：浏览器关掉就销毁原生会话（MainActivity 侧只停实例、不取消 scope，
+    // 下次再开浏览器还能起新会话）。
+    unawaited(_bridge.dispose());
+    _addressController.dispose();
+    _addressFocus.dispose();
     super.dispose();
   }
 
   /// 第 53 条：轮询一次 performance + video 地址，攒进候选集。
   /// 失败（页面正在跳转/JS 还没准备好）就跳过，不打扰浏览。
+  /// 实现 6：回滚停用时不轮询。
+  /// 集成：顺手拉一次原生候选进仓库，合并展示（原生在前、按地址去重）。
   Future<void> _pollSniff() async {
-    if (!mounted) return;
+    if (!mounted || _sniffDisabled) return;
     try {
       final raw = await _controller.runJavaScriptReturningResult(Sniffer.pollJs);
       final decoded = jsonDecode(raw.toString()) as Map<String, dynamic>;
@@ -186,6 +296,10 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
         // 嗅探按钮 / 页面加载嗅探时一起用，不用等加载时机。
       }
     } catch (_) {}
+    if (_bridge.isRunning && mounted) {
+      await _bridge.pollCandidates();
+      if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
+    }
   }
 
   /// 撞上验证页/加载失败时切另一个镜像（只切没试过的，两个都试过了就停）。
@@ -199,6 +313,190 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     if (!mounted) return;
     setState(() => _mirrorNote = '$host 打不开，已自动切到能打开的 $mirrorHost');
     _controller.loadRequest(Uri.parse(mirror));
+  }
+
+  // ---------- 实现 5：全局搜索（地址栏 + 引擎 + 历史 + 回退） ----------
+
+  /// 首选引擎在前，其余按默认顺序补齐（引擎打不开时的回退顺序）。
+  List<SearchEngine> _engineOrder() {
+    final order = <SearchEngine>[_engine];
+    for (final e in GlobalSearch.defaultEngineOrder) {
+      if (e != _engine) order.add(e);
+    }
+    return order;
+  }
+
+  /// 地址栏提交：解析输入并导航；搜索词记入历史。
+  /// sniffOnly 的源（niacg/lianzu11/hanime1/hanimeone）不走 HTTP 搜索——
+  /// 这里本来就不做 HTTP 搜索，只导航；输域名直接打开后由浏览器内嗅探发现视频。
+  Future<void> _goToAddress(String input) async {
+    final resolved = GlobalSearch.resolve(
+      input,
+      engine: _engine,
+      isKnownHost: (host) => SourceRegistry.bindingForHost(host) != null,
+    );
+    if (resolved == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('输入为空')),
+      );
+      return;
+    }
+    final history = _history;
+    if (history != null) {
+      await history.add(input.trim(), resolved.url);
+      if (mounted) setState(() {});
+    }
+    _navigateTo(resolved);
+  }
+
+  /// 统一导航入口（地址栏提交、历史点选都走这里）。
+  /// 只决定“加载哪个页面”，不产出候选、不解析 playlist；嗅探由浏览器已有的
+  /// 嗅探管线在页面加载时自动跑（搜索结果页也一样）。
+  void _navigateTo(ResolvedNavigation resolved) {
+    if (resolved.isSearch) {
+      _searchFallback = SearchEngineFallback(
+        resolved.query!,
+        order: _engineOrder(),
+      );
+      _searchUrl = resolved.url;
+      _lastSearchQuery = resolved.query;
+    } else {
+      _searchFallback = null;
+      _searchUrl = null;
+      _lastSearchQuery = null;
+    }
+    setState(() => _searchUnavailable = false);
+    _controller.loadRequest(Uri.parse(resolved.url));
+  }
+
+  /// 切换默认引擎（持久保存）。正在看搜索页就用新引擎重搜一次。
+  Future<void> _switchEngine(SearchEngine engine) async {
+    if (engine == _engine) return;
+    setState(() => _engine = engine);
+    await widget.store.setPreferredSearchEngine(engine);
+    final query = _lastSearchQuery;
+    if (query != null && mounted) {
+      final fallback = SearchEngineFallback(query, order: _engineOrder());
+      _searchFallback = fallback;
+      _searchUrl = fallback.firstUrl();
+      setState(() => _searchUnavailable = false);
+      await _controller.loadRequest(Uri.parse(fallback.firstUrl()));
+    }
+  }
+
+  /// “搜索不可用”横幅里的重试：用首选引擎重搜一次。
+  Future<void> _retrySearch() async {
+    final query = _lastSearchQuery;
+    if (query == null) {
+      setState(() => _searchUnavailable = false);
+      return;
+    }
+    final fallback = SearchEngineFallback(query, order: _engineOrder());
+    _searchFallback = fallback;
+    _searchUrl = fallback.firstUrl();
+    setState(() => _searchUnavailable = false);
+    await _controller.loadRequest(Uri.parse(fallback.firstUrl()));
+  }
+
+  /// 是否搜索引擎的结果页地址（Bing/Google 搜 /search，DuckDuckGo 用 /?q=）。
+  bool _isSearchEngineUrl(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return false;
+    switch (uri.host) {
+      case 'www.bing.com':
+      case 'www.google.com':
+        return uri.path == '/search';
+      case 'duckduckgo.com':
+      case 'www.duckduckgo.com':
+        return uri.path == '/' || uri.path.isEmpty;
+      default:
+        return false;
+    }
+  }
+
+  /// 搜索历史 bottom sheet：点一条打开，左滑删一条，右上角一键清空。
+  void _showHistorySheet() {
+    final history = _history;
+    if (history == null) return;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A22),
+      builder: (sheetContext) {
+        final entries = history.entries;
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                title: const Text('搜索历史',
+                    style: TextStyle(color: Colors.white)),
+                trailing: TextButton(
+                  onPressed: () async {
+                    await history.clear();
+                    if (!mounted) return;
+                    setState(() {});
+                    if (sheetContext.mounted) {
+                      Navigator.of(sheetContext).pop();
+                    }
+                  },
+                  child: const Text('清空'),
+                ),
+              ),
+              if (entries.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Text('还没有搜索历史',
+                      style: TextStyle(color: Colors.white54)),
+                )
+              else
+                Flexible(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: entries.length,
+                    itemBuilder: (_, i) {
+                      final e = entries[i];
+                      return Dismissible(
+                        key: ValueKey(e.url),
+                        direction: DismissDirection.endToStart,
+                        background: Container(
+                          color: Colors.red,
+                          alignment: Alignment.centerRight,
+                          padding: const EdgeInsets.only(right: 16),
+                          child:
+                              const Icon(Icons.delete, color: Colors.white),
+                        ),
+                        onDismissed: (_) async {
+                          await history.remove(e.url);
+                          if (mounted) setState(() {});
+                        },
+                        child: ListTile(
+                          title: Text(e.label,
+                              style: const TextStyle(color: Colors.white),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis),
+                          subtitle: Text(e.url,
+                              style: const TextStyle(
+                                  color: Colors.white54, fontSize: 12),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis),
+                          onTap: () async {
+                            await history.add(e.label, e.url);
+                            if (sheetContext.mounted) {
+                              Navigator.of(sheetContext).pop();
+                            }
+                            await _controller.loadRequest(Uri.parse(e.url));
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   /// 广告拦截第二层（第 26 条）：JS 注入——fetch/XHR 发往广告域名直接 abort、
@@ -218,7 +516,10 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   /// 轮询攒下来的候选地址一起传进去（视频播了一会儿才拉流的也能嗅到）。
   /// 顺带看页面标题是不是 Cloudflare 验证页（Just a moment / Attention
   /// Required）：是的话，hanime 镜像自动切另一个。
+  /// 实现 6：回滚停用时不嗅探。
+  /// 集成：顺手刷新一次原生候选（原生会话在后台并行收，手动点雷达时也要看到）。
   Future<void> _sniffVideo() async {
+    if (_sniffDisabled) return;
     try {
       final r = await Sniffer.sniff(
         _controller,
@@ -238,109 +539,128 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     } catch (_) {
       // 嗅不到就不弹条，不打扰浏览。
     }
+    if (_bridge.isRunning && mounted) {
+      await _bridge.pollCandidates();
+      if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
+    }
   }
 
-  /// 第 35 条：翻译开关开着、当前页还没翻过，就加载 translate.goog 代理页。
-  /// 翻译页加载失败（主框报错）时自动回落原文 + toast，不假装可用。
+  /// 合并展示：原生候选在前（有真实请求头、六路全开），旧嗅探去重后在后。
+  /// 按地址去重（小写、去 # 后缀），同一地址只留原生那条。
+  List<SniffedMedia> _mergedSniffed() {
+    final out = <SniffedMedia>[..._nativeSniffed];
+    final nativeUrls = _nativeSniffed.map((m) => _stripFragment(m.url)).toSet();
+    for (final m in _sniffed) {
+      if (!nativeUrls.contains(_stripFragment(m.url))) out.add(m);
+    }
+    return out;
+  }
+
+  /// 去 # 后缀并小写（地址去重比较用）。
+  static String _stripFragment(String url) {
+    final l = url.toLowerCase();
+    final h = l.indexOf('#');
+    return h == -1 ? l : l.substring(0, h);
+  }
+
+  /// 第 35 条：页内翻译（2026-11-17 改）：开关开着、当前页还没翻过，
+  /// 就在当前页里把可见文字翻成中文，不经过整页代理。
+  /// 之前走 translate.goog 代理：XHamster 直接回 "Can't translate this page"，
+  /// Bing 代理也失败，回原文后 onPageFinished 又自动重翻，死循环。
+  /// 现在同一地址翻成功或失败后都不再自动重翻，手动点翻译按钮才重试。
   Future<void> _maybeTranslate() async {
     if (!_translateOn) return;
-    if (!Translator.isTranslatableUrl(_currentUrl)) return;
-    if (_currentUrl == _lastTranslatedFor) return;
-    _lastTranslatedFor = _currentUrl;
-    _originalUrl = _currentUrl;
-    await _controller.loadRequest(Uri.parse(Translator.toTranslatedUrl(_currentUrl)));
-  }
+    if (_translating) return;
+    final url = _currentUrl;
+    if (url.isEmpty || !Translator.isTranslatableUrl(url)) return;
+    if (!_translationTracker.shouldAttempt(url)) return;
+    void snack(String m) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+    }
 
-  /// 第 39 条：翻译页打不开/翻不了时的回落链：Google -> Bing -> 原文。
-  /// onWebResourceError（主框报错）和 _checkTranslation（内容是错误页）都走这里。
-  void _fallbackFromTranslated(String failedUrl) {
-    var back = _originalUrl.isNotEmpty
-        ? _originalUrl
-        : Translator.originalUrlFromTranslated(failedUrl);
-    // Google 翻不了就试 Bing（国内一般能直接打开）；Bing 也不行就回原文。
-    if (Translator.isTranslatedUrl(failedUrl)) {
-      final bing = Translator.toBingTranslatedUrl(back);
-      if (bing != back) {
-        _lastTranslatedFor = back;
-        _controller.loadRequest(Uri.parse(bing));
+    _translating = true;
+    try {
+      final raw =
+          await _controller.runJavaScriptReturningResult(PageTranslator.collectJs);
+      final nodes = _parseCollectedNodes(raw.toString());
+      if (nodes.isEmpty) {
+        _translationTracker.markDone(url);
+        snack('本页没有找到可翻译的文字，已保留原文');
         return;
       }
-    }
-    // 原文地址拿不到（理论上不会发生：_maybeTranslate 一定先记了原文），
-    // 就不乱跳，只提示。
-    if (back.isEmpty ||
-        Translator.isTranslatedUrl(back) ||
-        Translator.isBingTranslatedUrl(back)) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('翻译服务不通，已切回原文')),
-        );
+      final texts = <String>[];
+      final seen = <String>{};
+      for (final n in nodes) {
+        if (seen.add(n.$2)) texts.add(n.$2);
       }
-      return;
+      final translated = await PageTranslator.translateTexts(texts);
+      final byText = <String, String>{};
+      for (var i = 0; i < texts.length && i < translated.length; i++) {
+        final t = translated[i];
+        if (t.isNotEmpty) byText[texts[i]] = t;
+      }
+      final writes = <String, String>{};
+      for (final n in nodes) {
+        final t = byText[n.$2];
+        if (t != null && t.isNotEmpty) writes[n.$1] = t;
+      }
+      if (writes.isEmpty) {
+        _translationTracker.markDone(url);
+        snack('翻译结果为空，已保留原文');
+        return;
+      }
+      await _controller.runJavaScript(PageTranslator.applyJs(writes));
+      _translationTracker.markDone(url);
+    } on PageTranslationException catch (e) {
+      _translationTracker.markFailed(url);
+      snack('翻译失败：${e.message}，已保留原文');
+    } catch (_) {
+      _translationTracker.markFailed(url);
+      snack('翻译失败，已保留原文');
+    } finally {
+      _translating = false;
     }
-    _lastTranslatedFor = '';
-    _originalUrl = '';
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('翻译服务不通（Google/Bing 都打不开），已切回原文')),
-      );
-    }
-    _controller.loadRequest(Uri.parse(back));
   }
 
-  /// 第 39 条：翻译页加载完看内容判断——Google 的 "Can't translate this page"
-  /// 是 HTTP 200 正常页，不触发 onWebResourceError，不看内容就永远回落不了，
-  /// 用户直接看到英文错误页。读不到内容就不判断，别把好页当坏页切走。
-  Future<void> _checkTranslation() async {
-    if (!Translator.isTranslatedUrl(_currentUrl) &&
-        !Translator.isBingTranslatedUrl(_currentUrl)) {
-      return;
-    }
-    String title = '';
-    String body = '';
+  /// 解析 collectJs 的返回：JSON 字符串 -> (id, text) 记录列表。
+  /// runJavaScriptReturningResult 的返回可能是 JSON 编码过的字符串，
+  /// 先解一次，解出来还是字符串就再解一次；任何一步失败返回空列表。
+  List<(String, String)> _parseCollectedNodes(String raw) {
     try {
-      final t = await _controller.runJavaScriptReturningResult('document.title');
-      try {
-        final d = jsonDecode(t.toString());
-        if (d is String) title = d;
-      } catch (_) {
-        title = t.toString();
+      Object? data = jsonDecode(raw);
+      if (data is String) data = jsonDecode(data);
+      if (data is! List) return const [];
+      final out = <(String, String)>[];
+      for (final e in data) {
+        if (e is! Map) continue;
+        final id = e['id'];
+        final text = e['text'];
+        if (id is String &&
+            text is String &&
+            id.isNotEmpty &&
+            text.isNotEmpty) {
+          out.add((id, text));
+        }
       }
-      final b = await _controller.runJavaScriptReturningResult(
-        "document.body ? document.body.innerText.slice(0, 500) : ''",
-      );
-      try {
-        final d = jsonDecode(b.toString());
-        if (d is String) body = d;
-      } catch (_) {
-        body = b.toString();
-      }
+      return out;
     } catch (_) {
-      return;
+      return const [];
     }
-    if (!Translator.isTranslationFailurePage(title, body)) return;
-    _fallbackFromTranslated(_currentUrl);
   }
 
   /// AppBar 翻译按钮：开/关翻译（选择持久保存到 Store）。
-  /// 关：回到翻译前的原文地址（翻不回去就反向映射当前地址）。
+  /// 开：清掉当前地址的尝试记录，马上翻一次；关：刷新回原文（页内翻译不改地址）。
   Future<void> _toggleTranslate() async {
     final on = !_translateOn;
     setState(() => _translateOn = on);
     await widget.store.setTranslateEnabled(on);
     if (!mounted) return;
+    _translationTracker.clear(_currentUrl);
     if (on) {
-      _lastTranslatedFor = '';
       await _maybeTranslate();
     } else {
-      final back = _originalUrl.isNotEmpty
-          ? _originalUrl
-          : Translator.originalUrlFromTranslated(_currentUrl);
-      _lastTranslatedFor = '';
-      _originalUrl = '';
-      if (back != _currentUrl) {
-        await _controller.loadRequest(Uri.parse(back));
-      }
+      await _controller.reload();
     }
   }
 
@@ -355,9 +675,9 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     // 其他源的视频页用这个 referer 会错）。
     final host = Uri.tryParse(_currentUrl)?.host ?? '';
     final item = VideoItem(
-      id: '${widget.sourceId}-$_currentUrl',
+      id: '$_sourceId-$_currentUrl',
       title: _cleanPageTitle,
-      source: widget.sourceId,
+      source: _sourceId,
       pageUrl: _currentUrl,
       streamUrl: url,
       referer: host.isEmpty ? '' : 'https://$host/',
@@ -369,22 +689,30 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   }
 
   /// 嗅到的清单里最适合播/下的那条：mp4 优先，其次 m3u8；blob 和下不了的不要。
+  /// 走合并清单（原生候选在前）。
   SniffedMedia? _bestSniffed() {
-    for (final m in _sniffed) {
+    final items = _mergedSniffed();
+    for (final m in items) {
       if (m.kind == 'mp4' && m.downloadable) return m;
     }
-    for (final m in _sniffed) {
+    for (final m in items) {
       if (m.kind == 'm3u8' && m.downloadable) return m;
     }
-    for (final m in _sniffed) {
+    for (final m in items) {
       if (m.downloadable) return m;
     }
     return null;
   }
 
+  /// 某条目的下载请求头：原生候选走原生侧记到的真实请求头
+  /// （含 Referer/UA/Cookie 上下文，403 恢复靠它）；旧嗅探的条目
+  /// 沿用原来的 pageUrl 当 Referer。
+  Map<String, String> _headersFor(String url) =>
+      _bridge.headersFor(url) ?? {'Referer': _currentUrl};
+
   @override
   Widget build(BuildContext context) {
-    final hasAds = StreamResolver.sourcePageHasAds(widget.sourceId);
+    final hasAds = StreamResolver.sourcePageHasAds(_sourceId);
     return PopScope(
       // 平时拦住所有返回：系统返回键走 WebView 历史；退出按钮按下时才放行。
       canPop: _forceExit,
@@ -444,7 +772,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
               onPressed: () async {
                 await _sniffVideo();
                 if (!context.mounted) return;
-                if (_sniffed.isEmpty) {
+                final items = _mergedSniffed();
+                if (items.isEmpty) {
                   final playerUrl = _lastDiagnosis.playerIframeUrl;
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
@@ -464,19 +793,197 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                 } else {
                   SniffSheet.show(
                     context,
-                    items: _sniffed,
+                    items: items,
                     pageTitle: _cleanPageTitle,
-                    sourceId: widget.sourceId,
+                    sourceId: _sourceId,
                     pageUrl: _currentUrl,
                     store: widget.store,
+                    headersFor: _headersFor,
                   );
                 }
+              },
+            ),
+            // 实现 6：回滚开关——一键停用/恢复当前源的嗅探（整源下线）。
+            // 未知站（不在 10 源里）没有绑定，嗅探常开，不可停用。
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert, color: Colors.white),
+              tooltip: '更多',
+              onSelected: (value) async {
+                if (value != 'toggle-sniff') return;
+                final b = SourceRegistry.bindingForHost(
+                  Uri.tryParse(_currentUrl)?.host ?? '',
+                );
+                if (b == null) return;
+                if (b.enabled) {
+                  SourceRegistry.disable(b.id);
+                } else {
+                  SourceRegistry.enable(b.id);
+                }
+                if (!mounted) return;
+                final nowDisabled =
+                    !sniffEnabledFor(SourceRegistry.bindingFor(b.id));
+                setState(() {
+                  _sniffDisabled = nowDisabled;
+                  if (nowDisabled) {
+                    _sniffed = [];
+                    _nativeSniffed = [];
+                    _accumulated.clear();
+                  }
+                });
+                // 集成：停用就停原生会话，恢复就按当前地址重起（走同一套回滚开关）。
+                // messenger 在 await 之前取出来：await 之后再用 context 会触发 lint。
+                final messenger = ScaffoldMessenger.of(context);
+                if (nowDisabled) {
+                  await _bridge.stopSession();
+                } else {
+                  await _bridge.startSession(
+                    _currentUrl,
+                    SourceRegistry.bindingForHost(
+                        Uri.tryParse(_currentUrl)?.host ?? ''),
+                  );
+                }
+                messenger.showSnackBar(
+                  SnackBar(
+                    content: Text(nowDisabled
+                        ? '已停用${b.displayName}的嗅探（回滚）'
+                        : '已恢复${b.displayName}的嗅探'),
+                  ),
+                );
+                if (!nowDisabled) await _sniffVideo();
+              },
+              itemBuilder: (_) {
+                final b = SourceRegistry.bindingForHost(
+                  Uri.tryParse(_currentUrl)?.host ?? '',
+                );
+                if (b == null) {
+                  return const [
+                    PopupMenuItem(
+                      value: 'none',
+                      enabled: false,
+                      child: Text('未知站：嗅探常开'),
+                    ),
+                  ];
+                }
+                return [
+                  PopupMenuItem(
+                    value: 'toggle-sniff',
+                    child: Text(
+                        b.enabled ? '停用该源嗅探（回滚）' : '恢复该源嗅探'),
+                  ),
+                ];
               },
             ),
           ],
         ),
         body: Column(
           children: [
+            // 实现 5：地址栏——输网址直接打开，输词走搜索引擎出结果（像 1DM+ 那样）。
+            Container(
+              color: const Color(0xFF1A1A22),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              child: Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.history, color: Colors.white70),
+                    tooltip: '搜索历史',
+                    onPressed: _showHistorySheet,
+                  ),
+                  Expanded(
+                    child: TextField(
+                      controller: _addressController,
+                      focusNode: _addressFocus,
+                      style:
+                          const TextStyle(color: Colors.white, fontSize: 14),
+                      decoration: InputDecoration(
+                        hintText: '搜索或输入网址',
+                        hintStyle: const TextStyle(color: Colors.white38),
+                        filled: true,
+                        fillColor: const Color(0xFF2A2A35),
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 8),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                      textInputAction: TextInputAction.go,
+                      onSubmitted: (value) {
+                        _addressFocus.unfocus();
+                        _goToAddress(value);
+                      },
+                    ),
+                  ),
+                  PopupMenuButton<SearchEngine>(
+                    tooltip: '搜索引擎（当前：${_engine.displayName}）',
+                    onSelected: _switchEngine,
+                    itemBuilder: (_) => SearchEngine.values
+                        .map((e) => PopupMenuItem(
+                              value: e,
+                              child: Row(
+                                children: [
+                                  if (e == _engine)
+                                    const Icon(Icons.check, size: 16),
+                                  if (e == _engine)
+                                    const SizedBox(width: 6),
+                                  Text(e.displayName),
+                                ],
+                              ),
+                            ))
+                        .toList(),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 8),
+                      child: Text(
+                        _engine.displayName,
+                        style: const TextStyle(
+                            color: Colors.white70, fontSize: 13),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            // 实现 5：全部引擎都打不开时的横幅（已降级打开首条历史地址）。
+            if (_searchUnavailable)
+              Container(
+                width: double.infinity,
+                color: const Color(0xFF3A2A1A),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        '搜索不可用：搜索引擎都打不开',
+                        style: TextStyle(color: Colors.amber, fontSize: 12),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _retrySearch,
+                      child: const Text('重试'),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close,
+                          color: Colors.amber, size: 18),
+                      tooltip: '关闭',
+                      onPressed: () =>
+                          setState(() => _searchUnavailable = false),
+                    ),
+                  ],
+                ),
+              ),
+            // 实现 6：回滚停用横幅——该源嗅探已停，只当浏览器用。
+            if (_sniffDisabled)
+              Container(
+                width: double.infinity,
+                color: const Color(0xFF3A2A2A),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: const Text(
+                  '该源嗅探已停用（回滚开关），只当浏览器用',
+                  style: TextStyle(color: Colors.orange, fontSize: 12),
+                ),
+              ),
             if (_loading) const LinearProgressIndicator(color: Colors.pinkAccent),
             if (_mirrorNote.isNotEmpty)
               Container(
@@ -488,7 +995,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
             Expanded(child: WebViewWidget(controller: _controller)),
             // 第 34 条：嗅到视频就弹出瘦条（播/下载两个按钮）。
             // 只有 blob、没找到底层地址时只显示条目说明（清单里写明下不了）。
-            if (_sniffed.isNotEmpty)
+            // 集成：条数与清单走合并清单（原生候选在前）；下载用原生真实请求头。
+            if (_mergedSniffed().isNotEmpty)
               Container(
                 width: double.infinity,
                 color: const Color(0xFF1F2A1F),
@@ -497,7 +1005,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                   children: [
                     Expanded(
                       child: Text(
-                        '嗅到 ${_sniffed.length} 个视频${_bestSniffed() == null ? '（浏览器内播放，拿不到地址）' : ''}',
+                        '嗅到 ${_mergedSniffed().length} 个视频${_bestSniffed() == null ? '（浏览器内播放，拿不到地址）' : ''}',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(color: Colors.white70, fontSize: 13),
@@ -506,11 +1014,12 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                     TextButton(
                       onPressed: () => SniffSheet.show(
                         context,
-                        items: _sniffed,
+                        items: _mergedSniffed(),
                         pageTitle: _cleanPageTitle,
-                        sourceId: widget.sourceId,
+                        sourceId: _sourceId,
                         pageUrl: _currentUrl,
                         store: widget.store,
+                        headersFor: _headersFor,
                       ),
                       child: const Text('查看'),
                     ),
@@ -529,9 +1038,9 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
                           await DownloadManager.instance.startDownloadFromUrl(
                             id: 'sniff-${best.url.hashCode.abs()}',
                             title: _cleanPageTitle,
-                            source: widget.sourceId,
+                            source: _sourceId,
                             url: best.url,
-                            headers: {'Referer': _currentUrl},
+                            headers: _headersFor(best.url),
                             durationSec: best.durationSec ?? 0,
                           );
                           if (!mounted) return;

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/video_item.dart';
+import '../search/global_search.dart';
 
 /// 收藏（喜欢）、关注的作者、观看记录、口味画像、缓存。存在手机本地，不上传。
 /// 口味画像只存本地：点赞、看完比例、关注作者、搜过的词、不喜欢的标签。
@@ -385,6 +386,21 @@ class Store {
 
   Future<void> setTranslateEnabled(bool v) async {
     await _prefs.setBool(_translateKey, v);
+  }
+
+  // ---- 全局搜索默认引擎（实现 5；默认 Bing，地址栏可切）----
+  static const _searchEngineKey = 'taohuayuan_search_engine';
+
+  SearchEngine get preferredSearchEngine {
+    final name = _prefs.getString(_searchEngineKey);
+    for (final e in SearchEngine.values) {
+      if (e.name == name) return e;
+    }
+    return SearchEngine.bing;
+  }
+
+  Future<void> setPreferredSearchEngine(SearchEngine e) async {
+    await _prefs.setString(_searchEngineKey, e.name);
   }
 
   // ---- 下载的 ts 转 mp4（第 34 条，1DM 同款勾选项）----

@@ -1,7 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../data/sources.dart';
+import '../search/global_search.dart';
+import '../search/search_history.dart';
 import '../services/store.dart';
+import '../source/source_registry.dart';
 import 'web_source_browser.dart';
 import 'widgets.dart';
 
@@ -26,6 +31,31 @@ class BrowserSourcesScreen extends StatelessWidget {
     ));
   }
 
+  /// 实现 5：全局搜索入口——不挑源也能搜。输词走搜索引擎、输网址直接打开，
+  /// 打开的是同一个内置浏览器（地址栏、嗅探、下载都在里面）。
+  void _search(BuildContext context, String input) {
+    final resolved = GlobalSearch.resolve(
+      input,
+      engine: store.preferredSearchEngine,
+      isKnownHost: (host) => SourceRegistry.bindingForHost(host) != null,
+    );
+    if (resolved == null) return;
+    // 记入搜索历史（异步，不堵导航）。
+    unawaited(
+      SearchHistory.load().then((h) => h.add(input.trim(), resolved.url)),
+    );
+    final host = Uri.tryParse(resolved.url)?.host ?? '';
+    final binding = SourceRegistry.bindingForHost(host);
+    _open(
+      context,
+      resolved.isSearch
+          ? '搜索：${resolved.query}'
+          : (binding?.displayName ?? '浏览器'),
+      resolved.url,
+      binding?.id ?? 'web',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final sources = allSources();
@@ -43,6 +73,29 @@ class BrowserSourcesScreen extends StatelessWidget {
       ),
       body: ListView(
         children: [
+          // 实现 5：全局搜索框——输搜索词走搜索引擎，输网址直接打开。
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+            child: TextField(
+              style: const TextStyle(color: Colors.white, fontSize: 14),
+              decoration: InputDecoration(
+                hintText: '搜索或输入网址',
+                hintStyle: const TextStyle(color: Colors.white38),
+                prefixIcon:
+                    const Icon(Icons.search, color: Colors.white54),
+                filled: true,
+                fillColor: const Color(0xFF2A2A35),
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+              textInputAction: TextInputAction.go,
+              onSubmitted: (value) => _search(context, value),
+            ),
+          ),
           const SectionTitle('全部源站', subtitle: '点哪个就用内置浏览器打开哪个源站'),
           // Hanime：两个镜像域名是同一站，内容一样，只显示一行；
           // 先走能进的 hanimeone.me，打不开自动切 hanime1.me。

@@ -1,0 +1,20 @@
+{
+  "id": "xvideos",
+  "displayName": "XVideos",
+  "hosts": [
+    "xvideos.com",
+    "www.xvideos.com"
+  ],
+  "searchMode": "http",
+  "entryUrl": "https://www.xvideos.com/",
+  "mirrors": [],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "xvideos-v1"
+}

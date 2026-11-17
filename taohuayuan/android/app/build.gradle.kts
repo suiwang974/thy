@@ -67,6 +67,14 @@ android {
     }
 }
 
+// 捕获层依赖（重构实现 2）：androidx.webkit 提供 document-start 全帧脚本注册
+// （WebViewCompat.addDocumentStartJavaScript，1.17.1 已对实物 AAR 核过 API）；
+// kotlinx-coroutines 提供 Sniffer 接口的 Flow/StateFlow。
+dependencies {
+    implementation("androidx.webkit:webkit:1.17.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

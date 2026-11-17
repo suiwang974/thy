@@ -12,6 +12,15 @@ import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import dev.akash.skystream.sniffer.CandidateSource
+import dev.akash.skystream.sniffer.SniffConfig
+import dev.akash.skystream.sniffer.SniffState
+import dev.akash.skystream.sniffer.SnifferWebView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileInputStream
 
@@ -20,6 +29,28 @@ import java.io.FileInputStream
 /// Android 10+ 强制分区存储，Dart 层不能直接往公共 Downloads 写文件，
 /// 只能走 MediaStore insert + ContentResolver 输出流。
 class MainActivity : FlutterActivity() {
+    private var sniffer: SnifferWebView? = null
+    private val snifferScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    /// Dart 侧传来的路名列表转 CandidateSource；名字对不上就跳过；
+    /// 没传或全对不上时返回默认六路、按 NETWORK、SERVICE_WORKER、PAGE_SCRIPT、
+    /// VIDEO_LISTENER、RULE、BLOB_MSE 的顺序。
+    private fun parseAdapters(raw: List<String>?): List<CandidateSource> {
+        val defaults = listOf(
+            CandidateSource.NETWORK,
+            CandidateSource.SERVICE_WORKER,
+            CandidateSource.PAGE_SCRIPT,
+            CandidateSource.VIDEO_LISTENER,
+            CandidateSource.RULE,
+            CandidateSource.BLOB_MSE,
+        )
+        if (raw.isNullOrEmpty()) return defaults
+        val parsed = raw.mapNotNull { name ->
+            runCatching { CandidateSource.valueOf(name.trim().uppercase()) }.getOrNull()
+        }
+        return parsed.ifEmpty { defaults }
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "taohuayuan/downloads")
@@ -54,6 +85,112 @@ class MainActivity : FlutterActivity() {
                     "resolvePath" -> {
                         val uri = call.argument<String>("uri")?.let { Uri.parse(it) }
                         result.success(uri?.let { resolvePath(it) })
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        // 捕获层通道（重构实现 2 + 集成）：原生 WebView 嗅探，无头跑（不挂界面），
+        // Dart 侧经 SnifferChannel 调 start/navigate/stop/getCandidates/dispose。
+        // start 里先注册 document-start 脚本再 loadUrl，顺序不能反。
+        // start/navigate 都接受 adapters 参数（路名列表）；已有实例在跑时当导航处理。
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "taohuayuan/sniffer")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "start" -> {
+                        val url = call.argument<String>("url")
+                        if (url == null) {
+                            result.error("BAD_ARGS", "url 缺失", null)
+                            return@setMethodCallHandler
+                        }
+                        val adapters = parseAdapters(call.argument<List<String>>("adapters"))
+                        snifferScope.launch {
+                            try {
+                                val existing = sniffer
+                                if (existing != null && existing.state.value == SniffState.RUNNING) {
+                                    existing.reconfigure(SniffConfig(adapterOrder = adapters))
+                                    existing.clearSession()
+                                    existing.loadUrl(url)
+                                } else {
+                                    existing?.destroy()
+                                    val script = assets.open("sniffer/page_script.js")
+                                        .bufferedReader().use { it.readText() }
+                                    val created = SnifferWebView(applicationContext, script)
+                                    sniffer = created
+                                    created.start(SniffConfig(adapterOrder = adapters))
+                                    created.loadUrl(url)
+                                }
+                                result.success(null)
+                            } catch (e: Exception) {
+                                result.error("SNIFFER_START_FAILED", e.message, null)
+                            }
+                        }
+                    }
+                    "navigate" -> {
+                        val url = call.argument<String>("url")
+                        if (url == null) {
+                            result.error("BAD_ARGS", "url 缺失", null)
+                            return@setMethodCallHandler
+                        }
+                        val adapters = parseAdapters(call.argument<List<String>>("adapters"))
+                        snifferScope.launch {
+                            try {
+                                val existing = sniffer
+                                if (existing != null && existing.state.value == SniffState.RUNNING) {
+                                    existing.reconfigure(SniffConfig(adapterOrder = adapters))
+                                    existing.clearSession()
+                                    existing.loadUrl(url)
+                                } else {
+                                    existing?.destroy()
+                                    val script = assets.open("sniffer/page_script.js")
+                                        .bufferedReader().use { it.readText() }
+                                    val created = SnifferWebView(applicationContext, script)
+                                    sniffer = created
+                                    created.start(SniffConfig(adapterOrder = adapters))
+                                    created.loadUrl(url)
+                                }
+                                result.success(null)
+                            } catch (e: Exception) {
+                                result.error("SNIFFER_NAVIGATE_FAILED", e.message, null)
+                            }
+                        }
+                    }
+                    "stop" -> {
+                        snifferScope.launch {
+                            try {
+                                sniffer?.stop()
+                                result.success(null)
+                            } catch (e: Exception) {
+                                result.error("SNIFFER_STOP_FAILED", e.message, null)
+                            }
+                        }
+                    }
+                    "getCandidates" -> {
+                        val list = sniffer?.candidates?.value?.map {
+                            mapOf(
+                                "url" to it.url,
+                                "referer" to it.referer,
+                                "mime" to it.mime,
+                                "confidence" to it.confidence,
+                                "source" to it.source.name,
+                                "headers" to it.headers,
+                                "expiresAt" to it.expiresAt,
+                            )
+                        } ?: emptyList()
+                        result.success(list)
+                    }
+                    "dispose" -> {
+                        // 只停掉并销毁当前实例，不取消 snifferScope——浏览器关了
+                        // 再开还要用这个 scope（取消后 launch 再也不执行，
+                        // 原生会话就再也起不来了）。
+                        snifferScope.launch {
+                            try {
+                                sniffer?.stop()
+                            } catch (_: Exception) {
+                            }
+                            sniffer?.destroy()
+                            sniffer = null
+                            result.success(null)
+                        }
                     }
                     else -> result.notImplemented()
                 }

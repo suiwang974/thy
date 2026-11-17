@@ -1,0 +1,22 @@
+{
+  "id": "hanime1",
+  "displayName": "Hanime1 (hanime1.me)",
+  "hosts": [
+    "hanime1.me",
+    "www.hanime1.me"
+  ],
+  "searchMode": "sniffOnly",
+  "entryUrl": "https://hanime1.me/",
+  "mirrors": [
+    "hanimeone.me"
+  ],
+  "adapterPath": [
+    "network",
+    "serviceWorker",
+    "pageScript",
+    "videoListen",
+    "ruleConcat",
+    "blobMse"
+  ],
+  "rollbackKey": "hanime1-v1"
+}
