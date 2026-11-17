@@ -1,8 +1,12 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/services.dart';
+// get_video_thumbnail 0.9.1 只导出了 XFile，没有导出 ImageFormat，只能直接引
+// 它的 src 文件；这是该包的缺陷（连它自己 README 的示例都因此编不过）。
+// ignore: implementation_imports
+import 'package:get_video_thumbnail/src/image_format.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:taohuayuan/services/downloader.dart';
@@ -656,6 +660,144 @@ void main() {
       ),
       isNot(contains('handshake.cc')),
     );
+  });
+
+  group('封面抽帧（extractPosterFrame）', () {
+    const channelName = 'plugins.kasunthilina.dev/get_video_thumbnail';
+    final channel = const MethodChannel(channelName);
+
+    TestDefaultBinaryMessenger messenger() =>
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+
+    Map<String, dynamic>? lastArgs;
+    String mockMode = 'success';
+
+    setUp(() {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      lastArgs = null;
+      mockMode = 'success';
+      messenger().setMockMethodCallHandler(channel, (call) async {
+        if (call.method != 'file') return null;
+        final args = Map<String, dynamic>.from(call.arguments as Map);
+        lastArgs = args;
+        final callId = args['callId'] as int;
+        final fakePath = '${args['path']}/thumb.jpg';
+        final mode = mockMode;
+        // 原生侧先回 true，再异步发结果，模拟真实插件行为。
+        Future.microtask(() async {
+          final MethodCall reply;
+          switch (mode) {
+            case 'error':
+              reply = MethodCall('result#error', {
+                'result': 'boom',
+                'callId': callId,
+              });
+              break;
+            case 'empty':
+              reply = MethodCall('result#file', {
+                'result': '',
+                'callId': callId,
+              });
+              break;
+            default:
+              reply = MethodCall('result#file', {
+                'result': fakePath,
+                'callId': callId,
+              });
+          }
+          await messenger().handlePlatformMessage(
+            channelName,
+            const StandardMethodCodec().encodeMethodCall(reply),
+            (_) {},
+          );
+        });
+        return true;
+      });
+    });
+
+    tearDown(() {
+      messenger().setMockMethodCallHandler(channel, null);
+    });
+
+    test('第 39 条：抽帧成功返回原生给的封面路径，请求参数原样透传', () async {
+      final thumbDir = await Directory.systemTemp.createTemp('poster-');
+      addTearDown(() async {
+        if (await thumbDir.exists()) {
+          await thumbDir.delete(recursive: true);
+        }
+      });
+
+      const videoPath = '/tmp/fake.mp4';
+      final result = await DownloadManager.extractPosterFrame(
+        videoPath: videoPath,
+        thumbDirPath: thumbDir.path,
+      );
+
+      expect(result, '${thumbDir.path}/thumb.jpg');
+
+      final args = lastArgs;
+      expect(args, isNotNull);
+      expect(args!['video'], videoPath);
+      expect(args['format'], ImageFormat.JPEG.index);
+      expect(args['maxw'], 640);
+      expect(args['quality'], 75);
+      expect(args['timeMs'], 1000);
+      expect(args['path'], thumbDir.path);
+      // callId 是 int，且由插件生成后原样回传。
+      expect(args['callId'], isA<int>());
+    });
+
+    test('第 40 条：原生回 result#error 时抽帧返回 null', () async {
+      mockMode = 'error';
+      final thumbDir = await Directory.systemTemp.createTemp('poster-');
+      addTearDown(() async {
+        if (await thumbDir.exists()) {
+          await thumbDir.delete(recursive: true);
+        }
+      });
+
+      final result = await DownloadManager.extractPosterFrame(
+        videoPath: '/tmp/fake.mp4',
+        thumbDirPath: thumbDir.path,
+      );
+
+      expect(result, isNull);
+    });
+
+    test('第 41 条：视频路径为空时直接返回 null，且通道未被调用', () async {
+      final thumbDir = await Directory.systemTemp.createTemp('poster-');
+      addTearDown(() async {
+        if (await thumbDir.exists()) {
+          await thumbDir.delete(recursive: true);
+        }
+      });
+
+      final result = await DownloadManager.extractPosterFrame(
+        videoPath: '',
+        thumbDirPath: thumbDir.path,
+      );
+
+      expect(result, isNull);
+      // 通道一次都没被调到。
+      expect(lastArgs, isNull);
+    });
+
+    test('第 42 条：原生回空路径时抽帧返回 null', () async {
+      mockMode = 'empty';
+      final thumbDir = await Directory.systemTemp.createTemp('poster-');
+      addTearDown(() async {
+        if (await thumbDir.exists()) {
+          await thumbDir.delete(recursive: true);
+        }
+      });
+
+      final result = await DownloadManager.extractPosterFrame(
+        videoPath: '/tmp/fake.mp4',
+        thumbDirPath: thumbDir.path,
+      );
+
+      expect(result, isNull);
+    });
   });
 }
 

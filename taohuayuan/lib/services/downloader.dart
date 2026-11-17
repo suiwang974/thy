@@ -7,7 +7,11 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:video_thumbnail/video_thumbnail.dart';
+import 'package:get_video_thumbnail/get_video_thumbnail.dart';
+// get_video_thumbnail 0.9.1 只导出了 XFile，没有导出 ImageFormat，只能直接引
+// 它的 src 文件；这是该包的缺陷（连它自己 README 的示例都因此编不过）。
+// ignore: implementation_imports
+import 'package:get_video_thumbnail/src/image_format.dart';
 
 import '../models/video_item.dart';
 import 'store.dart';
@@ -540,20 +544,12 @@ class DownloadManager extends ChangeNotifier {
           (task.poster.isEmpty || task.poster.startsWith('http'))) {
         try {
           final docs = await getApplicationDocumentsDirectory();
-          final thumbDir = Directory('${docs.path}/posters');
-          if (!await thumbDir.exists()) {
-            await thumbDir.create(recursive: true);
-          }
-          final thumb = await VideoThumbnail.thumbnailFile(
-            video: finalPath,
-            thumbnailPath: thumbDir.path,
-            imageFormat: ImageFormat.JPEG,
-            maxWidth: 640,
-            quality: 75,
-            timeMs: 1000,
+          final frame = await extractPosterFrame(
+            videoPath: finalPath,
+            thumbDirPath: '${docs.path}/posters',
           );
-          if (thumb != null && thumb.isNotEmpty) {
-            task.poster = thumb;
+          if (frame != null && frame.isNotEmpty) {
+            task.poster = frame;
           }
         } catch (_) {}
       }
@@ -1381,6 +1377,33 @@ class DownloadManager extends ChangeNotifier {
       final file = File('${posterDir.path}/$safeId.jpg');
       await file.writeAsBytes(res.bodyBytes, flush: true);
       return file.path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 从本地 mp4 里抽一帧当封面（下载完成后的封面兜底）。
+  /// videoPath 为空、抽帧失败、产出路径为空时返回 null，不抛错。
+  static Future<String?> extractPosterFrame({
+    required String videoPath,
+    required String thumbDirPath,
+  }) async {
+    try {
+      if (videoPath.isEmpty) return null;
+      final thumbDir = Directory(thumbDirPath);
+      if (!await thumbDir.exists()) {
+        await thumbDir.create(recursive: true);
+      }
+      final thumb = await VideoThumbnail.thumbnailFile(
+        video: videoPath,
+        thumbnailPath: thumbDir.path,
+        imageFormat: ImageFormat.JPEG,
+        maxWidth: 640,
+        quality: 75,
+        timeMs: 1000,
+      );
+      if (thumb.path.isEmpty) return null;
+      return thumb.path;
     } catch (_) {
       return null;
     }
