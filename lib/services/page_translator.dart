@@ -295,8 +295,9 @@ class PageTranslator {
   /// 翻译单条文本并返回译文。
   ///
   /// 按顺序尝试 6 个免费接口，成功一个立即返回：
-  /// 1. Google（dict-chrome-ex）；2. Bilibili 翻译；3. Google（gtx）；
-  /// 4. 爱词霸；5. 彩云小译；6. Yandex。
+  /// 1. Bilibili 翻译；2. 爱词霸；3. 彩云小译；4. Yandex；
+  /// 5. Google（dict-chrome-ex）；6. Google（gtx）。
+  /// Google 放最后：它老是不稳定（常被拦、限流）。
   /// 某个接口失败（网络异常、超时、状态码非 200、解析失败）就换下一个；
   /// 6 个全失败则抛出 [PageTranslationException]。
   ///
@@ -309,12 +310,12 @@ class PageTranslator {
     try {
       final List<Future<String> Function()> attempts =
           <Future<String> Function()>[
-        () => _requestOnce(httpClient, text, 'dict-chrome-ex'),
         () => _requestBilibili(httpClient, text),
-        () => _requestOnce(httpClient, text, 'gtx'),
         () => _requestIciba(httpClient, text),
         () => _requestCaiyun(httpClient, text),
         () => _requestYandex(httpClient, text),
+        () => _requestOnce(httpClient, text, 'dict-chrome-ex'),
+        () => _requestOnce(httpClient, text, 'gtx'),
       ];
       for (final Future<String> Function() attempt in attempts) {
         try {

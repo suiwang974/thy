@@ -9,7 +9,7 @@ const String successResponseBody =
 
 void main() {
   group('translateOne 重试与失败', () {
-    test('首次失败后换 Bilibili 再换 gtx 成功', () async {
+    test('前面 5 个失败后走 gtx 成功', () async {
       var calls = 0;
       final mock = MockClient((http.Request request) async {
         calls++;
@@ -22,10 +22,10 @@ void main() {
       final result = await PageTranslator.translateOne('Hello', client: mock);
 
       expect(result, '你好');
-      expect(calls, 3);
+      expect(calls, 6);
     });
 
-    test('两次都失败抛异常', () async {
+    test('全部失败抛异常', () async {
       final mock = MockClient((http.Request request) async {
         return http.Response('error', 500);
       });
@@ -39,9 +39,16 @@ void main() {
 
   group('translateTexts 批量', () {
     test('去重后逐条翻，重复文本只翻一次', () async {
-      final seenQueries = <String>[];
+      var calls = 0;
       final mock = MockClient((http.Request request) async {
-        seenQueries.add(request.url.queryParameters['q'] ?? '');
+        calls++;
+        if (request.url.host == 'index-translate.bilibili.com') {
+          return http.Response(
+            '{"choices":[{"message":{"role":"assistant","content":"你好"}}]}',
+            200,
+            headers: const {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
         return http.Response(successResponseBody, 200, headers: const {'content-type': 'application/json; charset=utf-8'});
       });
 
@@ -51,7 +58,7 @@ void main() {
       );
 
       expect(result.length, 2);
-      expect(seenQueries, ['Hello', 'Hi']);
+      expect(calls, 2);
     });
 
     test('空输入直接返回空列表，不发请求', () async {

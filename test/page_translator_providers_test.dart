@@ -140,7 +140,7 @@ void main() {
   });
 
   group('translateOne 兜底链', () {
-    test('Google 与 Bilibili 失败后走 gtx 成功', () async {
+    test('前面 5 个失败后走 gtx 成功', () async {
       var calls = 0;
       final mock = MockClient((http.Request request) async {
         calls++;
@@ -159,10 +159,10 @@ void main() {
       final result = await PageTranslator.translateOne('Hello', client: mock);
 
       expect(result, '你好');
-      expect(calls, 3);
+      expect(calls, 6);
     });
 
-    test('Google 全失败后走 Bilibili 成功', () async {
+    test('首选 Bilibili 成功', () async {
       final mock = MockClient((http.Request request) async {
         if (request.url.host == 'index-translate.bilibili.com') {
           return http.Response(
