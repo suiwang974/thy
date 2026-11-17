@@ -7,10 +7,14 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_thumbnail/video_thumbnail.dart';
 
 import '../models/video_item.dart';
 import 'store.dart';
 import 'stream_resolver.dart';
+import '../transfer/concurrency_ramp.dart';
+import '../transfer/throughput_tracker.dart';
+import '../transfer/transfer_config.dart';
 import 'ts_remuxer.dart';
 
 /// 视频下载（第 27、28 条）+ 下载管理。
@@ -44,7 +48,7 @@ class DownloadTask {
   final String id; // 视频条目 id
   final String title;
   final String source;
-  final String poster;
+  String poster;
   final int durationSec;
   DownloadKind kind;
   // 续传/重解析用：原视频页（eporner 签名过期后重算直链要它）与最后一次解析到的直链。
@@ -195,9 +199,54 @@ class DownloadManager extends ChangeNotifier {
   /// 默认分段数（SniffDL range_download 的默认值；1DM 免费版上限 16）。
   static const defaultParts = 8;
   static const maxParts = 16;
-  static const minSegmentedSize = 8 * 1024 * 1024; // 8MB 以下不分段
+  static const minSegmentedSize = 2 * 1024 * 1024; // 2MB 以下不分段
   static const minSegmentSize = 2 * 1024 * 1024; // 每段至少 2MB
   static const maxConcurrentDownloads = 2;
+
+  /// HLS 分片并发起点（具名常量；自适应并发 _ramp 会按实测逐档调下一轮）。
+  static const hlsDefaultConcurrency = 8;
+
+  /// 403 换请求头恢复用的备用 UA（和传输层 SegmentDownloader.altUserAgent
+  /// 同一个：去 Referer 时顺手换个移动端 UA，别光秃秃只剩桌面 UA）。
+  static const _altUa =
+      'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+
+  /// 自适应并发（传输层 ConcurrencyRamp + ThroughputTracker 的原样接线，
+  /// 不是另起炉灶：每次下载结束记一次实测，下一轮并发按实测逐档调，
+  /// 起步 8、下限 4、上限 16；被 429/403 压制或失败率超限就减半回退。
+  /// SegmentDownloader / TransferEngine 整体没接——它们是另一套任务模型
+  /// （自带 HttpClient、批量 API、AES 解密），替换现有 _downloadMp4 /
+  /// downloadHlsFile 会丢掉 v11 合并修复、逐段记账、签名过期重拉这些
+  /// 已修好的行为；只把 ramp 这一个纯逻辑类接进来。
+  final ThroughputTracker _tracker = ThroughputTracker();
+  late final ConcurrencyRamp _ramp = ConcurrencyRamp(
+    config: const TransferConfig(
+        startConcurrency: 8, minConcurrency: 4, maxConcurrency: 16),
+    tracker: _tracker,
+  );
+
+  /// 记一次实测进跟踪器，并让自适应并发算下一轮的并发数。
+  void _recordRun({
+    required int bytes,
+    required Duration elapsed,
+    required int concurrency,
+    int status429 = 0,
+    int status403 = 0,
+    int failedSegments = 0,
+    int totalSegments = 0,
+  }) {
+    _tracker.record(RunMeasurement(
+      bytes: bytes,
+      elapsed: elapsed,
+      concurrency: concurrency,
+      status429: status429,
+      status403: status403,
+      failedSegments: failedSegments,
+      totalSegments: totalSegments,
+    ));
+    _ramp.next();
+  }
 
   final List<DownloadTask> tasks = [];
   final Map<String, _DownloadJob> _jobs = {};
@@ -329,6 +378,17 @@ class DownloadManager extends ChangeNotifier {
     );
     tasks.insert(0, task);
     _jobs[task.id] = _DownloadJob(url: url, headers: headers, task: task);
+    // 海报存本地（不阻塞下载）：存下来后把任务的 poster 指到本地路径。
+    savePosterLocally(
+      taskId: task.id,
+      posterUrl: item.poster,
+      referer: item.pageUrl,
+    ).then((local) {
+      if (local != null && local.isNotEmpty && task.poster == item.poster) {
+        task.poster = local;
+        _notifyAndPersist(persist: true);
+      }
+    }).catchError((_) {});
     _notifyAndPersist(persist: true);
     _pumpQueue();
     return task;
@@ -358,6 +418,17 @@ class DownloadManager extends ChangeNotifier {
     );
     tasks.insert(0, task);
     _jobs[task.id] = _DownloadJob(url: url, headers: headers, task: task);
+    // 海报存本地（不阻塞下载）：存下来后把任务的 poster 指到本地路径。
+    savePosterLocally(
+      taskId: task.id,
+      posterUrl: poster,
+      referer: headers['Referer'],
+    ).then((local) {
+      if (local != null && local.isNotEmpty && task.poster == poster) {
+        task.poster = local;
+        _notifyAndPersist(persist: true);
+      }
+    }).catchError((_) {});
     _notifyAndPersist(persist: true);
     _pumpQueue();
     return task;
@@ -463,6 +534,29 @@ class DownloadManager extends ChangeNotifier {
       task.progress = 1.0;
       task.downloadedBytes = task.totalBytes > 0 ? task.totalBytes : task.downloadedBytes;
       _clearSpeed(task);
+      // 封面兜底：下完的是 mp4、且海报还是空或远程地址时，从视频里抽一帧当封面。
+      // 本地海报已存下来时不动它；.ts 不抽（抽帧只认 mp4）；失败静默跳过。
+      if (finalPath.endsWith('.mp4.tmp') &&
+          (task.poster.isEmpty || task.poster.startsWith('http'))) {
+        try {
+          final docs = await getApplicationDocumentsDirectory();
+          final thumbDir = Directory('${docs.path}/posters');
+          if (!await thumbDir.exists()) {
+            await thumbDir.create(recursive: true);
+          }
+          final thumb = await VideoThumbnail.thumbnailFile(
+            video: finalPath,
+            thumbnailPath: thumbDir.path,
+            imageFormat: ImageFormat.JPEG,
+            maxWidth: 640,
+            quality: 75,
+            timeMs: 1000,
+          );
+          if (thumb != null && thumb.isNotEmpty) {
+            task.poster = thumb;
+          }
+        } catch (_) {}
+      }
       try {
         await File(finalPath).delete();
       } catch (_) {}
@@ -486,6 +580,7 @@ class DownloadManager extends ChangeNotifier {
   /// 后开的段会把先开的段已写好的数据清掉，拼出来大小对、内容是 0 洞）。
   /// 分段失败（比如中途某段拿不到 206）：删掉分段残留，单连接重下一次。
   Future<String> _downloadMp4(_DownloadJob job, String tmpPath, DownloadTask task) async {
+    final sw = Stopwatch()..start();
     final probe = await probeRange(job.url, job.headers);
     final total = probe.totalBytes;
     task.totalBytes = total;
@@ -493,8 +588,11 @@ class DownloadManager extends ChangeNotifier {
       return _downloadSingleMp4(job, tmpPath, task, total);
     }
     final useSegments = total >= minSegmentedSize;
+    // parts 上限取 defaultParts 与自适应并发当前值的较小值（起步都是 8；
+    // 上一轮被压制回退到 4 时，下一轮就只开 4 段）。
+    final partsCap = defaultParts < _ramp.current ? defaultParts : _ramp.current;
     final parts = useSegments
-        ? (total ~/ minSegmentSize).clamp(2, defaultParts)
+        ? (total ~/ minSegmentSize).clamp(2, partsCap)
         : 1;
     if (task.segmentDone.length != parts) {
       task.segmentDone = List<int>.filled(parts, 0);
@@ -506,6 +604,10 @@ class DownloadManager extends ChangeNotifier {
       bounds.add((a, i == parts - 1 ? total - 1 : b));
     }
     final job2 = job;
+    // 分段下载整程共用一个 HttpClient（连接复用/keep-alive）：
+    // 原来每段每次重试都新建 HttpClient、用完 close(force: true)，
+    // 几十个段就是几十次 TCP+TLS 握手，握手比传数据还慢。
+    final sharedClient = HttpClient();
     try {
       await _runSegments(
         parts: parts,
@@ -541,20 +643,40 @@ class DownloadManager extends ChangeNotifier {
             },
             isCancelled: () => job2.cancelled,
             retries: 3,
+            client: sharedClient,
           );
         },
       );
     } catch (e) {
       if (e is _Paused) rethrow;
-      // 分段失败：删掉分段残留，单连接重下一次。
+      // 分段失败：记一次失败实测（下一轮并发减半），删掉分段残留，单连接重下一次。
+      _recordRun(
+          bytes: task.downloadedBytes,
+          elapsed: sw.elapsed,
+          concurrency: parts,
+          failedSegments: 1,
+          totalSegments: 1);
       await deleteParts(tmpPath, parts);
       return _downloadSingleMp4(job, tmpPath, task, total);
+    } finally {
+      sharedClient.close(force: true);
     }
     await mergeParts(tmpPath, parts);
     final size = await File(tmpPath).length();
     if (total > 0 && size != total) {
+      _recordRun(
+          bytes: size,
+          elapsed: sw.elapsed,
+          concurrency: parts,
+          failedSegments: 1,
+          totalSegments: 1);
       throw StateError('合并后大小不符 $size != $total');
     }
+    _recordRun(
+        bytes: total,
+        elapsed: sw.elapsed,
+        concurrency: parts,
+        totalSegments: parts);
     return tmpPath;
   }
 
@@ -594,89 +716,162 @@ class DownloadManager extends ChangeNotifier {
     required String targetPath,
     Set<int>? alreadyDone,
     void Function(int doneCount, int totalCount, int bytesDownloaded)? onProgress,
+    void Function(int index)? onSegmentDone,
+    Future<List<String>?> Function()? refreshSegments,
+    http.Client? client,
     bool Function()? isCancelled,
+    int? concurrency,
+    void Function(
+            {required int status429,
+            required int status403,
+            required int totalSegments})? onRunStats,
   }) async {
-    final mediaUrl = await _resolveMediaPlaylist(masterUrl, headers);
-    final playlistBody = await _fetchText(mediaUrl, headers);
-    if (playlistBody.contains('#EXT-X-KEY') &&
-        !playlistBody.contains('METHOD=NONE')) {
-      throw StateError('这条是加密 HLS（AES-128），App 里下不了，只能在线看');
-    }
-    final segments = parseHlsSegments(playlistBody, mediaUrl);
-    if (segments.isEmpty) throw StateError('播放列表里没有分片');
-    final isFmp4 = playlistBody.contains('#EXT-X-MAP');
-    final tmpDir = Directory('$targetPath.segs');
-    await tmpDir.create(recursive: true);
-    final segPaths = List<String>.generate(
-        segments.length, (i) => '${tmpDir.path}/$i.ts');
-    final done = <int>{
-      for (final i in (alreadyDone ?? {}))
-        if (i < segments.length && File(segPaths[i]).existsSync()) i
-    };
-    var completed = done.length;
-    var downloaded = 0;
-    var cursor = 0;
-    Future<void> worker() async {
-      while (true) {
-        if (isCancelled != null && isCancelled()) throw _Paused();
-        var i = -1;
-        for (var k = 0; k < segments.length; k++) {
-          final idx = (cursor + k) % segments.length;
-          if (!done.contains(idx)) {
-            i = idx;
-            break;
-          }
-        }
-        if (i < 0) return;
-        cursor = (i + 1) % segments.length;
-        done.add(i); // 正在下（防重复取）
-        var ok = false;
-        for (var attempt = 0; attempt < 3 && !ok; attempt++) {
-          try {
-            final bytes = await _fetchBytes(segments[i], headers);
-            if (bytes.isEmpty) throw StateError('分片 $i 为空');
-            await File(segPaths[i]).writeAsBytes(bytes);
-            completed++;
-            downloaded += bytes.length;
-            onProgress?.call(completed, segments.length, downloaded);
-            ok = true;
-          } catch (e) {
-            if (isCancelled != null && isCancelled()) throw _Paused();
-            if (attempt == 2) rethrow;
-            await Future.delayed(Duration(seconds: 1 << attempt));
-          }
-        }
-      }
+    final ownsClient = client == null;
+    final sharedClient = client ?? http.Client();
+    // 并发 worker 数：调用方（任务层）按自适应并发给，没给就用默认 8。
+    final workers = (concurrency ?? hlsDefaultConcurrency).clamp(1, 32);
+    var seen429 = 0;
+    var seen403 = 0;
+    void countStatus(int s) {
+      if (s == 429) seen429++;
+      if (s == 403) seen403++;
     }
 
-    await Future.wait(List.generate(8, (_) => worker()));
-    // 顺序拼：fMP4 先写 init 段，再按序号拼；TS 直接按序号拼。
-    final out = await File(targetPath).open(mode: FileMode.write);
+    void reportStats(int totalSegments) {
+      onRunStats?.call(
+          status429: seen429, status403: seen403, totalSegments: totalSegments);
+    }
     try {
-      if (isFmp4) {
-        final mapUri = _parseExtXMap(playlistBody, mediaUrl);
-        if (mapUri != null) {
-          final init = await _fetchBytes(mapUri, headers);
-          await out.writeFrom(init);
+      final mediaUrl =
+          await _resolveMediaPlaylist(masterUrl, headers, client: sharedClient);
+      final playlistBody =
+          await _fetchText(mediaUrl, headers, client: sharedClient);
+      if (playlistBody.contains('#EXT-X-KEY') &&
+          !playlistBody.contains('METHOD=NONE')) {
+        throw StateError('这条是加密 HLS（AES-128），App 里下不了，只能在线看');
+      }
+      var segments = parseHlsSegments(playlistBody, mediaUrl);
+      if (segments.isEmpty) throw StateError('播放列表里没有分片');
+      final isFmp4 = playlistBody.contains('#EXT-X-MAP');
+      final tmpDir = Directory('$targetPath.segs');
+      await tmpDir.create(recursive: true);
+      var segPaths = List<String>.generate(
+          segments.length, (i) => '${tmpDir.path}/$i.ts');
+      final done = <int>{
+        for (final i in (alreadyDone ?? {}))
+          if (i < segments.length && File(segPaths[i]).existsSync()) i
+      };
+      var completed = done.length;
+      var downloaded = 0;
+      var cursor = 0;
+      // 403/连接被掐时重拉分片列表：整条下载最多重拉 1 次（多个 worker
+      // 并发时先抢到的那一个拉，标记先占上、再等结果，不重复拉）。
+      var refreshedOnce = false;
+      Future<void> worker() async {
+        while (true) {
+          if (isCancelled != null && isCancelled()) throw _Paused();
+          var i = -1;
+          for (var k = 0; k < segments.length; k++) {
+            final idx = (cursor + k) % segments.length;
+            if (!done.contains(idx)) {
+              i = idx;
+              break;
+            }
+          }
+          if (i < 0) return;
+          cursor = (i + 1) % segments.length;
+          done.add(i); // 正在下（防重复取）
+          var ok = false;
+          for (var attempt = 0; attempt < 3 && !ok; attempt++) {
+            try {
+              // 流式写盘：边收边写，不把整段先缓存在内存里。
+              final n = await _fetchBytesToFile(segments[i], headers,
+                  segPaths[i],
+                  client: sharedClient, onHttpStatus: countStatus);
+              completed++;
+              downloaded += n;
+              onSegmentDone?.call(i);
+              onProgress?.call(completed, segments.length, downloaded);
+              ok = true;
+            } catch (e) {
+              if (isCancelled != null && isCancelled()) throw _Paused();
+              if (attempt == 2) {
+                // 最后一次还失败：只对 403/连接被掐重拉一次分片列表再续传，
+                // 其他错误直接重抛。
+                if (!_isRefreshableError(e) ||
+                    refreshSegments == null ||
+                    refreshedOnce) {
+                  rethrow;
+                }
+                refreshedOnce = true;
+                final fresh = await refreshSegments.call();
+                if (fresh == null || fresh.isEmpty) rethrow;
+                segments = fresh;
+                segPaths = List<String>.generate(
+                    segments.length, (i) => '${tmpDir.path}/$i.ts');
+                done.removeWhere((idx) => idx >= segments.length);
+                completed = done.length;
+                if (i >= segments.length) return;
+                try {
+                  final n = await _fetchBytesToFile(segments[i], headers,
+                      segPaths[i],
+                      client: sharedClient, onHttpStatus: countStatus);
+                  completed++;
+                  downloaded += n;
+                  onSegmentDone?.call(i);
+                  onProgress?.call(completed, segments.length, downloaded);
+                  ok = true;
+                } catch (e2) {
+                  if (isCancelled != null && isCancelled()) throw _Paused();
+                  rethrow;
+                }
+              } else {
+                await Future.delayed(Duration(seconds: 1 << attempt));
+              }
+            }
+          }
         }
       }
-      for (var i = 0; i < segments.length; i++) {
-        final bytes = await File(segPaths[i]).readAsBytes();
-        await out.writeFrom(bytes);
+
+      await Future.wait(List.generate(workers, (_) => worker()));
+      // 顺序拼：fMP4 先写 init 段，再按序号拼；TS 直接按序号拼。
+      final out = await File(targetPath).open(mode: FileMode.write);
+      try {
+        if (isFmp4) {
+          final mapUri = _parseExtXMap(playlistBody, mediaUrl);
+          if (mapUri != null) {
+            final init = await _fetchBytes(mapUri, headers, client: sharedClient);
+            await out.writeFrom(init);
+          }
+        }
+        for (var i = 0; i < segments.length; i++) {
+          final bytes = await File(segPaths[i]).readAsBytes();
+          await out.writeFrom(bytes);
+        }
+      } finally {
+        await out.close();
       }
+      try {
+        await tmpDir.delete(recursive: true);
+      } catch (_) {}
+      // fMP4 拼出来的是 .mp4，改一下扩展名再落盘（调用方按 tmpPath 后缀定名）。
+      if (isFmp4) {
+        final mp4Path = targetPath.replaceAll(RegExp(r'\.ts\.tmp$'), '.mp4.tmp');
+        await File(targetPath).rename(mp4Path);
+        reportStats(segments.length);
+        return mp4Path;
+      }
+      reportStats(segments.length);
+      return targetPath;
     } finally {
-      await out.close();
+      if (ownsClient) sharedClient.close();
     }
-    try {
-      await tmpDir.delete(recursive: true);
-    } catch (_) {}
-    // fMP4 拼出来的是 .mp4，改一下扩展名再落盘（调用方按 tmpPath 后缀定名）。
-    if (isFmp4) {
-      final mp4Path = targetPath.replaceAll(RegExp(r'\.ts\.tmp$'), '.mp4.tmp');
-      await File(targetPath).rename(mp4Path);
-      return mp4Path;
-    }
-    return targetPath;
+  }
+
+  /// 403 或连接被掐（服务端中途断开）时才值得重拉分片列表再续传。
+  static bool _isRefreshableError(Object e) {
+    final s = e.toString();
+    return s.contains('HTTP 403') || s.contains('Connection closed');
   }
 
   /// 任务层薄壳：把任务的断点记账（segmentDone）翻译成静态函数能用的
@@ -687,49 +882,264 @@ class DownloadManager extends ChangeNotifier {
       for (var i = 0; i < task.segmentDone.length; i++)
         if (task.segmentDone[i] == 1) i
     };
-    final out = await downloadHlsFile(
-      masterUrl: job.url,
-      headers: job.headers,
-      targetPath: tmpPath,
-      alreadyDone: alreadyDone,
-      onProgress: (doneCount, totalCount, bytes) {
-        task.segmentTotal = totalCount;
-        task.downloadedBytes = bytes;
-        task.progress = totalCount > 0 ? doneCount / totalCount : 0;
-        _recordBytes(task);
-        _throttledNotify(task);
-      },
-      isCancelled: () => job.cancelled,
-    );
-    task.segmentDone = List<int>.filled(task.segmentTotal, 1);
-    task.progress = 1.0;
-    return out;
+    var persistedSegments = 0;
+    final sw = Stopwatch()..start();
+    var run429 = 0;
+    var run403 = 0;
+    var runTotal = 0;
+    // 自适应并发：本轮用 ramp 当前值，跑完按实测调下一轮。
+    final usedConcurrency = _ramp.current;
+    try {
+      final result = await downloadHlsFile(
+        masterUrl: job.url,
+        headers: job.headers,
+        targetPath: tmpPath,
+        alreadyDone: alreadyDone,
+        concurrency: usedConcurrency,
+        onRunStats: (
+            {required status429,
+            required status403,
+            required totalSegments}) {
+          run429 = status429;
+          run403 = status403;
+          runTotal = totalSegments;
+        },
+        onProgress: (doneCount, totalCount, bytes) {
+          task.segmentTotal = totalCount;
+          task.downloadedBytes = bytes;
+          task.progress = totalCount > 0 ? doneCount / totalCount : 0;
+          _recordBytes(task);
+          _throttledNotify(task);
+        },
+        onSegmentDone: (index) {
+          // 每下一好一段就记账（失败重试只补没下的段），每 10 段持久化一次。
+          while (task.segmentDone.length <= index) {
+            task.segmentDone.add(0);
+          }
+          task.segmentDone[index] = 1;
+          persistedSegments++;
+          if (persistedSegments % 10 == 0) {
+            _notifyAndPersist(persist: true);
+          }
+        },
+        refreshSegments: () async {
+          // 重拉同一条已签名的播放列表地址：临时性失败能救回来；
+          // 签名本身过期时重拉也会失败，外层会换成用户看得懂的错误。
+          try {
+            final mediaUrl =
+                await _resolveMediaPlaylist(job.url, job.headers);
+            final body = await _fetchText(mediaUrl, job.headers);
+            final fresh = parseHlsSegments(body, mediaUrl);
+            return fresh.isEmpty ? null : fresh;
+          } catch (_) {
+            return null;
+          }
+        },
+        isCancelled: () => job.cancelled,
+      );
+      task.segmentDone = List<int>.filled(task.segmentTotal, 1);
+      task.progress = 1.0;
+      _recordRun(
+          bytes: task.downloadedBytes,
+          elapsed: sw.elapsed,
+          concurrency: usedConcurrency,
+          status429: run429,
+          status403: run403,
+          totalSegments: runTotal);
+      return result;
+    } catch (e) {
+      // 暂停不是失败，不记实测、不动并发。
+      if (e is! _Paused) {
+        _recordRun(
+            bytes: task.downloadedBytes,
+            elapsed: sw.elapsed,
+            concurrency: usedConcurrency,
+            status429: run429,
+            status403: run403,
+            failedSegments: 1,
+            totalSegments: 1);
+      }
+      final s = e.toString();
+      if (s.contains('HTTP 403') || s.contains('Connection closed')) {
+        throw StateError(
+            '分片拉取失败：服务器拒绝了连接，可能是链接过期，重新打开视频页再下载');
+      }
+      rethrow;
+    }
   }
 
   /// 主播放列表 -> 选 BANDWIDTH 最大的变体；已经是媒体播放列表就原样返回。
   static Future<String> _resolveMediaPlaylist(
-      String url, Map<String, String> headers) async {
-    final body = await _fetchText(url, headers);
+      String url, Map<String, String> headers,
+      {http.Client? client}) async {
+    final body = await _fetchText(url, headers, client: client);
     if (!body.contains('#EXT-X-STREAM-INF')) return url;
     final variant = pickHlsVariant(body, url);
     if (variant == null) return url;
     return variant;
   }
 
-  static Future<String> _fetchText(String url, Map<String, String> headers) async {
-    final res = await http
-        .get(Uri.parse(url), headers: {'User-Agent': _ua, ...headers})
+  static Future<String> _fetchText(String url, Map<String, String> headers,
+      {http.Client? client}) async {
+    final uri = Uri.parse(url);
+    final requestHeaders = {'User-Agent': _ua, ...headers};
+    final res = await (client != null
+            ? client.get(uri, headers: requestHeaders)
+            : http.get(uri, headers: requestHeaders))
         .timeout(const Duration(seconds: 20));
     if (res.statusCode != 200) throw StateError('拉播放列表失败：HTTP ${res.statusCode}');
     return utf8.decode(res.bodyBytes);
   }
 
-  static Future<List<int>> _fetchBytes(String url, Map<String, String> headers) async {
-    final res = await http
-        .get(Uri.parse(url), headers: {'User-Agent': _ua, ...headers})
-        .timeout(const Duration(seconds: 30));
+  /// 读响应头 retry-after（不区分大小写；解析不到或 ≤0 按 2 秒，超 10 秒按 10 秒封顶）。
+  static int _parseRetryAfter(Map<String, String> responseHeaders) {
+    String? raw;
+    for (final entry in responseHeaders.entries) {
+      if (entry.key.toLowerCase() == 'retry-after') {
+        raw = entry.value;
+        break;
+      }
+    }
+    final seconds = int.tryParse((raw ?? '').trim());
+    if (seconds == null || seconds <= 0) return 2;
+    return seconds > 10 ? 10 : seconds;
+  }
+
+  /// 403 换请求头恢复用的第二组头（传输层 SegmentDownloader 的轮换第 2 组）：
+  /// 去掉 Referer、换备用 UA。
+  static Map<String, String> _altHeaders(Map<String, String> headers) {
+    return Map<String, String>.from(headers)
+      ..remove('Referer')
+      ..['User-Agent'] = _altUa;
+  }
+
+  static Future<List<int>> _fetchBytes(String url, Map<String, String> headers,
+      {http.Client? client, void Function(int status)? onHttpStatus}) async {
+    final uri = Uri.parse(url);
+    final requestHeaders = {'User-Agent': _ua, ...headers};
+
+    Future<http.Response> send([Map<String, String>? hdrs]) {
+      final future = client != null
+          ? client.get(uri, headers: hdrs ?? requestHeaders)
+          : http.get(uri, headers: hdrs ?? requestHeaders);
+      return future.timeout(const Duration(seconds: 30));
+    }
+
+    var res = await send();
+    if (res.statusCode != 200) onHttpStatus?.call(res.statusCode);
+    if (res.statusCode == 429 || res.statusCode == 503) {
+      final retryAfter = _parseRetryAfter(res.headers);
+      await Future<void>.delayed(Duration(seconds: retryAfter));
+      res = await send();
+      if (res.statusCode != 200) {
+        onHttpStatus?.call(res.statusCode);
+        throw StateError('HTTP ${res.statusCode} (retry-after $retryAfter)');
+      }
+      return res.bodyBytes;
+    }
+    if (res.statusCode == 403) {
+      // 403 换请求头恢复：去 Referer + 备用 UA 再试一次，仍 403 再抛。
+      res = await send(_altHeaders(headers));
+      if (res.statusCode != 200) {
+        onHttpStatus?.call(res.statusCode);
+        throw StateError('HTTP ${res.statusCode}');
+      }
+      return res.bodyBytes;
+    }
     if (res.statusCode != 200) throw StateError('HTTP ${res.statusCode}');
     return res.bodyBytes;
+  }
+
+  /// 流式下分片：边收边写文件，不把整段先缓存在内存里（HLS 分片几百个，
+  /// 每段几百 KB，全缓冲既占内存又慢）。语义与 _fetchBytes 一致：
+  /// 429/503 按 retry-after 重发一次；403 去 Referer + 备用 UA 重发一次；
+  /// 非 200 或 0 字节时删掉不完整文件再抛错（别留 0 字节段冒充下好的段）；
+  /// 返回写好的字节数。
+  static Future<int> _fetchBytesToFile(
+    String url,
+    Map<String, String> headers,
+    String targetPath, {
+    http.Client? client,
+    void Function(int status)? onHttpStatus,
+  }) async {
+    final uri = Uri.parse(url);
+    final ownsClient = client == null;
+    final sharedClient = client ?? http.Client();
+    try {
+      Future<http.StreamedResponse> send(Map<String, String> hdrs) {
+        final req = http.Request('GET', uri)..headers.addAll(hdrs);
+        return sharedClient.send(req).timeout(const Duration(seconds: 30));
+      }
+
+      final requestHeaders = {'User-Agent': _ua, ...headers};
+      Future<int> writeStream(http.StreamedResponse res) async {
+        final sink = File(targetPath).openWrite();
+        var n = 0;
+        try {
+          await for (final chunk
+              in res.stream.timeout(const Duration(seconds: 60))) {
+            sink.add(chunk);
+            n += chunk.length;
+          }
+        } finally {
+          await sink.close();
+        }
+        return n;
+      }
+
+      Future<void> dropIncomplete() async {
+        try {
+          await File(targetPath).delete();
+        } catch (_) {}
+      }
+
+      var res = await send(requestHeaders);
+      if (res.statusCode != 200) onHttpStatus?.call(res.statusCode);
+      if (res.statusCode == 429 || res.statusCode == 503) {
+        final retryAfter = _parseRetryAfter(res.headers);
+        await res.stream.drain<void>();
+        await Future<void>.delayed(Duration(seconds: retryAfter));
+        res = await send(requestHeaders);
+        if (res.statusCode != 200) {
+          onHttpStatus?.call(res.statusCode);
+          await res.stream.drain<void>();
+          throw StateError('HTTP ${res.statusCode} (retry-after $retryAfter)');
+        }
+        final n = await writeStream(res);
+        if (n == 0) {
+          await dropIncomplete();
+          throw StateError('分片为空');
+        }
+        return n;
+      }
+      if (res.statusCode == 403) {
+        await res.stream.drain<void>();
+        res = await send(_altHeaders(headers));
+        if (res.statusCode != 200) {
+          onHttpStatus?.call(res.statusCode);
+          await res.stream.drain<void>();
+          throw StateError('HTTP ${res.statusCode}');
+        }
+        final n = await writeStream(res);
+        if (n == 0) {
+          await dropIncomplete();
+          throw StateError('分片为空');
+        }
+        return n;
+      }
+      if (res.statusCode != 200) {
+        await res.stream.drain<void>();
+        throw StateError('HTTP ${res.statusCode}');
+      }
+      final n = await writeStream(res);
+      if (n == 0) {
+        await dropIncomplete();
+        throw StateError('分片为空');
+      }
+      return n;
+    } finally {
+      if (ownsClient) sharedClient.close();
+    }
   }
   static String? _parseExtXMap(String body, String baseUrl) {
     final m = RegExp(r'#EXT-X-MAP:URI="([^"]+)"').firstMatch(body);
@@ -787,6 +1197,7 @@ class DownloadManager extends ChangeNotifier {
     required void Function(int n) onBytes,
     required bool Function() isCancelled,
     int retries = 3,
+    HttpClient? client,
   }) async {
     await _downloadRange(
       url: url,
@@ -798,6 +1209,7 @@ class DownloadManager extends ChangeNotifier {
       onBytes: onBytes,
       isCancelled: isCancelled,
       retries: retries,
+      client: client,
     );
   }
 
@@ -811,6 +1223,7 @@ class DownloadManager extends ChangeNotifier {
     required void Function(int n) onBytes,
     required bool Function() isCancelled,
     int retries = 3,
+    HttpClient? client,
   }) async {
     Object? lastError;
     var written = 0; // 本次调用新写入的字节数
@@ -823,6 +1236,10 @@ class DownloadManager extends ChangeNotifier {
         throw StateError('分段续传文件不对（缺失或长度不符），删了重下');
       }
     }
+    // 共享连接：调用方传了 client 就复用它（_downloadMp4 整程共用一个，
+    // 连接复用/keep-alive）；没传就自己建一个、用完关掉（老行为）。
+    final ownsClient = client == null;
+    final sharedClient = client ?? HttpClient();
     RandomAccessFile? raf;
     try {
       // 打开一次、用到底：重试不重复打开（重复打开会再截断一次）。
@@ -833,26 +1250,23 @@ class DownloadManager extends ChangeNotifier {
       for (var attempt = 0; attempt < retries; attempt++) {
         if (isCancelled()) throw _Paused();
         try {
-          final client = HttpClient();
-          try {
-            final req = await client.getUrl(Uri.parse(url));
-            req.headers.set('User-Agent', _ua);
-            headers.forEach((k, v) => req.headers.set(k, v));
-            req.headers
-                .set('Range', 'bytes=${start + writeOffset + written}-$end');
-            final res = await req.close().timeout(const Duration(seconds: 60));
-            if (res.statusCode != 206) {
-              throw StateError('分段响应码 ${res.statusCode}（服务器不支持 Range）');
-            }
-            await for (final chunk in res.timeout(const Duration(seconds: 60))) {
-              if (isCancelled()) throw _Paused();
-              await raf.writeFrom(chunk);
-              written += chunk.length;
-              onBytes(chunk.length);
-            }
-          } finally {
-            client.close(force: true);
+          final req = await sharedClient.getUrl(Uri.parse(url));
+          req.headers.set('User-Agent', _ua);
+          headers.forEach((k, v) => req.headers.set(k, v));
+          req.headers
+              .set('Range', 'bytes=${start + writeOffset + written}-$end');
+          final res = await req.close().timeout(const Duration(seconds: 60));
+          if (res.statusCode != 206) {
+            throw StateError('分段响应码 ${res.statusCode}（服务器不支持 Range）');
           }
+          await for (final chunk in res.timeout(const Duration(seconds: 60))) {
+            if (isCancelled()) throw _Paused();
+            await raf.writeFrom(chunk);
+            written += chunk.length;
+            onBytes(chunk.length);
+          }
+          // 注意：这里不关 sharedClient——重试还要复用它；自有连接在
+          // 外层 finally 里统一关，调用方传进来的绝不关。
           // 每段完整性校验（抄 SniffDL：got 必须等于 want，否则这段不算完）。
           if (written != expected) {
             throw StateError('分段不完整 $written/$expected');
@@ -867,6 +1281,7 @@ class DownloadManager extends ChangeNotifier {
         }
       }
     } finally {
+      if (ownsClient) sharedClient.close(force: true);
       await raf?.close();
     }
     throw lastError ?? StateError('分段下载失败');
@@ -921,6 +1336,53 @@ class DownloadManager extends ChangeNotifier {
       return const RangeProbe(false, 0);
     } finally {
       client.close(force: true);
+    }
+  }
+
+  /// 海报图存本地（封面本地化）：把远程 poster URL 的图片用带 UA + Referer
+  /// 的请求下到应用文档目录 `posters/<taskId>.jpg`，返回本地绝对路径；
+  /// 拿不到（空地址、data: 占位、非 200、非图片、异常）返回 null，不抛错。
+  /// fetchImage 可注入（单元测试用假响应，不真联网）。
+  static Future<String?> savePosterLocally({
+    required String taskId,
+    required String posterUrl,
+    String? referer,
+    Future<http.Response> Function(Uri url, Map<String, String> headers)?
+        fetchImage,
+  }) async {
+    try {
+      if (posterUrl.isEmpty || posterUrl.startsWith('data:')) return null;
+      final uri = Uri.tryParse(posterUrl);
+      if (uri == null) return null;
+      final headers = <String, String>{
+        'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        if (referer != null && referer.isNotEmpty) 'Referer': referer,
+      };
+      final res = fetchImage != null
+          ? await fetchImage(uri, headers).timeout(const Duration(seconds: 8))
+          : await http
+              .get(uri, headers: headers)
+              .timeout(const Duration(seconds: 8));
+      if (res.statusCode != 200) return null;
+      final contentType = (res.headers['content-type'] ??
+              res.headers['Content-Type'] ??
+              '')
+          .toLowerCase()
+          .trim();
+      if (!contentType.startsWith('image/')) return null;
+      final safeId = taskId.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+      final docs = await getApplicationDocumentsDirectory();
+      final posterDir = Directory('${docs.path}/posters');
+      if (!await posterDir.exists()) {
+        await posterDir.create(recursive: true);
+      }
+      final file = File('${posterDir.path}/$safeId.jpg');
+      await file.writeAsBytes(res.bodyBytes, flush: true);
+      return file.path;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -1028,6 +1490,8 @@ class DownloadManager extends ChangeNotifier {
       usedParts = (total ~/ minSegmentSize).clamp(2, parts);
       final done = List<int>.filled(usedParts, 0);
       var next = 0;
+      // 分段整程共用一个 HttpClient（连接复用），同 _downloadMp4。
+      final sharedClient = HttpClient();
       Future<void> worker() async {
         while (true) {
           final i = next++;
@@ -1047,6 +1511,7 @@ class DownloadManager extends ChangeNotifier {
               onProgress(done.fold(0, (s, e) => s + e), total);
             },
             isCancelled: cancelled,
+            client: sharedClient,
           );
         }
       }
@@ -1058,6 +1523,8 @@ class DownloadManager extends ChangeNotifier {
         // 分段失败（比如中途某段拿不到 206）：删掉残留，单连接重下一次。
         await deleteParts(targetPath, usedParts);
         return single();
+      } finally {
+        sharedClient.close(force: true);
       }
       await mergeParts(targetPath, usedParts);
       final size = await File(targetPath).length();

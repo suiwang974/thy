@@ -243,7 +243,7 @@ class _ShortsScreenState extends State<ShortsScreen> {
     final rotation = widget.store.shortsRotation + 1;
     await widget.store.setShortsRotation(rotation);
     final feed = await SearchService(disabledSources: widget.store.disabledSources)
-        .homeFeed(rotation: rotation);
+        .homeFeed(rotation: rotation, firstSourceId: 'rule34videos');
     if (!mounted) return;
     final base = feed.where(isShortForShorts).toList();
     final start =
@@ -294,7 +294,7 @@ class _ShortsScreenState extends State<ShortsScreen> {
     final rotation = widget.store.shortsRotation + 1;
     await widget.store.setShortsRotation(rotation);
     final feed = await SearchService(disabledSources: widget.store.disabledSources)
-        .homeFeed(rotation: rotation);
+        .homeFeed(rotation: rotation, firstSourceId: 'rule34videos');
     if (!mounted || gen != _feedGen) {
       _refreshing = false;
       return;

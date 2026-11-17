@@ -108,6 +108,10 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   List<SniffedMedia> _nativeSniffed = [];
   // 已拉过播放列表富化的原生 m3u8 地址（按去 # 后的地址记，只富化一次）。
   final _enrichedNativeUrls = <String>{};
+  // 原生富化失败重试计数（按去 # 后的地址记；超过 3 次就放弃，不无限重试）。
+  final _nativeEnrichAttempts = <String, int>{};
+  // 轮询攒下来的 video 元素实测元数据（地址归一化后记，供下次嗅探时传入）。
+  final _pollDomMeta = <String, DomVideoMeta>{};
   // 拉播放列表用的 UA（与 Sniffer._ua 一致）。
   static const _ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -293,8 +297,18 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       final decoded = jsonDecode(raw.toString()) as Map<String, dynamic>;
       var changed = false;
       for (final v in (decoded['videos'] as List?) ?? []) {
-        final src = ((v as Map)['src'] ?? '').toString();
+        final vm = v as Map;
+        final src = (vm['src'] ?? '').toString();
         if (src.isNotEmpty && _accumulated.add(src)) changed = true;
+        final vw = (vm['videoWidth'] as num?)?.toInt() ?? 0;
+        final vh = (vm['videoHeight'] as num?)?.toInt() ?? 0;
+        final dur = (vm['duration'] as num?)?.toDouble() ?? 0;
+        if (vw > 0 && vh > 0) {
+          _pollDomMeta[Sniffer.normalizeUrl(src)] = DomVideoMeta(
+            resolution: '${vw}x$vh',
+            durationSec: dur > 0 && dur.isFinite ? dur.round() : null,
+          );
+        }
       }
       for (final r in (decoded['resources'] as List?) ?? []) {
         final u = r.toString();
@@ -311,6 +325,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
     }
     unawaited(_enrichNativeHls());
+    unawaited(_enrichNativeMp4());
   }
 
   /// 撞上验证页/加载失败时切另一个镜像（只切没试过的，两个都试过了就停）。
@@ -536,6 +551,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
         _controller,
         pageUrl: _currentUrl,
         extraCandidates: _accumulated.toList(),
+        extraDomMeta: _pollDomMeta,
       );
       if (!mounted) return;
       setState(() {
@@ -556,10 +572,37 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
     }
     unawaited(_enrichNativeHls());
+    unawaited(_enrichNativeMp4());
+  }
+
+  /// 把同地址 Dart 条目的元数据抄到原生条目上（只补空项，不覆盖已有的）。
+  static SniffedMedia _fillFromDart(SniffedMedia cur, SniffedMedia dart) {
+    return cur.copyWith(
+      sizeBytes: cur.sizeBytes ?? dart.sizeBytes,
+      resolution: cur.resolution ?? dart.resolution,
+      durationSec: cur.durationSec ?? dart.durationSec,
+      bandwidth: cur.bandwidth ?? dart.bandwidth,
+      estimatedSizeBytes: cur.estimatedSizeBytes ?? dart.estimatedSizeBytes,
+      metaNote: cur.metaNote ?? dart.metaNote,
+      segmentCount:
+          cur.segmentCount > 0 ? cur.segmentCount : dart.segmentCount,
+    );
+  }
+
+  /// 两条元数据有没有实质差别（富化后变了才 setState，别每轮都刷新）。
+  static bool _metaDiffers(SniffedMedia a, SniffedMedia b) {
+    return a.sizeBytes != b.sizeBytes ||
+        a.resolution != b.resolution ||
+        a.durationSec != b.durationSec ||
+        a.bandwidth != b.bandwidth ||
+        a.estimatedSizeBytes != b.estimatedSizeBytes ||
+        a.metaNote != b.metaNote ||
+        a.segmentCount != b.segmentCount;
   }
 
   /// 原生 m3u8 缺元数据时富化：先抄同地址 Dart 条目的元数据（不联网），
-  /// 还没有就拉一次播放列表解析后填上。按地址缓存，只富化一次；
+  /// 还没有就拉一次播放列表解析后填上。失败不记“已富化”，下次轮询再试，
+  /// 最多试 3 次；3 次都拿不到就把原因写到条目上，别永远未知。
   /// 失败就留空（显示“未知”），不抛错、不挡展示。
   Future<void> _enrichNativeHls() async {
     try {
@@ -571,36 +614,44 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       final next = <SniffedMedia>[];
       var changed = false;
       for (final m in _nativeSniffed) {
-        if (m.kind != 'm3u8' || m.resolution != null || m.durationSec != null) {
+        if (m.kind != 'm3u8') {
           next.add(m);
           continue;
         }
         final key = _stripFragment(m.url);
+        var cur = m;
         final dart = dartByUrl[key];
-        if (dart != null &&
-            (dart.resolution != null || dart.durationSec != null)) {
-          next.add(m.copyWith(
-            resolution: dart.resolution ?? m.resolution,
-            bandwidth: dart.bandwidth ?? m.bandwidth,
-            estimatedSizeBytes: dart.estimatedSizeBytes ?? m.estimatedSizeBytes,
-            durationSec: dart.durationSec ?? m.durationSec,
-            segmentCount:
-                dart.segmentCount > 0 ? dart.segmentCount : m.segmentCount,
-          ));
-          changed = true;
+        if (dart != null) {
+          final filled = _fillFromDart(cur, dart);
+          if (_metaDiffers(filled, cur)) changed = true;
+          cur = filled;
+        }
+        if (cur.resolution != null || cur.durationSec != null) {
+          next.add(cur);
           continue;
         }
         if (_enrichedNativeUrls.contains(key)) {
-          next.add(m);
+          next.add(cur);
           continue;
         }
-        _enrichedNativeUrls.add(key);
-        final fetched = await _fetchHlsMeta(m);
+        final attempts = (_nativeEnrichAttempts[key] ?? 0) + 1;
+        _nativeEnrichAttempts[key] = attempts;
+        if (attempts > 3) {
+          // 给过 3 次机会还拿不到：记成已富化，原因写到条目上，别永远未知。
+          _enrichedNativeUrls.add(key);
+          final failed =
+              cur.copyWith(metaNote: cur.metaNote ?? '播放列表拉取失败');
+          if (_metaDiffers(failed, cur)) changed = true;
+          next.add(failed);
+          continue;
+        }
+        final fetched = await _fetchHlsMeta(cur);
         if (fetched != null) {
+          _enrichedNativeUrls.add(key);
+          if (_metaDiffers(fetched, cur)) changed = true;
           next.add(fetched);
-          changed = true;
         } else {
-          next.add(m);
+          next.add(cur);
         }
       }
       if (changed && mounted) {
@@ -611,7 +662,65 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     }
   }
 
-  /// 拉一次播放列表，解析出分辨率/码率/时长/预估大小；拿不到返回 null。
+  /// 原生 mp4/webm/mov 缺大小时富化：先抄同地址 Dart 条目，没有再 HEAD
+  /// 探一次 Content-Length。按地址缓存，只富化一次；失败留空，不挡展示。
+  Future<void> _enrichNativeMp4() async {
+    try {
+      if (_nativeSniffed.isEmpty) return;
+      final dartByUrl = <String, SniffedMedia>{};
+      for (final d in _sniffed) {
+        dartByUrl[_stripFragment(d.url)] = d;
+      }
+      final next = <SniffedMedia>[];
+      var changed = false;
+      for (final m in _nativeSniffed) {
+        if (m.kind != 'mp4' && m.kind != 'webm' && m.kind != 'mov') {
+          next.add(m);
+          continue;
+        }
+        final key = _stripFragment(m.url);
+        var cur = m;
+        final dart = dartByUrl[key];
+        if (dart != null) {
+          final filled = _fillFromDart(cur, dart);
+          if (_metaDiffers(filled, cur)) changed = true;
+          cur = filled;
+        }
+        if (cur.sizeBytes != null) {
+          next.add(cur);
+          continue;
+        }
+        if (_enrichedNativeUrls.contains(key)) {
+          next.add(cur);
+          continue;
+        }
+        final attempts = (_nativeEnrichAttempts[key] ?? 0) + 1;
+        _nativeEnrichAttempts[key] = attempts;
+        if (attempts > 3) {
+          _enrichedNativeUrls.add(key);
+          next.add(cur);
+          continue;
+        }
+        final size =
+            await Sniffer.probeHeadSize(m.url, {'Referer': _currentUrl});
+        if (size != null) {
+          _enrichedNativeUrls.add(key);
+          final sized = cur.copyWith(sizeBytes: size);
+          if (_metaDiffers(sized, cur)) changed = true;
+          next.add(sized);
+        } else {
+          next.add(cur);
+        }
+      }
+      if (changed && mounted) {
+        setState(() => _nativeSniffed = next);
+      }
+    } catch (_) {
+      // 富化失败静默忽略，不影响展示。
+    }
+  }
+
+  /// 拉一次播放列表，用共享解析拿分辨率/码率/时长/预估大小；拿不到返回 null。
   Future<SniffedMedia?> _fetchHlsMeta(SniffedMedia m) async {
     try {
       final headers = {'User-Agent': _ua, 'Referer': _currentUrl};
@@ -619,33 +728,31 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           .get(Uri.parse(m.url), headers: headers)
           .timeout(const Duration(seconds: 8));
       if (res.statusCode != 200) return null;
-      var body = utf8.decode(res.bodyBytes);
-      String? resolution;
-      int? bandwidth;
-      if (body.contains('#EXT-X-STREAM-INF')) {
-        final variants = HlsPlaylist.parseMaster(body, m.url);
-        final picked = HlsPlaylist.pickVariant(variants);
-        if (picked == null) return null;
-        resolution = picked.resolution.isEmpty ? null : picked.resolution;
-        bandwidth = picked.bandwidth <= 0 ? null : picked.bandwidth;
-        final vres = await http
-            .get(Uri.parse(picked.url), headers: headers)
-            .timeout(const Duration(seconds: 8));
-        if (vres.statusCode != 200) return null;
-        body = utf8.decode(vres.bodyBytes);
-      }
-      final (dur, count) = Sniffer.parseM3u8Durations(body);
-      final durationSec = dur > 0 ? dur : m.durationSec;
+      final body = utf8.decode(res.bodyBytes);
+      final meta = await HlsPlaylist.resolveVariantMeta(
+        masterBody: body,
+        masterUrl: m.url,
+        fetch: (u) async {
+          final r = await http
+              .get(Uri.parse(u), headers: headers)
+              .timeout(const Duration(seconds: 8));
+          if (r.statusCode != 200) throw StateError('HTTP ${r.statusCode}');
+          return utf8.decode(r.bodyBytes);
+        },
+      );
+      final durationSec = meta.durationSec ?? m.durationSec;
       final estimatedSizeBytes =
-          (bandwidth != null && durationSec != null && durationSec > 0)
-              ? bandwidth ~/ 8 * durationSec
-              : null;
+          (meta.bandwidth != null && durationSec != null && durationSec > 0)
+              ? meta.bandwidth! ~/ 8 * durationSec
+              : m.estimatedSizeBytes;
       return m.copyWith(
-        resolution: resolution ?? m.resolution,
-        bandwidth: bandwidth ?? m.bandwidth,
+        resolution: meta.resolution ?? m.resolution,
+        bandwidth: meta.bandwidth ?? m.bandwidth,
         estimatedSizeBytes: estimatedSizeBytes ?? m.estimatedSizeBytes,
         durationSec: durationSec,
-        segmentCount: count > 0 ? count : m.segmentCount,
+        segmentCount:
+            meta.segmentCount > 0 ? meta.segmentCount : m.segmentCount,
+        metaNote: meta.metaNote ?? m.metaNote,
       );
     } catch (_) {
       return null;
@@ -654,18 +761,27 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
 
   /// 合并展示：原生候选在前（有真实请求头、六路全开），旧嗅探去重后在后。
   /// 按地址去重（小写、去 # 后缀），同一地址只留原生那条。
-  /// 原生 m3u8 缺元数据时，用同地址 Dart 条目的元数据补全（copyWith）。
+  /// 原生条目缺元数据时，用同地址 Dart 条目的元数据补全（copyWith）。
   List<SniffedMedia> _mergedSniffed() {
     final out = <SniffedMedia>[];
     final nativeUrls = <String>{};
     for (final m in _nativeSniffed) {
       final key = _stripFragment(m.url);
       nativeUrls.add(key);
-      if (m.kind == 'm3u8' && m.resolution == null && m.durationSec == null) {
+      if ((m.kind == 'm3u8' ||
+              m.kind == 'mp4' ||
+              m.kind == 'webm' ||
+              m.kind == 'mov') &&
+          m.resolution == null &&
+          m.durationSec == null &&
+          m.sizeBytes == null) {
         SniffedMedia? dartMeta;
         for (final d in _sniffed) {
           if (_stripFragment(d.url) == key &&
-              (d.resolution != null || d.durationSec != null)) {
+              (d.resolution != null ||
+                  d.durationSec != null ||
+                  d.sizeBytes != null ||
+                  d.estimatedSizeBytes != null)) {
             dartMeta = d;
             break;
           }
@@ -677,6 +793,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
             estimatedSizeBytes:
                 dartMeta.estimatedSizeBytes ?? m.estimatedSizeBytes,
             durationSec: dartMeta.durationSec ?? m.durationSec,
+            sizeBytes: dartMeta.sizeBytes ?? m.sizeBytes,
+            metaNote: dartMeta.metaNote ?? m.metaNote,
             segmentCount: dartMeta.segmentCount > 0
                 ? dartMeta.segmentCount
                 : m.segmentCount,
@@ -833,8 +951,14 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   /// 某条目的下载请求头：原生候选走原生侧记到的真实请求头
   /// （含 Referer/UA/Cookie 上下文，403 恢复靠它）；旧嗅探的条目
   /// 沿用原来的 pageUrl 当 Referer。
-  Map<String, String> _headersFor(String url) =>
-      _bridge.headersFor(url) ?? {'Referer': _currentUrl};
+  /// 注意：原生侧没记到 Referer 时也要补上当前页地址——只靠 ?? 兜底
+  /// 是不够的，原生侧返回空 Map（非 null）时 ?? 根本触发不了。
+  Map<String, String> _headersFor(String url) {
+    final fromBridge = _bridge.headersFor(url);
+    final out = <String, String>{...?fromBridge};
+    out.putIfAbsent('Referer', () => _currentUrl);
+    return out;
+  }
 
   @override
   Widget build(BuildContext context) {

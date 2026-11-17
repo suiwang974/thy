@@ -320,6 +320,47 @@ void main() {
     expect(items.map((i) => i.id), ['n2']);
   }, timeout: const Timeout(Duration(seconds: 30)));
 
+  group('短视频排序：rule34videos 排第一（firstSourceId）', () {
+    VideoItem sv(String id, String source) =>
+        VideoItem(id: id, title: id, source: source, durationSec: 60);
+
+    test('传 firstSourceId：rule34 条目在最前，其余相对顺序不变', () async {
+      final svc = SearchService(sources: [
+        FakeSource('s1', items: [sv('a1', 's1'), sv('a2', 's1')]),
+        FakeSource('rule34videos',
+            delay: const Duration(milliseconds: 150),
+            items: [sv('r1', 'rule34videos'), sv('r2', 'rule34videos')]),
+        FakeSource('s2',
+            delay: const Duration(milliseconds: 50),
+            items: [sv('b1', 's2')]),
+      ]);
+      // 不传：按完成先后，rule34 最慢、排最后。
+      final plain = await svc.homeFeed();
+      expect(plain.map((i) => i.id), ['a1', 'a2', 'b1', 'r1', 'r2']);
+      // 传了：rule34 跳到最前，其余 a1/a2/b1 相对顺序不变。
+      final sorted = await svc.homeFeed(firstSourceId: 'rule34videos');
+      expect(sorted.map((i) => i.id), ['r1', 'r2', 'a1', 'a2', 'b1']);
+    });
+
+    test('firstSourceId 指到不存在的源：顺序不变，不崩', () async {
+      final svc = SearchService(sources: [
+        FakeSource('s1', items: [sv('a1', 's1')]),
+        FakeSource('s2', items: [sv('b1', 's2')]),
+      ]);
+      final feed = await svc.homeFeed(firstSourceId: 'no-such-source');
+      expect(feed.map((i) => i.id), ['a1', 'b1']);
+    });
+
+    test('rule34 没返回条目：不崩，其他源正常排', () async {
+      final svc = SearchService(sources: [
+        FakeSource('s1', items: [sv('a1', 's1')]),
+        const FakeSource('rule34videos'),
+      ]);
+      final feed = await svc.homeFeed(firstSourceId: 'rule34videos');
+      expect(feed.map((i) => i.id), ['a1']);
+    });
+  });
+
 }
 
 /// 按词/页返回不同条目的假源：验 homeFeed 轮换是不是真换了批。

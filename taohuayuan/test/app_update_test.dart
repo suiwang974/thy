@@ -98,7 +98,8 @@ void main() {
   });
 
   test('第 50 条：分段数跟视频下载同一套数', () {
-    expect(AppUpdateService.computeParts(5 * 1024 * 1024), 1); // 8MB 以下不分段
+    expect(AppUpdateService.computeParts(1 * 1024 * 1024), 1); // 2MB 以下不分段
+    expect(AppUpdateService.computeParts(5 * 1024 * 1024), 2); // 5MB：2 段
     expect(AppUpdateService.computeParts(21 * 1024 * 1024), 8); // 21MB：10 段封顶 8
     expect(AppUpdateService.computeParts(8 * 1024 * 1024), 4);
   });

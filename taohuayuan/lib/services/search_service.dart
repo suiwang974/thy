@@ -337,6 +337,7 @@ class SearchService {
     void Function(List<VideoItem> partial)? onResult,
     void Function(List<VideoItem> extra)? onRetried,
     int rotation = 0,
+    String? firstSourceId,
   }) async {
     final items = <VideoItem>[];
     final failed = <Source>[];
@@ -365,7 +366,19 @@ class SearchService {
         unawaited(_retryHome(s, onRetried, rotation));
       }
     }
-    return dedupeById(items);
+    final result = dedupeById(items);
+    if (firstSourceId == null || firstSourceId.isEmpty) return result;
+    // 稳定分区：只按来源排，条目之间的相对顺序不变。
+    final first = <VideoItem>[];
+    final rest = <VideoItem>[];
+    for (final it in result) {
+      if (it.source == firstSourceId) {
+        first.add(it);
+      } else {
+        rest.add(it);
+      }
+    }
+    return [...first, ...rest];
   }
 
   Future<void> _retryHome(

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../models/video_item.dart';
@@ -10,16 +12,30 @@ class PosterThumb extends StatelessWidget {
   final double? width;
   const PosterThumb({super.key, required this.item, this.height, this.width});
 
+  /// 封面来源分支（纯函数，供单元测试直接验分支判定，不用真的解码图片）：
+  /// 'asset' 本地资源 / 'http' 远程地址 / 'file' 本地文件路径 / 'none' 无封面。
+  static String posterKind(String poster) {
+    if (poster.startsWith('assets/')) return 'asset';
+    if (poster.startsWith('http')) return 'http';
+    if (poster.startsWith('/')) return 'file';
+    return 'none';
+  }
+
   @override
   Widget build(BuildContext context) {
     final poster = item.poster;
     Widget child;
-    if (poster.startsWith('assets/')) {
+    final kind = posterKind(poster);
+    if (kind == 'asset') {
       child = Image.asset(poster,
           width: width, height: height, fit: BoxFit.cover,
           errorBuilder: (_, _, _) => _textCard(context));
-    } else if (poster.startsWith('http')) {
+    } else if (kind == 'http') {
       child = Image.network(poster,
+          width: width, height: height, fit: BoxFit.cover,
+          errorBuilder: (_, _, _) => _textCard(context));
+    } else if (kind == 'file') {
+      child = Image.file(File(poster),
           width: width, height: height, fit: BoxFit.cover,
           errorBuilder: (_, _, _) => _textCard(context));
     } else {

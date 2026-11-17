@@ -6,6 +6,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../transfer/hls_playlist.dart';
 import 'downloader.dart';
+import 'stream_resolver.dart';
 
 /// 网页嗅探（第 34 条，2026-11-09 用户纠正：不是“太弱”，是根本就没有；
 /// 第 53 条重写：视频正在播也嗅不到，用户发火）。
@@ -69,6 +70,7 @@ class SniffedMedia {
   final String? resolution; // 如 "1920x1080"，无则 null
   final int? bandwidth; // bps，无则 null
   final int? estimatedSizeBytes; // 预估大小字节数，无则 null
+  final String? metaNote; // 失败原因显示文案（只用于显示，不影响 downloadable）
 
   const SniffedMedia({
     required this.url,
@@ -81,6 +83,7 @@ class SniffedMedia {
     this.resolution,
     this.bandwidth,
     this.estimatedSizeBytes,
+    this.metaNote,
   });
 
   SniffedMedia copyWith({
@@ -94,6 +97,7 @@ class SniffedMedia {
     String? resolution,
     int? bandwidth,
     int? estimatedSizeBytes,
+    String? metaNote,
   }) {
     return SniffedMedia(
       url: url ?? this.url,
@@ -106,6 +110,7 @@ class SniffedMedia {
       resolution: resolution ?? this.resolution,
       bandwidth: bandwidth ?? this.bandwidth,
       estimatedSizeBytes: estimatedSizeBytes ?? this.estimatedSizeBytes,
+      metaNote: metaNote ?? this.metaNote,
     );
   }
 
@@ -159,8 +164,9 @@ class SniffedMedia {
     return '$m:${r.toString().padLeft(2, '0')}';
   }
 
-  /// 清单里的一行说明：分辨率 · 大小/预估大小 · 时长 · 分片数（有的才写）。
-  /// m3u8 啥都没有时显示“时长未知 · 分辨率未知”。
+  /// 清单里的一行说明：分辨率/码率 · 大小/预估大小 · 时长 · 分片数（有的才写）。
+  /// m3u8/mp4/webm/mov 全空时显示“未知”：m3u8 是“时长未知 · 分辨率未知”，
+  /// mp4/webm/mov 再加“大小未知”；失败原因（metaNote）有就带上。
   String get detailLine {
     final res = resolutionText;
     final sz = sizeText;
@@ -170,18 +176,32 @@ class SniffedMedia {
     final r = resolution;
     final noDuration = d == null || d <= 0;
     final noResolution = r == null || r.isEmpty;
-    if (kind == 'm3u8' &&
+    final noBandwidth = bandwidth == null || bandwidth! <= 0;
+    if ((kind == 'm3u8' ||
+            kind == 'mp4' ||
+            kind == 'webm' ||
+            kind == 'mov') &&
         noDuration &&
         noResolution &&
         sz.isEmpty &&
-        est.isEmpty) {
+        est.isEmpty &&
+        noBandwidth) {
       final parts = <String>['时长未知', '分辨率未知'];
+      if (kind == 'mp4' || kind == 'webm' || kind == 'mov') {
+        parts.add('大小未知');
+      }
       if (segmentCount > 0) parts.add('$segmentCount 个分片');
+      if (metaNote != null) parts.add(metaNote!);
       if (note != null) parts.add(note!);
       return parts.join(' · ');
     }
     final parts = <String>[];
-    if (res.isNotEmpty) parts.add(res);
+    if (res.isNotEmpty) {
+      parts.add(res);
+    } else if (!noBandwidth) {
+      // 没分辨率但码率已知：码率就是质量信号，显示出来别藏着。
+      parts.add('约 ${(bandwidth! / 1000000).toStringAsFixed(1)} Mbps');
+    }
     if (sz.isNotEmpty) {
       parts.add(sz);
     } else if (est.isNotEmpty) {
@@ -190,6 +210,7 @@ class SniffedMedia {
     if (dur.isNotEmpty) parts.add(dur);
     if (segmentCount > 0) parts.add('$segmentCount 个分片');
     if (kind == 'ts') parts.add('分段视频');
+    if (metaNote != null) parts.add(metaNote!);
     if (note != null) parts.add(note!);
     return parts.join(' · ');
   }
@@ -248,6 +269,7 @@ class SniffDiagnosis {
   final List<String> iframeSrcs; // 跨域 iframe 的 src（最多记 3 个）
   final int htmlMediaCount; // HTML 正则扫到的媒体地址数
   final String? jsError; // JS 求值本身抛错（之前是静默吞掉）
+  final int previewFilteredCount; // 被当成预览/广告短片过滤掉的候选地址数
 
   const SniffDiagnosis({
     this.videoCount = 0,
@@ -259,6 +281,7 @@ class SniffDiagnosis {
     this.iframeSrcs = const [],
     this.htmlMediaCount = 0,
     this.jsError,
+    this.previewFilteredCount = 0,
   });
 
   /// 像播放器的跨域 iframe 地址（能一键打开它再嗅）：
@@ -299,6 +322,10 @@ class SniffDiagnosis {
   String get text {
     if (jsError != null && jsError!.isNotEmpty) {
       return '嗅探脚本在页面里执行失败（$jsError）：没查到任何东西，不是页面没有视频，是嗅探本身没跑起来。退出重进一次再试。';
+    }
+    // 只嗅到预览：诊断只在没嗅到正片时展示，所以这里直接说清，不装作没嗅到。
+    if (previewFilteredCount > 0) {
+      return '本页只嗅到预览短片，没找到正片：$previewFilteredCount 个预览/广告地址已过滤掉。正片可能要等播放器加载出来，点开播一次再嗅。';
     }
     final parts = <String>['查了本页：'];
     if (videoCount == 0) {
@@ -345,21 +372,66 @@ class SniffResult {
       this.pagePoster = '']);
 }
 
+/// 单个 video 元素实测的元数据（videoWidth/videoHeight、duration）。
+class DomVideoMeta {
+  final String? resolution; // 如 '1920x1080'，无则 null
+  final int? durationSec;
+  const DomVideoMeta({this.resolution, this.durationSec});
+}
+
+/// 页面级视频信息（og:video 或 JSON-LD VideoObject）。
+class PageVideoMeta {
+  final String? videoUrl; // og:video 或 VideoObject 的 contentUrl/embedUrl
+  final String? resolution;
+  final int? durationSec;
+  const PageVideoMeta({this.videoUrl, this.resolution, this.durationSec});
+}
+
 class Sniffer {
   static const _ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
   /// 排除：缩略图预览、广告域名（和 StreamResolver.genericMediaScan 同一套词）。
+  /// 预览标记按 URL 路径段判（不是任意子串），规则见 isPreviewUrl：
+  /// 路径段恰好叫 preview 的正片页（如 /videos/preview/12345.mp4）不排除。
   static bool isExcludedUrl(String url) {
     final l = url.toLowerCase();
     return l.contains('thumb') ||
         l.contains('.t.mp4') ||
-        l.contains('preview') ||
+        isPreviewUrl(url) ||
         l.contains('googletag') ||
         l.contains('doubleclick') ||
         l.contains('googleads') ||
         l.contains('adsystem') ||
         l.contains('adservice');
+  }
+
+  /// 预览/广告短片判定（只看 URL 路径段，不看标题）：
+  /// - 任一段 == 'pre_videos'（Pornhub 预览 CDN 路径段，如
+  ///   .../pre_videos/003/003/832/3003832/mp4_720p...）；
+  /// - 任一段 == 'trailer'，或以 'trailer_' / 'trailer-' / 'trailer.' 开头；
+  /// - 任一段以 'preview_' / 'preview-' / 'preview.' 开头，或含 '_preview'
+  ///   （preview_720p.mp4、x_preview.mp4、video_preview.mp4 这类文件名）；
+  /// - 裸一段 == 'preview'（只是路由/目录段）不算，避免错杀正片。
+  static bool isPreviewUrl(String url) {
+    final l = url.toLowerCase();
+    final path = Uri.tryParse(l)?.path ?? l.split('?').first;
+    for (final seg in path.split('/')) {
+      if (seg == 'pre_videos') return true;
+      if (seg == 'trailer' ||
+          seg.startsWith('trailer_') ||
+          seg.startsWith('trailer-') ||
+          seg.startsWith('trailer.')) {
+        return true;
+      }
+      if (seg.startsWith('preview_') ||
+          seg.startsWith('preview-') ||
+          seg.startsWith('preview.') ||
+          seg.contains('_preview')) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// 在 WebView 里跑 JS 嗅两遍，返回分组后的媒体清单 + 页面标题 + 诊断。
@@ -379,12 +451,15 @@ class Sniffer {
     WebViewController controller, {
     required String pageUrl,
     List<String> extraCandidates = const [],
+    Map<String, DomVideoMeta> extraDomMeta = const {},
   }) async {
     var title = '';
     var pageAuthor = '';
     var pagePoster = '';
     var candidates = <String>[];
     var domDurations = <String, double>{};
+    var domMeta = <String, DomVideoMeta>{};
+    PageVideoMeta? pageMeta;
     var diagnosis = const SniffDiagnosis();
 
     // ---- 第一段：触发（SniffDL：muted-play + 等 2.5 秒）----
@@ -457,6 +532,14 @@ class Sniffer {
         candidates.add(src);
         final d = (m['duration'] as num?)?.toDouble() ?? 0;
         if (d > 0 && d.isFinite) domDurations[src] = d;
+        final vw = (m['videoWidth'] as num?)?.toInt() ?? 0;
+        final vh = (m['videoHeight'] as num?)?.toInt() ?? 0;
+        if (vw > 0 && vh > 0) {
+          domMeta[normalizeUrl(src)] = DomVideoMeta(
+            resolution: '${vw}x$vh',
+            durationSec: d > 0 && d.isFinite ? d.round() : null,
+          );
+        }
       }
       final resources = (decoded['resources'] as List?) ?? [];
       for (final r in resources) {
@@ -468,6 +551,7 @@ class Sniffer {
       }
       final html = (decoded['html'] ?? '').toString();
       final htmlFound = _scanHtmlForMedia(html);
+      candidates.addAll(pornhubMainCandidates(html)); // 正片 HLS 优先
       candidates.addAll(htmlFound);
       final iframeSrcs = ((decoded['iframeSrcs'] as List?) ?? [])
           .map((e) => e.toString())
@@ -485,6 +569,29 @@ class Sniffer {
             (decoded['crossOrigin'] as num?)?.toInt() ?? 0,
         iframeSrcs: iframeSrcs,
         htmlMediaCount: htmlFound.length,
+        previewFilteredCount: candidates.where(isPreviewUrl).length,
+      );
+      // 页面级视频信息：og:video 优先，其次 JSON-LD VideoObject。
+      final voList = <Map<String, dynamic>>[];
+      for (final vo in (decoded['videoObjects'] as List?) ?? []) {
+        if (vo is Map<String, dynamic>) {
+          voList.add(vo);
+        } else if (vo is Map) {
+          voList.add(Map<String, dynamic>.from(vo));
+        }
+      }
+      String? nonEmpty(dynamic v) {
+        final s = (v ?? '').toString().trim();
+        return s.isEmpty ? null : s;
+      }
+
+      pageMeta = pickPageMeta(
+        ogVideo: nonEmpty(decoded['ogVideo']),
+        ogVideoSecure: nonEmpty(decoded['ogVideoSecure']),
+        ogWidth: (decoded['ogVideoWidth'] as num?)?.toInt(),
+        ogHeight: (decoded['ogVideoHeight'] as num?)?.toInt(),
+        ogDuration: (decoded['ogVideoDuration'] as num?)?.toDouble(),
+        videoObjects: voList,
       );
     } catch (e) {
       return SniffResult(
@@ -498,6 +605,8 @@ class Sniffer {
     final items = await groupAndEnrich(
       candidates: candidates,
       domDurations: domDurations,
+      domMeta: {...extraDomMeta, ...domMeta},
+      pageMeta: pageMeta,
       pageUrl: pageUrl,
     );
     return SniffResult(items, title, pageAuthor, diagnosis, pagePoster);
@@ -520,6 +629,96 @@ class Sniffer {
     } catch (_) {
       return {};
     }
+  }
+
+  /// 地址归一化（去重/查表用）：小写、去 # 后缀。
+  static String normalizeUrl(String url) {
+    final l = url.toLowerCase();
+    final h = l.indexOf('#');
+    return h == -1 ? l : l.substring(0, h);
+  }
+
+  /// ISO 8601 时长转秒数（如 'PT1M30S' → 90；'PT2H3M4S' → 7384）。
+  /// 纯数字字符串当秒数；非法返回 null。
+  static int? parseIso8601Duration(String s) {
+    final t = s.trim();
+    if (t.isEmpty) return null;
+    final asNum = double.tryParse(t);
+    if (asNum != null) return asNum.round();
+    final m = RegExp(
+            r'^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$')
+        .firstMatch(t);
+    if (m == null) return null;
+    var total = 0.0;
+    var any = false;
+    final h = double.tryParse(m.group(1) ?? '');
+    if (h != null) {
+      total += h * 3600;
+      any = true;
+    }
+    final min = double.tryParse(m.group(2) ?? '');
+    if (min != null) {
+      total += min * 60;
+      any = true;
+    }
+    final sec = double.tryParse(m.group(3) ?? '');
+    if (sec != null) {
+      total += sec;
+      any = true;
+    }
+    if (!any || total <= 0) return null;
+    return total.round();
+  }
+
+  static int? _asInt(dynamic v) {
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v.trim());
+    return null;
+  }
+
+  /// 页面级视频信息：og:video 优先，其次 JSON-LD VideoObject；
+  /// 都没有返回 null。
+  static PageVideoMeta? pickPageMeta({
+    String? ogVideo,
+    String? ogVideoSecure,
+    int? ogWidth,
+    int? ogHeight,
+    num? ogDuration,
+    List<Map<String, dynamic>> videoObjects = const [],
+  }) {
+    final ogUrl = (ogVideoSecure != null && ogVideoSecure.isNotEmpty)
+        ? ogVideoSecure
+        : (ogVideo != null && ogVideo.isNotEmpty ? ogVideo : null);
+    if (ogUrl != null) {
+      final w = ogWidth ?? 0;
+      final h = ogHeight ?? 0;
+      final d = ogDuration ?? 0;
+      return PageVideoMeta(
+        videoUrl: ogUrl,
+        resolution: w > 0 && h > 0 ? '${w}x$h' : null,
+        durationSec: d > 0 ? d.round() : null,
+      );
+    }
+    for (final vo in videoObjects) {
+      final url =
+          (vo['contentUrl'] ?? vo['embedUrl'] ?? '').toString().trim();
+      if (url.isEmpty) continue;
+      final w = _asInt(vo['width']) ?? 0;
+      final h = _asInt(vo['height']) ?? 0;
+      int? dur;
+      final rawDur = vo['duration'];
+      if (rawDur is num) {
+        dur = rawDur.toInt();
+      } else if (rawDur is String) {
+        dur = parseIso8601Duration(rawDur);
+      }
+      return PageVideoMeta(
+        videoUrl: url,
+        resolution: w > 0 && h > 0 ? '${w}x$h' : null,
+        durationSec: dur != null && dur > 0 ? dur : null,
+      );
+    }
+    return null;
   }
 
   /// 第一段 JS：触发（只动没初始化过的 video）+ 扩资源时间线缓冲。
@@ -550,18 +749,21 @@ class Sniffer {
   /// title,author,poster,iframes,crossOrigin,iframeSrcs,error}。
   static const _collectJs = "(function(){"
       "var out={videos:[],resources:[],links:[],html:'',title:document.title,author:'',poster:'',"
+      "ogVideo:'',ogVideoSecure:'',ogVideoWidth:0,ogVideoHeight:0,ogVideoDuration:0,videoObjects:[],"
       "iframes:0,crossOrigin:0,iframeSrcs:[],error:''};"
       "try{"
       "function collectDoc(doc){"
       "doc.querySelectorAll('video,audio').forEach(function(v){"
       "var src=v.currentSrc||v.src||'';"
-      "var o={src:src,duration:v.duration||0,paused:!!v.paused,currentTime:v.currentTime||0};"
+      "var vw=(v.tagName==='VIDEO')?(v.videoWidth||0):0;"
+      "var vh=(v.tagName==='VIDEO')?(v.videoHeight||0):0;"
+      "var o={src:src,duration:v.duration||0,paused:!!v.paused,currentTime:v.currentTime||0,videoWidth:vw,videoHeight:vh};"
       "if(src)out.videos.push(o);"
       "v.querySelectorAll('source').forEach(function(s){"
-      "if(s.src)out.videos.push({src:s.src,duration:v.duration||0,paused:!!v.paused,currentTime:v.currentTime||0});});"
+      "if(s.src)out.videos.push({src:s.src,duration:v.duration||0,paused:!!v.paused,currentTime:v.currentTime||0,videoWidth:vw,videoHeight:vh});});"
       "['data-src','data-video','data-url','data-source'].forEach(function(a){"
       "var val=v.getAttribute&&v.getAttribute(a);"
-      "if(val)out.videos.push({src:val,duration:v.duration||0,paused:!!v.paused,currentTime:v.currentTime||0});});});"
+      "if(val)out.videos.push({src:val,duration:v.duration||0,paused:!!v.paused,currentTime:v.currentTime||0,videoWidth:vw,videoHeight:vh});});});"
       "doc.querySelectorAll('a[href]').forEach(function(a){"
       "var h=a.getAttribute('href')||'';"
       "if(/\\.(mp3|mp4|m4a|flac|wav|aac|ogg|opus|wma|m4b|mkv|avi|mov|flv|ts|webm|m3u8)(\\?|#|\$)/i.test(h))out.links.push(h);});"
@@ -576,8 +778,8 @@ class Sniffer {
       "catch(e){out.crossOrigin++;if(f.src)out.iframeSrcs.push(f.src);}});"
       "var h=document.documentElement?document.documentElement.outerHTML:'';"
       "out.html=h.slice(0,400000);"
-      "try{var _pv=document.querySelector('video[poster]');"
-      "if(_pv&&_pv.getAttribute('poster')){out.poster=_pv.getAttribute('poster');}"
+      "try{var _pvs=document.querySelectorAll('video[poster]');"
+      "for(var _pi=0;_pi<_pvs.length&&!out.poster;_pi++){var _pp=_pvs[_pi].getAttribute('poster')||'';if(_pp.indexOf('http')===0)out.poster=_pp.trim();}"
       "if(!out.poster){var _og=document.querySelector('meta[property=\"og:image\"]');"
       "if(_og&&_og.getAttribute('content')){out.poster=_og.getAttribute('content');}}"
       "if(!out.poster){var _tw=document.querySelector('meta[name=\"twitter:image\"]');"
@@ -593,6 +795,17 @@ class Sniffer {
       "if(!author){var r=document.querySelector('a[rel=\"author\"]');if(r)author=r.textContent.trim();}"
       "if(!author){var e=document.querySelector('.entry-author a,.posted-by a,.author-name');if(e)author=e.textContent.trim();}"
       "if(author)out.author=author;}catch(e){}"
+      "try{function _mg(p){var _m=document.querySelector('meta[property=\"' + p + '\"]');return _m?(_m.getAttribute('content')||''):'';}"
+      "out.ogVideo=_mg('og:video');out.ogVideoSecure=_mg('og:video:secure_url');"
+      "out.ogVideoWidth=parseInt(_mg('og:video:width'),10)||0;"
+      "out.ogVideoHeight=parseInt(_mg('og:video:height'),10)||0;"
+      "out.ogVideoDuration=parseFloat(_mg('og:video:duration'))||0;"
+      "var _vos=[];"
+      "document.querySelectorAll('script[type=\"application/ld+json\"]').forEach(function(s){try{var _j=JSON.parse(s.textContent);"
+      "var _arr=Array.isArray(_j)?_j:(_j['@graph']||[_j]);"
+      "_arr.forEach(function(_o){if(!_o)return;var _t=_o['@type'];var _isVo=_t==='VideoObject'||(Array.isArray(_t)&&_t.indexOf('VideoObject')>=0);"
+      "if(_isVo)_vos.push({url:_o.contentUrl||_o.embedUrl||'',width:_o.width||0,height:_o.height||0,duration:_o.duration||''});});}catch(e){}});"
+      "out.videoObjects=_vos;}catch(e){}"
       "}catch(e){out.error=String((e&&e.message)||e);}"
       "return JSON.stringify(out);})()";
 
@@ -605,14 +818,23 @@ class Sniffer {
       "try{"
       "document.querySelectorAll('video,audio').forEach(function(v){"
       "var src=v.currentSrc||v.src||'';"
-      "if(src)out.videos.push({src:src,duration:v.duration||0});});"
+      "if(src)out.videos.push({src:src,duration:v.duration||0,videoWidth:(v.tagName==='VIDEO')?(v.videoWidth||0):0,videoHeight:(v.tagName==='VIDEO')?(v.videoHeight||0):0});});"
       "try{performance.getEntriesByType('resource').forEach(function(r){var u=r.name||'';"
       "if(/\\.(mp4|m3u8|ts|webm|mov)(\\?|#|\$)/i.test(u)||u.indexOf('blob:')===0)out.resources.push(u);});}catch(e){}"
       "}catch(e){}"
       "return JSON.stringify(out);})()";
 
   /// 页面 HTML 内正则扫媒体地址（绝对 + 相对地址都认）。
+  /// HTML 里的转义地址还原（供单测直接验）：JSON 里 `\/` 与 `\u002F`
+  /// 都是 `/`，不还原正则就匹配不到（反斜杠把 // 隔开了）。
+  static String unescapeHtmlUrls(String html) {
+    return html.replaceAll(r'\/', '/').replaceAll(r'\u002F', '/');
+  }
+
   static List<String> _scanHtmlForMedia(String html) {
+    // JSON 里转义过的地址（https:\/\/...、\u002F）先还原，否则正则
+    // 匹配不到（反斜杠把 // 隔开了）。
+    html = unescapeHtmlUrls(html);
     final out = <String>[];
     final re = RegExp(
         r'''(?:https?:)?//[^"'<>\s\\]+?\.(?:mp4|m3u8|ts|webm)(?:\?[^"'<>\s\\]*)?''',
@@ -631,13 +853,30 @@ class Sniffer {
     return out;
   }
 
+  /// Pornhub 正片候选：复用 StreamResolver 的 mediaDefinitions 提取，
+  /// 只取 format == 'hls' 的 master.m3u8（正片多档）；format == 'mp4'
+  /// 那条是 get_media 接口地址（返回 JSON，不是直链），不要。
+  static List<String> pornhubMainCandidates(String html) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final d in StreamResolver.parsePornhubMediaDefinitions(html)) {
+      if (d.format != 'hls' || d.url.isEmpty) continue;
+      if (seen.add(d.url)) out.add(d.url);
+    }
+    return out;
+  }
+
   /// 候选地址 -> 分组后的媒体清单（纯逻辑 + 联网补信息）。
   /// fetchText 可注入（单元测试用假播放列表，不真联网）。
+  /// probeHead 可注入（单元测试用假 HEAD 响应，不真联网）。
   static Future<List<SniffedMedia>> groupAndEnrich({
     required List<String> candidates,
     Map<String, double> domDurations = const {},
+    Map<String, DomVideoMeta> domMeta = const {},
+    PageVideoMeta? pageMeta,
     required String pageUrl,
     Future<String> Function(String url)? fetchText,
+    Future<int?> Function(String url)? probeHead,
   }) async {
     final fetch = fetchText ??
         (String u) async {
@@ -681,7 +920,10 @@ class Sniffer {
         m3u8s.add(u);
       } else if (lower.endsWith('.mp4') ||
           lower.endsWith('.webm') ||
-          lower.endsWith('.mov')) {
+          lower.endsWith('.mov') ||
+          lower.contains('/mp4_')) {
+        // '/mp4_'：Pornhub 预览地址形如 .../pre_videos/.../mp4_720p...，
+        // 后缀可能被截断得看不清，路径里有 mp4_ 标记的也算 mp4。
         files.add(u);
       } else if (lower.endsWith('.ts')) {
         final prefix = u.substring(0, u.lastIndexOf('/'));
@@ -689,36 +931,80 @@ class Sniffer {
       }
     }
     final out = <SniffedMedia>[];
-    // 3) m3u8：拉播放列表算总时长/分片数（主播放列表先挑最高变体，
-    // 记下选中变体的分辨率/码率，再按码率×时长估大小）。
+    // 页面元数据的匹配规则（分辨率/时长都走同一套）：
+    // 精确匹配：地址相同（归一化后比较）才套；
+    // 单候选兜底：页面只有一个媒体候选时，页面级信息就是它的（主视频）。
+    // 多个候选且对不上地址的，绝不乱套。
+    final singleCandidate = m3u8s.length + files.length == 1;
+    String? resolutionFromDom(String url) {
+      final exact = domMeta[normalizeUrl(url)]?.resolution;
+      if (exact != null) return exact;
+      if (singleCandidate && domMeta.length == 1) {
+        return domMeta.values.first.resolution;
+      }
+      return null;
+    }
+
+    int? durationFromDom(String url) {
+      final exact = domMeta[normalizeUrl(url)]?.durationSec;
+      if (exact != null) return exact;
+      if (singleCandidate && domMeta.length == 1) {
+        return domMeta.values.first.durationSec;
+      }
+      return null;
+    }
+
+    String? resolutionFromPage(String url) {
+      final pm = pageMeta;
+      if (pm == null || pm.resolution == null) return null;
+      if (pm.videoUrl != null &&
+          normalizeUrl(pm.videoUrl!) == normalizeUrl(url)) {
+        return pm.resolution;
+      }
+      if (singleCandidate) return pm.resolution;
+      return null;
+    }
+
+    int? durationFromPage(String url) {
+      final pm = pageMeta;
+      if (pm == null || pm.durationSec == null) return null;
+      if (pm.videoUrl != null &&
+          normalizeUrl(pm.videoUrl!) == normalizeUrl(url)) {
+        return pm.durationSec;
+      }
+      if (singleCandidate) return pm.durationSec;
+      return null;
+    }
+
+    // 3) m3u8：共享解析（HlsPlaylist.resolveVariantMeta）算分辨率/码率/
+    // 时长/分片数；DOM/页面信息只当兜底（解析没给分辨率/时长时）。
     for (final u in m3u8s) {
       try {
-        var body = await fetch(u);
-        String? resolution;
-        int? bandwidth;
-        if (body.contains('#EXT-X-STREAM-INF')) {
-          final variants = HlsPlaylist.parseMaster(body, u);
-          final variant = HlsPlaylist.pickVariant(variants);
-          if (variant != null) {
-            resolution = variant.resolution.isEmpty ? null : variant.resolution;
-            bandwidth = variant.bandwidth <= 0 ? null : variant.bandwidth;
-            body = await fetch(variant.url);
-          }
-        }
-        final (dur, count) = parseM3u8Durations(body);
-        final durationSec = dur > 0 ? dur : _domDuration(domDurations, u);
+        final body = await fetch(u);
+        final meta = await HlsPlaylist.resolveVariantMeta(
+          masterBody: body,
+          masterUrl: u,
+          fetch: fetch,
+        );
+        final durationSec = meta.durationSec ??
+            _domDuration(domDurations, u) ??
+            durationFromDom(u) ??
+            durationFromPage(u);
+        final resolution =
+            meta.resolution ?? resolutionFromDom(u) ?? resolutionFromPage(u);
         final estimatedSizeBytes =
-            (bandwidth != null && durationSec != null && durationSec > 0)
-                ? bandwidth ~/ 8 * durationSec
+            (meta.bandwidth != null && durationSec != null && durationSec > 0)
+                ? meta.bandwidth! ~/ 8 * durationSec
                 : null;
         out.add(SniffedMedia(
           url: u,
           kind: 'm3u8',
           durationSec: durationSec,
-          segmentCount: count,
+          segmentCount: meta.segmentCount,
           resolution: resolution,
-          bandwidth: bandwidth,
+          bandwidth: meta.bandwidth,
           estimatedSizeBytes: estimatedSizeBytes,
+          metaNote: meta.metaNote,
         ));
       } catch (_) {
         out.add(SniffedMedia(
@@ -726,14 +1012,21 @@ class Sniffer {
           kind: 'm3u8',
           durationSec: _domDuration(domDurations, u),
           note: '播放列表拉不到，下不了，只能在线播',
+          metaNote: '播放列表拉取失败',
         ));
       }
     }
-    // 4) mp4/webm：Range 探大小（并行）。
+    // 4) mp4/webm：分辨率/时长（DOM 实测 → 页面信息）+ 大小
+    // （Range 探 → HEAD 兜底，并行；三样都拿不到的字段保持 null）。
+    final headProbe = probeHead ??
+        (String u) => probeHeadSize(u, {'Referer': pageUrl});
     final sizes = await Future.wait(files.map((u) async {
       try {
         final p = await DownloadManager.probeRange(u, {'Referer': pageUrl});
-        return p.totalBytes > 0 ? p.totalBytes : null;
+        if (p.totalBytes > 0) return p.totalBytes;
+      } catch (_) {}
+      try {
+        return await headProbe(u);
       } catch (_) {
         return null;
       }
@@ -749,7 +1042,10 @@ class Sniffer {
                 ? 'mp4'
                 : 'mp4',
         sizeBytes: sizes[i],
-        durationSec: _domDuration(domDurations, u),
+        durationSec: _domDuration(domDurations, u) ??
+            durationFromDom(u) ??
+            durationFromPage(u),
+        resolution: resolutionFromDom(u) ?? resolutionFromPage(u),
       ));
     }
     // 5) ts 分组：同一目录前缀归一条。
@@ -796,19 +1092,24 @@ class Sniffer {
     return d.round();
   }
 
+  /// HEAD 探大小：只拿响应头、不下正文。返回 Content-Length（>0 才算），
+  /// 拿不到返回 null，不抛错。
+  static Future<int?> probeHeadSize(
+      String url, Map<String, String> headers) async {
+    try {
+      final res = await http
+          .head(Uri.parse(url), headers: {'User-Agent': _ua, ...headers})
+          .timeout(const Duration(seconds: 8));
+      final cl = res.headers['content-length'] ?? '';
+      final n = int.tryParse(cl.trim()) ?? 0;
+      return n > 0 ? n : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 媒体播放列表正文 -> (总时长秒, 分片数)。供单元测试直接验。
   static (int, int) parseM3u8Durations(String body) {
-    var total = 0.0;
-    var count = 0;
-    for (final line in body.split('\n')) {
-      final t = line.trim();
-      if (!t.startsWith('#EXTINF:')) continue;
-      final sec = double.tryParse(
-              t.substring(8).split(',').first.trim()) ??
-          0;
-      total += sec;
-      count++;
-    }
-    return (total.round(), count);
+    return HlsPlaylist.parseMediaDurations(body);
   }
 }

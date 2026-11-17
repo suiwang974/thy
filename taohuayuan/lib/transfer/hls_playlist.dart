@@ -179,6 +179,143 @@ class HlsPlaylist {
     return best;
   }
 
+  /// 累加所有 `#EXTINF:` 行秒数并统计分片数，返回 (总秒四舍五入, 分片数)。
+  /// 空正文返回 (0, 0)。
+  static (int, int) parseMediaDurations(String body) {
+    var total = 0.0;
+    var count = 0;
+    for (final rawLine in body.split('\n')) {
+      final line = rawLine.trim();
+      if (!line.startsWith('#EXTINF:')) continue;
+      final value = line.substring('#EXTINF:'.length).split(',').first.trim();
+      final seconds = double.tryParse(value);
+      count++;
+      if (seconds != null && seconds > 0) total += seconds;
+    }
+    return (total.round(), count);
+  }
+
+  /// 从 URL 小写路径里找分辨率提示，返回标准 16:9 展示宽高，找不到返回 null。
+  /// 宽度是按 16:9 推算的，仅用于展示和排序。
+  static String? resolutionFromUrlHint(String url) {
+    final lower = url.toLowerCase();
+    String path;
+    try {
+      final uri = Uri.parse(lower);
+      path = uri.path.isEmpty ? lower : uri.path;
+    } catch (_) {
+      path = lower;
+    }
+    const hints = <String, String>{
+      '2160': '3840x2160',
+      '1440': '2560x1440',
+      '1080': '1920x1080',
+      '720': '1280x720',
+      '480': '854x480',
+      '360': '640x360',
+      '240': '426x240',
+      '4k': '3840x2160',
+      '2k': '2560x1440',
+    };
+    for (final entry in hints.entries) {
+      final pattern =
+          RegExp('(?<![0-9])${RegExp.escape(entry.key)}(?![0-9])');
+      if (pattern.hasMatch(path)) return entry.value;
+    }
+    return null;
+  }
+
+  /// master 解析成最终的变体信息（Dart 侧嗅探与原生侧富化共用同一份逻辑）。
+  /// 兜底顺序：master RESOLUTION → 嵌套 master 再解析一层 → 变体 URL 提示。
+  /// fetch 只负责拉取（调用方决定怎么拉、带什么请求头）；任何一步失败都
+  /// 不抛错，返回带 metaNote 的结果。
+  static Future<HlsResolvedMeta> resolveVariantMeta({
+    required String masterBody,
+    required String masterUrl,
+    required Future<String> Function(String url) fetch,
+  }) async {
+    // 不是 master：当媒体播放列表直接算时长。
+    if (!isMaster(masterBody)) {
+      final (dur, count) = parseMediaDurations(masterBody);
+      return HlsResolvedMeta(
+        durationSec: dur > 0 ? dur : null,
+        segmentCount: count,
+        metaNote: dur > 0 ? '播放列表无分辨率信息' : null,
+      );
+    }
+    final variants = parseMaster(masterBody, masterUrl);
+    final picked = pickVariant(variants);
+    if (picked == null) {
+      return const HlsResolvedMeta(metaNote: '播放列表无分辨率信息');
+    }
+    var resolution = picked.resolution.isEmpty ? null : picked.resolution;
+    var bandwidth = picked.bandwidth > 0 ? picked.bandwidth : null;
+    String? mediaBody;
+    // 选中变体没有 RESOLUTION：先拉变体地址，看是不是嵌套 master。
+    if (resolution == null) {
+      try {
+        final body = await fetch(picked.url);
+        if (isMaster(body)) {
+          final nested = pickVariant(parseMaster(body, picked.url));
+          if (nested != null) {
+            if (nested.resolution.isNotEmpty) {
+              resolution = nested.resolution;
+            }
+            if (nested.bandwidth > 0) bandwidth = nested.bandwidth;
+            // 嵌套 master 的选中变体才是媒体播放列表，再拉一次。
+            try {
+              mediaBody = await fetch(nested.url);
+            } catch (_) {
+              return HlsResolvedMeta(
+                resolution: resolution,
+                bandwidth: bandwidth,
+                metaNote: '播放列表拉取失败',
+              );
+            }
+          }
+        } else {
+          mediaBody = body;
+          resolution ??= resolutionFromUrlHint(picked.url);
+        }
+      } catch (_) {
+        return HlsResolvedMeta(
+          resolution: resolution,
+          bandwidth: bandwidth,
+          metaNote: '播放列表拉取失败',
+        );
+      }
+    }
+    // 拉最终的媒体播放列表正文（上面已取到的复用，不重复拉）。
+    mediaBody ??= await _fetchMediaBody(picked.url, fetch);
+    if (mediaBody == null) {
+      return HlsResolvedMeta(
+        resolution: resolution,
+        bandwidth: bandwidth,
+        metaNote: '播放列表拉取失败',
+      );
+    }
+    final (dur, count) = parseMediaDurations(mediaBody);
+    return HlsResolvedMeta(
+      resolution: resolution,
+      bandwidth: bandwidth,
+      durationSec: dur > 0 ? dur : null,
+      segmentCount: count,
+      metaNote: resolution == null && dur > 0 ? '播放列表无分辨率信息' : null,
+    );
+  }
+
+  /// 拉媒体播放列表正文；失败返回 null（不抛错）。
+  static Future<String?> _fetchMediaBody(
+    String url,
+    Future<String> Function(String url) fetch,
+  ) async {
+    try {
+      return await fetch(url);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// 解析 IV=0x... 十六进制串；不合法返回 null。
   static List<int>? parseIv(String raw) {
     var hex = raw.trim();
@@ -191,4 +328,20 @@ class HlsPlaylist {
     }
     return out;
   }
+}
+
+/// 一次 master 解析的结果：分辨率/码率/时长/分片数，失败时 metaNote 写原因。
+class HlsResolvedMeta {
+  final String? resolution; // 如 '1920x1080'
+  final int? bandwidth; // bps
+  final int? durationSec;
+  final int segmentCount;
+  final String? metaNote; // 失败原因显示文案，成功为 null
+  const HlsResolvedMeta({
+    this.resolution,
+    this.bandwidth,
+    this.durationSec,
+    this.segmentCount = 0,
+    this.metaNote,
+  });
 }
