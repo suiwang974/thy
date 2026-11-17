@@ -13,6 +13,7 @@ import '../services/adblock_service.dart';
 import '../services/downloader.dart';
 import '../services/sniffer.dart';
 import '../transfer/hls_playlist.dart';
+import '../transfer/mp4_probe.dart';
 import '../services/store.dart';
 import '../services/stream_resolver.dart';
 import '../services/translator.dart';
@@ -110,6 +111,14 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
   final _enrichedNativeUrls = <String>{};
   // 原生富化失败重试计数（按去 # 后的地址记；超过 3 次就放弃，不无限重试）。
   final _nativeEnrichAttempts = <String, int>{};
+  // 富化成功的结果缓存（key = _stripFragment(url)，即去 # 后的地址）。
+  // 桥每轮轮询返回的都是一组全新的裸条目（无任何元数据），以前直接覆盖
+  // _nativeSniffed，富化结果最多活 3 秒就被洗掉。这里缓存一份富化后的条目，
+  // 轮询每轮拿回裸条目后重新合并回去，富化结果不再被轮询洗掉。
+  final Map<String, SniffedMedia> _nativeMetaCache = {};
+  // 富化互斥：多轮 unawaited 富化并发跑会互相覆盖，同一时刻只跑一轮。
+  bool _enrichingHls = false;
+  bool _enrichingMp4 = false;
   // 轮询攒下来的 video 元素实测元数据（地址归一化后记，供下次嗅探时传入）。
   final _pollDomMeta = <String, DomVideoMeta>{};
   // 拉播放列表用的 UA（与 Sniffer._ua 一致）。
@@ -242,7 +251,8 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
               if (stripped != _nativeUrl) {
                 _nativeUrl = stripped;
                 _nativeSniffed = [];
-                _enrichedNativeUrls.clear();
+      _enrichedNativeUrls.clear();
+      _nativeMetaCache.clear();
                 unawaited(_bridge.navigateTo(u, binding));
               }
             }
@@ -322,7 +332,15 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     } catch (_) {}
     if (_bridge.isRunning && mounted) {
       await _bridge.pollCandidates();
-      if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
+      if (mounted) {
+        // 桥返回的是全新裸条目，先拿裸条目，再用 _nativeMetaCache 逐条合并
+        // （只补空字段），否则富化结果会被下一轮轮询覆盖掉。
+        final merged = _bridge.sniffedMedia.map((m) {
+          final cached = _nativeMetaCache[_stripFragment(m.url)];
+          return cached == null ? m : _fillFromDart(m, cached);
+        }).toList();
+        setState(() => _nativeSniffed = merged);
+      }
     }
     unawaited(_enrichNativeHls());
     unawaited(_enrichNativeMp4());
@@ -569,7 +587,15 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
     }
     if (_bridge.isRunning && mounted) {
       await _bridge.pollCandidates();
-      if (mounted) setState(() => _nativeSniffed = _bridge.sniffedMedia);
+      if (mounted) {
+        // 桥返回的是全新裸条目，先拿裸条目，再用 _nativeMetaCache 逐条合并
+        // （只补空字段），否则富化结果会被下一轮轮询覆盖掉。
+        final merged = _bridge.sniffedMedia.map((m) {
+          final cached = _nativeMetaCache[_stripFragment(m.url)];
+          return cached == null ? m : _fillFromDart(m, cached);
+        }).toList();
+        setState(() => _nativeSniffed = merged);
+      }
     }
     unawaited(_enrichNativeHls());
     unawaited(_enrichNativeMp4());
@@ -600,11 +626,11 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
         a.segmentCount != b.segmentCount;
   }
 
-  /// 原生 m3u8 缺元数据时富化：先抄同地址 Dart 条目的元数据（不联网），
-  /// 还没有就拉一次播放列表解析后填上。失败不记“已富化”，下次轮询再试，
   /// 最多试 3 次；3 次都拿不到就把原因写到条目上，别永远未知。
   /// 失败就留空（显示“未知”），不抛错、不挡展示。
   Future<void> _enrichNativeHls() async {
+    if (_enrichingHls) return;
+    _enrichingHls = true;
     try {
       if (_nativeSniffed.isEmpty) return;
       final dartByUrl = <String, SniffedMedia>{};
@@ -625,6 +651,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           final filled = _fillFromDart(cur, dart);
           if (_metaDiffers(filled, cur)) changed = true;
           cur = filled;
+          _nativeMetaCache[key] = cur;
         }
         if (cur.resolution != null || cur.durationSec != null) {
           next.add(cur);
@@ -642,12 +669,14 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           final failed =
               cur.copyWith(metaNote: cur.metaNote ?? '播放列表拉取失败');
           if (_metaDiffers(failed, cur)) changed = true;
+          _nativeMetaCache[key] = failed;
           next.add(failed);
           continue;
         }
         final fetched = await _fetchHlsMeta(cur);
         if (fetched != null) {
           _enrichedNativeUrls.add(key);
+          _nativeMetaCache[key] = fetched;
           if (_metaDiffers(fetched, cur)) changed = true;
           next.add(fetched);
         } else {
@@ -659,12 +688,16 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       }
     } catch (_) {
       // 富化失败静默忽略，不影响展示。
+    } finally {
+      _enrichingHls = false;
     }
   }
 
   /// 原生 mp4/webm/mov 缺大小时富化：先抄同地址 Dart 条目，没有再 HEAD
   /// 探一次 Content-Length。按地址缓存，只富化一次；失败留空，不挡展示。
   Future<void> _enrichNativeMp4() async {
+    if (_enrichingMp4) return;
+    _enrichingMp4 = true;
     try {
       if (_nativeSniffed.isEmpty) return;
       final dartByUrl = <String, SniffedMedia>{};
@@ -685,6 +718,7 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           final filled = _fillFromDart(cur, dart);
           if (_metaDiffers(filled, cur)) changed = true;
           cur = filled;
+          _nativeMetaCache[key] = cur;
         }
         if (cur.sizeBytes != null) {
           next.add(cur);
@@ -701,13 +735,26 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           next.add(cur);
           continue;
         }
-        final size =
-            await Sniffer.probeHeadSize(m.url, {'Referer': _currentUrl});
+        // 用原生侧记到的真实请求头（含 Referer/UA/Cookie 上下文）；
+        // Sniffer.probeHeadSize 内部是 {'User-Agent': _ua, ...headers}，
+        // 这里直接传 _headersFor 的结果，别在外面再拼 UA。
+        final size = await Sniffer.probeHeadSize(m.url, _headersFor(m.url));
         if (size != null) {
           _enrichedNativeUrls.add(key);
           final sized = cur.copyWith(sizeBytes: size);
-          if (_metaDiffers(sized, cur)) changed = true;
-          next.add(sized);
+          var withMeta = sized;
+          if (withMeta.durationSec == null || withMeta.resolution == null) {
+            final moov = await Mp4Probe.probe(m.url, _headersFor(m.url));
+            if (moov != null) {
+              withMeta = withMeta.copyWith(
+                durationSec: withMeta.durationSec ?? moov.durationSec,
+                resolution: withMeta.resolution ?? moov.resolution,
+              );
+            }
+          }
+          if (_metaDiffers(withMeta, cur)) changed = true;
+          _nativeMetaCache[key] = withMeta;
+          next.add(withMeta);
         } else {
           next.add(cur);
         }
@@ -717,13 +764,17 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
       }
     } catch (_) {
       // 富化失败静默忽略，不影响展示。
+    } finally {
+      _enrichingMp4 = false;
     }
   }
 
   /// 拉一次播放列表，用共享解析拿分辨率/码率/时长/预估大小；拿不到返回 null。
   Future<SniffedMedia?> _fetchHlsMeta(SniffedMedia m) async {
     try {
-      final headers = {'User-Agent': _ua, 'Referer': _currentUrl};
+      // 原生头里若有 User-Agent 则以原生为准，否则用 _ua；
+      // _headersFor 永远返回非空 Map（缺 Referer 时补当前页）。
+      final headers = {'User-Agent': _ua, ..._headersFor(m.url)};
       final res = await http
           .get(Uri.parse(m.url), headers: headers)
           .timeout(const Duration(seconds: 8));
@@ -996,6 +1047,22 @@ class _WebSourceBrowserState extends State<WebSourceBrowser> {
           ),
           title: Text(widget.title, style: const TextStyle(color: Colors.white, fontSize: 15)),
           actions: [
+            IconButton(
+              icon: const Icon(Icons.arrow_forward, color: Colors.white),
+              tooltip: '前进',
+              onPressed: () async {
+                if (await _controller.canGoForward()) {
+                  await _controller.goForward();
+                }
+              },
+            ),
+            IconButton(
+              icon: const Icon(Icons.home, color: Colors.white),
+              tooltip: '回首页',
+              onPressed: () async {
+                await _controller.loadRequest(Uri.parse(widget.url));
+              },
+            ),
             // 第 35 条：翻译按钮（默认开，翻成中文；点一下切回原文）。
             IconButton(
               icon: Icon(Icons.translate,

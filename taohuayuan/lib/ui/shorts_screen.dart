@@ -1054,7 +1054,9 @@ class _ShortPageState extends State<_ShortPage>
         fit: StackFit.expand,
         children: [
           GestureDetector(
-            onTap: () {
+            // 主 feed 没有可唤出的自动隐藏控制条（_fsControls 只在全屏页），
+            // 单击不做事；双击切换暂停/播放。
+            onDoubleTap: () {
               if (c == null) return;
               setState(() => c.value.isPlaying ? c.pause() : c.play());
             },
@@ -1360,10 +1362,14 @@ class _FullscreenShortsState extends State<_FullscreenShorts> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // 点视频区 = 暂停/继续 + 唤出控制条（播的时候重新计时 3 秒），
+          // 双击视频区 = 暂停/继续，单击只唤出控制条（播的时候重新计时 3 秒），
           // 退出只走右上角 ✕ 和系统返回；点画面绝不触发放大。
           GestureDetector(
             onTap: () {
+              if (c == null) return;
+              setState(() => _fsControls.poke(isPlaying: c.value.isPlaying));
+            },
+            onDoubleTap: () {
               if (c == null) return;
               final wasPlaying = c.value.isPlaying;
               if (wasPlaying) {

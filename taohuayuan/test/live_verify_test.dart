@@ -4,6 +4,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:taohuayuan/data/sources.dart';
 import 'package:taohuayuan/services/stream_resolver.dart';
+import 'package:taohuayuan/transfer/hls_playlist.dart';
+import 'package:taohuayuan/transfer/mp4_probe.dart';
 
 /// 联网验证（只在明确跑这个文件时跑，不进常规 flutter test 的快通道）：
 ///   flutter test test/live_verify_test.dart
@@ -146,5 +148,42 @@ void main() {
       // ignore: avoid_print
       print('niacg 解析异常（VM 网络问题，待手机真机复验）：$e');
     }
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('真网 Mux master：选 1080p 变体，总时长 635 秒、64 分片', () async {
+    final master = await http
+        .get(Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+            headers: {'User-Agent': _ua})
+        .timeout(const Duration(seconds: 25));
+    expect(master.statusCode, 200);
+    final meta = await HlsPlaylist.resolveVariantMeta(
+      masterBody: master.body,
+      masterUrl: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+      fetch: (u) async {
+        final r = await http
+            .get(Uri.parse(u), headers: {'User-Agent': _ua})
+            .timeout(const Duration(seconds: 25));
+        if (r.statusCode != 200) throw StateError('HTTP ${r.statusCode}');
+        return r.body;
+      },
+    );
+    expect(meta.resolution, '1920x1080');
+    expect(meta.bandwidth, 6221600);
+    expect(meta.durationSec, 635);
+    expect(meta.segmentCount, 64);
+  }, timeout: const Timeout(Duration(seconds: 60)));
+
+  test('真网 BBB mp4：Range 取头 64KB，moov 解析出 10 秒、1280x720', () async {
+    const mp4Url =
+        'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4';
+    final head = await http
+        .head(Uri.parse(mp4Url), headers: {'User-Agent': _ua})
+        .timeout(const Duration(seconds: 25));
+    expect(head.statusCode, 200);
+    final cl = int.tryParse(head.headers['content-length'] ?? '') ?? 0;
+    expect(cl, greaterThan(0));
+    final probed = await Mp4Probe.probe(mp4Url, {'User-Agent': _ua});
+    expect(probed?.durationSec, 10);
+    expect(probed?.resolution, '1280x720');
   }, timeout: const Timeout(Duration(seconds: 60)));
 }

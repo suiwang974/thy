@@ -1053,9 +1053,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
         // 控制条是 Stack 的直接子项，钉在 16:9 框底部。
         AspectRatio(aspectRatio: safeAr, child: VideoPlayer(c)),
         GestureDetector(
-          // 第 43+44 条：点视频区只做暂停/继续 + 唤出控制条（播的时候重新计时 3 秒），
-          // 绝不触发放大/全屏切换。
+          // 双击切换暂停/继续；单击只唤出控制条（播的时候重新计时 3 秒），绝不触发放大/全屏切换。
           onTap: () {
+            setState(() => _fsControls.poke(isPlaying: c.value.isPlaying));
+          },
+          onDoubleTap: () {
             final wasPlaying = c.value.isPlaying;
             setState(() {
               if (wasPlaying) {

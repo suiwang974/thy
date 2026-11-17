@@ -74,6 +74,9 @@ class NativeSnifferBridge {
       kind = 'ts';
     }
 
+    // 原生路径也要过同一套预览/广告排除（以前只在 Dart 路径 groupAndEnrich 里判）。
+    if (Sniffer.isExcludedUrl(url)) return null;
+
     if (kind == null) return null;
 
     return SniffedMedia(

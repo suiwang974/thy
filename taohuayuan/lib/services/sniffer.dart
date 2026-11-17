@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../transfer/hls_playlist.dart';
+import '../transfer/mp4_probe.dart';
 import 'downloader.dart';
 import 'stream_resolver.dart';
 
@@ -231,9 +232,28 @@ class SniffedMedia {
     }
   }
 
-  /// 质量比较（最好在前）：分辨率像素降序 → 码率降序 → 大小降序 → 类型优先级。
+  /// 像预览/缩略图：已知体积很小（< 512KB）且没时长；或 URL 已命中排除规则。
+  /// 有真实时长的短片不算（durationSec != null 就不算预览）。
+  bool get looksLikePreview {
+    if (Sniffer.isExcludedUrl(url)) return true;
+    final s = sizeBytes ?? estimatedSizeBytes;
+    if (s != null && s > 0 && s < 512 * 1024 && (durationSec == null || durationSec! <= 0)) return true;
+    return false;
+  }
+
+  /// 质量比较（最好在前）：预览最后、有元数据在前 → 分辨率像素降序 → 码率降序 → 大小降序 → 类型优先级。
   /// 返回负数表示 a 排在 b 前面。
   static int compareQuality(SniffedMedia a, SniffedMedia b) {
+    final byPreview = (a.looksLikePreview ? 1 : 0).compareTo(b.looksLikePreview ? 1 : 0);
+    if (byPreview != 0) return byPreview;
+    bool hasMeta(SniffedMedia m) =>
+        (m.resolution != null && m.resolution!.isNotEmpty) ||
+        (m.durationSec != null && m.durationSec! > 0) ||
+        (m.sizeBytes != null && m.sizeBytes! > 0) ||
+        (m.estimatedSizeBytes != null && m.estimatedSizeBytes! > 0) ||
+        (m.bandwidth != null && m.bandwidth! > 0);
+    final byMeta = (hasMeta(b) ? 1 : 0).compareTo(hasMeta(a) ? 1 : 0);
+    if (byMeta != 0) return byMeta;
     final byPixels = b.qualityPixels.compareTo(a.qualityPixels);
     if (byPixels != 0) return byPixels;
     final byBandwidth = (b.bandwidth ?? 0).compareTo(a.bandwidth ?? 0);
@@ -243,17 +263,26 @@ class SniffedMedia {
     return _kindRank(a.kind).compareTo(_kindRank(b.kind));
   }
 
-  /// 可下条目里质量最好的一条；没有可下的返回 null。
+  /// 可下、非预览、有元数据的条目里质量最好的一条；没有就返回 null（不默认勾选）。
   static SniffedMedia? bestOf(Iterable<SniffedMedia> items) {
     SniffedMedia? best;
+    bool hasMeta(SniffedMedia m) =>
+        (m.resolution != null && m.resolution!.isNotEmpty) ||
+        (m.durationSec != null && m.durationSec! > 0) ||
+        (m.sizeBytes != null && m.sizeBytes! > 0) ||
+        (m.estimatedSizeBytes != null && m.estimatedSizeBytes! > 0) ||
+        (m.bandwidth != null && m.bandwidth! > 0);
     for (final item in items) {
       if (!item.downloadable) continue;
+      if (item.looksLikePreview) continue;
+      if (!hasMeta(item)) continue;
       if (best == null || compareQuality(item, best) < 0) {
         best = item;
       }
     }
     return best;
   }
+
 }
 
 /// 嗅探诊断（第 53 条）：嗅不到时写明到底查了什么、为什么没嗅到，
@@ -394,8 +423,21 @@ class Sniffer {
   /// 排除：缩略图预览、广告域名（和 StreamResolver.genericMediaScan 同一套词）。
   /// 预览标记按 URL 路径段判（不是任意子串），规则见 isPreviewUrl：
   /// 路径段恰好叫 preview 的正片页（如 /videos/preview/12345.mp4）不排除。
+  /// 另外按文件名 token 补充：300x250 等小尺寸标记，以及复数目录段
+  /// previews（640x360 不排除，它是合法 360p）。
+  /// 注意：`low` 单独出现不排除——xxx-low.mp4 可能是低画质正片全片，
+  /// 不是预览（2026-11-17 回归：旧测试拿 low.mp4 当正常 mp4）；
+  /// 真预览 300x250.low.mp4 靠 300x250 token 排除；真小文件靠
+  /// looksLikePreview（体积 <512KB 且无时长）在排序时垫底。
   static bool isExcludedUrl(String url) {
     final l = url.toLowerCase();
+    final parsed = Uri.tryParse(l);
+    final segments = parsed?.pathSegments ?? const <String>[];
+    // 文件名取最后一段；取不到就用整个 url（小写）兜底。
+    final fileName = segments.isNotEmpty ? segments.last : l;
+    // 小尺寸预览标记（320x180、480x270 等），按 token 边界匹配。
+    final smallSizeToken =
+        RegExp(r'(^|[._-])(300x250|320x180|320x240|480x270)([._-]|$)');
     return l.contains('thumb') ||
         l.contains('.t.mp4') ||
         isPreviewUrl(url) ||
@@ -403,7 +445,9 @@ class Sniffer {
         l.contains('doubleclick') ||
         l.contains('googleads') ||
         l.contains('adsystem') ||
-        l.contains('adservice');
+        l.contains('adservice') ||
+        smallSizeToken.hasMatch(fileName) ||
+        segments.any((seg) => seg == 'previews');
   }
 
   /// 预览/广告短片判定（只看 URL 路径段，不看标题）：
@@ -1047,6 +1091,33 @@ class Sniffer {
             durationFromPage(u),
         resolution: resolutionFromDom(u) ?? resolutionFromPage(u),
       ));
+    }
+    // mp4/webm 缺时长/分辨率的，用 moov 探测补（只取文件头 64KB，不下全片）。
+    final moovTargets = <int>[];
+    for (var i = 0; i < out.length; i++) {
+      final m = out[i];
+      if ((m.kind == 'mp4' || m.kind == 'webm') &&
+          (m.durationSec == null || m.resolution == null)) {
+        moovTargets.add(i);
+      }
+    }
+    if (moovTargets.isNotEmpty) {
+      final moovResults = await Future.wait(moovTargets.map((i) async {
+        try {
+          return await Mp4Probe.probe(out[i].url, {'Referer': pageUrl});
+        } catch (_) {
+          return null;
+        }
+      }));
+      for (var j = 0; j < moovTargets.length; j++) {
+        final r = moovResults[j];
+        if (r == null) continue;
+        final i = moovTargets[j];
+        out[i] = out[i].copyWith(
+          durationSec: out[i].durationSec ?? r.durationSec,
+          resolution: out[i].resolution ?? r.resolution,
+        );
+      }
     }
     // 5) ts 分组：同一目录前缀归一条。
     for (final e in tsGroups.entries) {
