@@ -1,5 +1,6 @@
 package dev.akash.skystream.extractor
 
+import dev.akash.skystream.sniffer.AdapterPipeline
 import dev.akash.skystream.sniffer.CandidateNormalizer
 import dev.akash.skystream.sniffer.CandidateSource
 import dev.akash.skystream.sniffer.DownloadCandidate
@@ -90,8 +91,8 @@ class ExtractorImpl : Extractor {
         depth: Int,
     ): List<Variant> {
         ensureOpen()
-        if (depth > MAX_MASTER_DEPTH) {
-            throw ExtractException.DepthExceeded("master 递归超过 $MAX_MASTER_DEPTH 层")
+        if (depth > Extractor.MAX_MASTER_DEPTH) {
+            throw ExtractException.DepthExceeded("master 递归超过 ${Extractor.MAX_MASTER_DEPTH} 层")
         }
         if (!master.isMaster) return master.variants
         val out = mutableListOf<Variant>()

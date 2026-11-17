@@ -133,7 +133,7 @@ class SnifferWebView(
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             settings.setSupportMultipleWindows(false)
             if (config.userAgent.isNotEmpty()) {
                 settings.userAgentString = config.userAgent
