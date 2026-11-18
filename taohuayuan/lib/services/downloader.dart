@@ -17,6 +17,7 @@ import '../models/video_item.dart';
 import 'store.dart';
 import 'stream_resolver.dart';
 import '../transfer/concurrency_ramp.dart';
+import '../transfer/hls_playlist.dart';
 import '../transfer/throughput_tracker.dart';
 import '../transfer/transfer_config.dart';
 import 'ts_remuxer.dart';
@@ -713,7 +714,7 @@ class DownloadManager extends ChangeNotifier {
     Set<int>? alreadyDone,
     void Function(int doneCount, int totalCount, int bytesDownloaded)? onProgress,
     void Function(int index)? onSegmentDone,
-    Future<List<String>?> Function()? refreshSegments,
+    Future<List<HlsSegment>?> Function()? refreshSegments,
     http.Client? client,
     bool Function()? isCancelled,
     int? concurrency,
@@ -781,9 +782,14 @@ class DownloadManager extends ChangeNotifier {
           for (var attempt = 0; attempt < 3 && !ok; attempt++) {
             try {
               // 流式写盘：边收边写，不把整段先缓存在内存里。
-              final n = await _fetchBytesToFile(segments[i], headers,
+              // BYTERANGE 段带 Range 头只取区间（Apple bipbop 这类 181 段共用
+              // 一个 main.ts 的列表，不带 Range 会把整文件下 181 遍）。
+              final seg = segments[i];
+              final n = await _fetchBytesToFile(seg.url, headers,
                   segPaths[i],
-                  client: sharedClient, onHttpStatus: countStatus);
+                  client: sharedClient, onHttpStatus: countStatus,
+                  rangeStart: seg.byteRangeOffset,
+                  rangeLength: seg.byteRangeLength);
               completed++;
               downloaded += n;
               onSegmentDone?.call(i);
@@ -809,9 +815,12 @@ class DownloadManager extends ChangeNotifier {
                 completed = done.length;
                 if (i >= segments.length) return;
                 try {
-                  final n = await _fetchBytesToFile(segments[i], headers,
+                  final seg = segments[i];
+                  final n = await _fetchBytesToFile(seg.url, headers,
                       segPaths[i],
-                      client: sharedClient, onHttpStatus: countStatus);
+                      client: sharedClient, onHttpStatus: countStatus,
+                      rangeStart: seg.byteRangeOffset,
+                      rangeLength: seg.byteRangeLength);
                   completed++;
                   downloaded += n;
                   onSegmentDone?.call(i);
@@ -1051,16 +1060,30 @@ class DownloadManager extends ChangeNotifier {
   /// 429/503 按 retry-after 重发一次；403 去 Referer + 备用 UA 重发一次；
   /// 非 200 或 0 字节时删掉不完整文件再抛错（别留 0 字节段冒充下好的段）；
   /// 返回写好的字节数。
+  /// BYTERANGE（rangeStart/rangeLength 都给了才生效）：发
+  /// `Range: bytes=start-end`，服务器回 206 照单全收；回 200（忽略 Range）
+  /// 时流式切出 [start, end] 窗口、窗口写满即断流，不把整文件缓存在内存里；
+  /// 写完校验长度恰好等于 rangeLength，不等就删文件抛错（不许半截段记成已下）。
   static Future<int> _fetchBytesToFile(
     String url,
     Map<String, String> headers,
     String targetPath, {
     http.Client? client,
     void Function(int status)? onHttpStatus,
+    int? rangeStart,
+    int? rangeLength,
   }) async {
     final uri = Uri.parse(url);
     final ownsClient = client == null;
     final sharedClient = client ?? http.Client();
+    // 两个都有且长度 > 0 才发 Range：解析层对非法 BYTERANGE 会给出
+    // length 为 null 的段，那种段按整文件下，不发 Range。
+    final hasRange =
+        rangeStart != null && rangeLength != null && rangeLength > 0;
+    final rangeEnd = hasRange ? rangeStart + rangeLength - 1 : null;
+    final rangeHeader = hasRange ? 'bytes=$rangeStart-$rangeEnd' : null;
+    // 带 Range 的请求：206 是正常成功；不带 Range 时只有 200 算成功。
+    bool isOk(int s) => s == 200 || (hasRange && s == 206);
     try {
       Future<http.StreamedResponse> send(Map<String, String> hdrs) {
         final req = http.Request('GET', uri)..headers.addAll(hdrs);
@@ -1068,25 +1091,52 @@ class DownloadManager extends ChangeNotifier {
       }
 
       final requestHeaders = {'User-Agent': _ua, ...headers};
-      Future<int> writeStream(http.StreamedResponse res) async {
-        final sink = File(targetPath).openWrite();
-        var n = 0;
-        try {
-          await for (final chunk
-              in res.stream.timeout(const Duration(seconds: 60))) {
-            sink.add(chunk);
-            n += chunk.length;
-          }
-        } finally {
-          await sink.close();
-        }
-        return n;
-      }
+      if (rangeHeader != null) requestHeaders['Range'] = rangeHeader;
 
       Future<void> dropIncomplete() async {
         try {
           await File(targetPath).delete();
         } catch (_) {}
+      }
+
+      Future<int> writeStream(http.StreamedResponse res) async {
+        // 206：响应体本身就是要的区间，照单全收；200 + 带 Range：
+        // 服务器忽略了 Range，流式切出窗口，窗口写满即断流。
+        final slice = hasRange && res.statusCode == 200;
+        final windowEnd = hasRange ? rangeStart + rangeLength : null;
+        final sink = File(targetPath).openWrite();
+        var n = 0;
+        var pos = 0;
+        try {
+          await for (final chunk
+              in res.stream.timeout(const Duration(seconds: 60))) {
+            if (!slice) {
+              sink.add(chunk);
+              n += chunk.length;
+            } else {
+              final chunkStart = pos;
+              final chunkEnd = pos + chunk.length;
+              final overlapStart =
+                  chunkStart > rangeStart ? chunkStart : rangeStart;
+              final overlapEnd =
+                  chunkEnd < windowEnd! ? chunkEnd : windowEnd;
+              if (overlapEnd > overlapStart) {
+                sink.add(chunk.sublist(
+                    overlapStart - chunkStart, overlapEnd - chunkStart));
+                n += overlapEnd - overlapStart;
+              }
+              if (chunkEnd >= windowEnd) break;
+            }
+            pos += chunk.length;
+          }
+        } finally {
+          await sink.close();
+        }
+        if (hasRange && n != rangeLength) {
+          await dropIncomplete();
+          throw StateError('分片长度不符：要 $rangeLength 字节，实得 $n 字节');
+        }
+        return n;
       }
 
       var res = await send(requestHeaders);
@@ -1096,7 +1146,7 @@ class DownloadManager extends ChangeNotifier {
         await res.stream.drain<void>();
         await Future<void>.delayed(Duration(seconds: retryAfter));
         res = await send(requestHeaders);
-        if (res.statusCode != 200) {
+        if (!isOk(res.statusCode)) {
           onHttpStatus?.call(res.statusCode);
           await res.stream.drain<void>();
           throw StateError('HTTP ${res.statusCode} (retry-after $retryAfter)');
@@ -1110,8 +1160,11 @@ class DownloadManager extends ChangeNotifier {
       }
       if (res.statusCode == 403) {
         await res.stream.drain<void>();
-        res = await send(_altHeaders(headers));
-        if (res.statusCode != 200) {
+        // 403 换头重试也要带上 Range，不然重发会把整文件当分片下回来。
+        final retryHeaders = _altHeaders(headers);
+        if (rangeHeader != null) retryHeaders['Range'] = rangeHeader;
+        res = await send(retryHeaders);
+        if (!isOk(res.statusCode)) {
           onHttpStatus?.call(res.statusCode);
           await res.stream.drain<void>();
           throw StateError('HTTP ${res.statusCode}');
@@ -1123,7 +1176,7 @@ class DownloadManager extends ChangeNotifier {
         }
         return n;
       }
-      if (res.statusCode != 200) {
+      if (!isOk(res.statusCode)) {
         await res.stream.drain<void>();
         throw StateError('HTTP ${res.statusCode}');
       }
@@ -1409,16 +1462,12 @@ class DownloadManager extends ChangeNotifier {
     }
   }
 
-  /// 媒体播放列表正文 -> 分片地址列表（相对地址按 baseUrl 拼）。
+  /// 媒体播放列表正文 -> 分片列表（相对地址按 baseUrl 拼）。
+  /// 每段含 url + BYTERANGE（byteRangeLength/byteRangeOffset，无
+  /// BYTERANGE 的段两者为 null）；无 @offset 的 BYTERANGE 从上一段末尾续。
   /// 供单元测试直接验。
-  static List<String> parseHlsSegments(String body, String baseUrl) {
-    final out = <String>[];
-    for (final line in body.split('\n')) {
-      final u = line.trim();
-      if (u.isEmpty || u.startsWith('#')) continue;
-      out.add(u.startsWith('http') ? u : Uri.parse(baseUrl).resolve(u).toString());
-    }
-    return out;
+  static List<HlsSegment> parseHlsSegments(String body, String baseUrl) {
+    return HlsPlaylist.parseMedia(body, baseUrl).segments;
   }
 
   /// 主播放列表正文 -> BANDWIDTH 最大的变体地址（相对地址按 baseUrl 拼）。

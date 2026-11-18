@@ -135,7 +135,7 @@ void main() {
     var serialBytes = 0;
     for (final s in segs) {
       final r = await http
-          .get(Uri.parse(s), headers: {'User-Agent': _ua, ...stream.headers})
+          .get(Uri.parse(s.url), headers: {'User-Agent': _ua, ...stream.headers})
           .timeout(const Duration(seconds: 30));
       serialBytes += r.bodyBytes.length;
     }

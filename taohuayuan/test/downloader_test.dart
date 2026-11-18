@@ -11,6 +11,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:taohuayuan/services/downloader.dart';
 import 'package:taohuayuan/transfer/concurrency_ramp.dart';
+import 'package:taohuayuan/transfer/hls_playlist.dart';
 import 'package:taohuayuan/transfer/throughput_tracker.dart';
 import 'package:taohuayuan/transfer/transfer_config.dart';
 
@@ -223,7 +224,8 @@ void main() {
       const body = '#EXTM3U\n#EXTINF:10.0,\nseg0.ts\n#EXTINF:10.0,\n'
           'https://cdn.example.com/seg1.ts\n#EXT-X-ENDLIST\n';
       final segs = DownloadManager.parseHlsSegments(body, '$base/high.m3u8');
-      expect(segs, ['$base/seg0.ts', 'https://cdn.example.com/seg1.ts']);
+      expect(segs.map((s) => s.url).toList(),
+          ['$base/seg0.ts', 'https://cdn.example.com/seg1.ts']);
     });
 
     test('pickHlsVariant：选 BANDWIDTH 最大的变体', () {
@@ -317,7 +319,7 @@ void main() {
       );
       expect(segs.length, 2);
       for (final s in segs) {
-        expect(s, contains('0TARefjlDnV4owLMxLmFkA==,1794904419'));
+        expect(s.url, contains('0TARefjlDnV4owLMxLmFkA==,1794904419'));
       }
     });
 
@@ -365,10 +367,13 @@ void main() {
         client: client,
         refreshSegments: () async {
           refreshCalls++;
-          return [
-            'http://mock/s0.ts',
-            'http://mock/s1-fixed.ts',
-            'http://mock/s2.ts',
+          return const [
+            HlsSegment(
+                url: 'http://mock/s0.ts', duration: 10, sequence: 0),
+            HlsSegment(
+                url: 'http://mock/s1-fixed.ts', duration: 10, sequence: 1),
+            HlsSegment(
+                url: 'http://mock/s2.ts', duration: 10, sequence: 2),
           ];
         },
       );
@@ -436,6 +441,127 @@ void main() {
       );
       expect(s0Tries, 0);
       expect(await File(out).readAsBytes(), [65, 65, 65, 66, 66]);
+    });
+  });
+
+  group('HLS BYTERANGE（实现 7）', () {
+    late Directory tmp;
+    setUp(() async {
+      tmp = await Directory.systemTemp.createTemp('hlsbyterange');
+    });
+    tearDown(() async {
+      await tmp.delete(recursive: true);
+    });
+
+    // 30 字节确定性内容：三段窗口分别是 0-9、10-19、20-29。
+    final full = List<int>.generate(30, (i) => i);
+    const mediaWithRanges = '#EXTM3U\n'
+        '#EXT-X-VERSION:4\n'
+        '#EXT-X-TARGETDURATION:10\n'
+        '#EXTINF:10.0,\n'
+        '#EXT-X-BYTERANGE:10@0\n'
+        '/main.ts\n'
+        '#EXTINF:10.0,\n'
+        '#EXT-X-BYTERANGE:10@10\n'
+        '/main.ts\n'
+        '#EXTINF:10.0,\n'
+        '#EXT-X-BYTERANGE:10@20\n'
+        '/main.ts\n'
+        '#EXT-X-ENDLIST\n';
+
+    String? rangeOf(http.BaseRequest req) {
+      for (final e in req.headers.entries) {
+        if (e.key.toLowerCase() == 'range') return e.value;
+      }
+      return null;
+    }
+
+    MockClient byterangeClient(
+        {required bool honorRange, required List<String> seenRanges}) {
+      return MockClient((req) async {
+        final p = req.url.path;
+        if (p == '/master.m3u8') {
+          return http.Response(
+              '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\n/v.m3u8\n',
+              200);
+        }
+        if (p == '/v.m3u8') {
+          return http.Response(mediaWithRanges, 200);
+        }
+        if (p == '/main.ts') {
+          final range = rangeOf(req);
+          expect(range, isNotNull, reason: 'BYTERANGE 段必须带 Range 头');
+          seenRanges.add(range!);
+          final m = RegExp(r'bytes=(\d+)-(\d+)').firstMatch(range);
+          final start = int.parse(m!.group(1)!);
+          final end = int.parse(m.group(2)!);
+          if (honorRange) {
+            return http.Response.bytes(full.sublist(start, end + 1), 206,
+                headers: {'content-range': 'bytes $start-$end/30'});
+          }
+          // 服务器忽略 Range：回 200 整文件，下载器要自己切出窗口。
+          return http.Response.bytes(full, 200);
+        }
+        return http.Response('not found', 404);
+      });
+    }
+
+    test('A：206 回包——三段同一 URL 各取自己的区间，拼出来等于三段拼接',
+        () async {
+      final seenRanges = <String>[];
+      final segLens = <int, int>{};
+      final out = await DownloadManager.downloadHlsFile(
+        masterUrl: 'http://mock/master.m3u8',
+        headers: const {},
+        targetPath: '${tmp.path}/out.ts.tmp',
+        client: byterangeClient(honorRange: true, seenRanges: seenRanges),
+        concurrency: 1,
+        onSegmentDone: (i) {
+          // 拼合前分段临时文件还在：每段恰好 10 字节。
+          segLens[i] =
+              File('${tmp.path}/out.ts.tmp.segs/$i.ts').lengthSync();
+        },
+      );
+      expect(seenRanges, ['bytes=0-9', 'bytes=10-19', 'bytes=20-29']);
+      expect(segLens, {0: 10, 1: 10, 2: 10});
+      expect(await File(out).readAsBytes(), full);
+    });
+
+    test('B：服务器忽略 Range 回 200——输出仍是三段窗口拼接，不是整文件下 3 遍',
+        () async {
+      final seenRanges = <String>[];
+      final out = await DownloadManager.downloadHlsFile(
+        masterUrl: 'http://mock/master.m3u8',
+        headers: const {},
+        targetPath: '${tmp.path}/out.ts.tmp',
+        client: byterangeClient(honorRange: false, seenRanges: seenRanges),
+      );
+      expect(seenRanges, ['bytes=0-9', 'bytes=10-19', 'bytes=20-29']);
+      expect(await File(out).readAsBytes(), full);
+    });
+
+    test('C：无 @offset 的 BYTERANGE 从上一段末尾续；非法值不丢段、不抛错', () {
+      const body = '#EXTM3U\n'
+          '#EXTINF:10.0,\n'
+          '#EXT-X-BYTERANGE:10@5\n'
+          '/main.ts\n'
+          '#EXTINF:10.0,\n'
+          '#EXT-X-BYTERANGE:10\n'
+          '/main.ts\n'
+          '#EXTINF:10.0,\n'
+          '#EXT-X-BYTERANGE:xx@yy\n'
+          '/main.ts\n'
+          '#EXT-X-ENDLIST\n';
+      final segs = DownloadManager.parseHlsSegments(body, '$base/v.m3u8');
+      expect(segs.length, 3);
+      expect(segs[0].byteRangeLength, 10);
+      expect(segs[0].byteRangeOffset, 5);
+      // 第二段只有长度：从第一段末尾（5 + 10）续。
+      expect(segs[1].byteRangeLength, 10);
+      expect(segs[1].byteRangeOffset, 15);
+      // 非法 BYTERANGE：段还在，range 置空，走整文件下，不抛错。
+      expect(segs[2].byteRangeLength, isNull);
+      expect(segs[2].url, '$base/main.ts');
     });
   });
 
