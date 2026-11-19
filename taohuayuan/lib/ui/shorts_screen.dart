@@ -16,6 +16,7 @@ import '../services/stream_resolver.dart';
 import '../services/web_search.dart';
 import 'author_screen.dart';
 import 'download_button.dart';
+import 'web_source_browser.dart';
 
 /// 短视频顶上的三个标签（第 48 条）：推荐 / 最新 / 最热门。
 /// 各记各的位置，切过去再切回来接着刷，互不干扰。
@@ -1259,6 +1260,24 @@ class _ShortPageState extends State<_ShortPage>
                   icon: const Icon(Icons.fullscreen, color: Colors.white, size: 30),
                   onPressed: _fullscreen,
                 ),
+                const SizedBox(height: 8),
+                // 在浏览器打开（用户 2026-11-19 定）：短视频流加一个入口，复用详情页
+                // 第 52 条逻辑——点一下进这条视频的源站页；没有源站页时不显示。
+                if ((widget.item.pageUrl ?? '').isNotEmpty)
+                  IconButton(
+                    icon: const Icon(Icons.open_in_browser, color: Colors.white, size: 30),
+                    tooltip: '在浏览器打开源站页面',
+                    onPressed: () {
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => WebSourceBrowser(
+                          title: widget.item.title,
+                          url: widget.item.pageUrl ?? '',
+                          sourceId: widget.item.source,
+                          store: widget.store,
+                        ),
+                      ));
+                    },
+                  ),
                 const SizedBox(height: 8),
                 // 下载入口（第 27 条）：短视频点一下就开始下。
                 // 第 30 条：22px，跟旁边点赞/静音/全屏图标收齐，别挡画面。
